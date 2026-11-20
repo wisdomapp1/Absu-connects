@@ -71,7 +71,7 @@ import {
   uploadPostMediaToSupabaseStorage,
   deletePostMediaFilesFromStorage,
 } from '../lib/storageService.ts';
-import { adminService } from '../lib/adminService.ts';
+import { adminService, isSuperAdminEmail } from '../lib/adminService.ts';
 import {
   sendPrivacySafePush,
   playNotificationChime,
@@ -337,19 +337,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     }
   }, [auth.profile, authUserId]);
 
-  // Super Admin state & live server-side verification
-  const AUTHORIZED_SUPER_ADMIN_EMAILS = [
-    'wisdomchinonso82@gmail.com',
-    'natashaojiugo112@gmail.com',
-    'absuconnect.team@gmail.com',
-  ];
-
-  const isSuperAdminEmail = (email?: string | null): boolean => {
-    if (!email) return false;
-    const normalized = email.toLowerCase().trim();
-    return AUTHORIZED_SUPER_ADMIN_EMAILS.some((admin) => admin.toLowerCase().trim() === normalized);
-  };
-
+  // Super Admin state & live verification
   const [isSuperAdmin, setIsSuperAdmin] = useState<boolean>(false);
   const [adminViewOpen, setAdminViewOpen] = useState<boolean>(false);
   const [platformBanner, setPlatformBanner] = useState<string | null>(null);
@@ -372,7 +360,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         return;
       }
 
-      // Pre-check against configured authorized administration emails
+      // Check against configured authorized administration emails
       if (!isSuperAdminEmail(email)) {
         setIsSuperAdmin(false);
         setAdminViewOpen(false);
@@ -386,7 +374,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         }
       } catch {
         if (!isCancelled) {
-          setIsSuperAdmin(false);
+          // If server verification threw a transient network error but user holds a valid authorized session, keep check consistent
+          setIsSuperAdmin(isSuperAdminEmail(email));
         }
       }
     };

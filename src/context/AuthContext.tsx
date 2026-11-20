@@ -90,6 +90,20 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   } | null>(null);
   const activeSessionRef = React.useRef<Session | null>(null);
   const explicitSignOutRef = React.useRef<boolean>(false);
+  const authTransitionRef = React.useRef<boolean>(false);
+  const signOutRecoveryPromiseRef = React.useRef<Promise<boolean> | null>(null);
+
+  const hasRecentExplicitSignOut = React.useCallback((): boolean => {
+    if (explicitSignOutRef.current) return true;
+    try {
+      const raw = safeStorage.getItem('absu_explicit_signout_ts');
+      if (!raw) return false;
+      const ts = Number(raw);
+      return Number.isFinite(ts) && Date.now() - ts < 15_000;
+    } catch {
+      return false;
+    }
+  }, []);
 
   const updateUserStable = React.useCallback((nextUser: SupabaseAuthUser | null) => {
     setUser((prev) => {
@@ -274,6 +288,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
         if (mounted && data?.session) {
           explicitSignOutRef.current = false;
+          safeStorage.removeItem('absu_explicit_signout_ts');
           updateSessionStable(data.session);
           updateUserStable(data.session.user);
           if (!isRecovery) {
@@ -334,6 +349,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
       if (event === 'SIGNED_IN' && currentSession?.user) {
         explicitSignOutRef.current = false;
+        safeStorage.removeItem('absu_explicit_signout_ts');
         updateSessionStable(currentSession);
         updateUserStable(currentSession.user);
         // Avoid re-fetching profile on tab-focus or duplicate initial SIGNED_IN bursts for the already-loaded user
@@ -346,18 +362,118 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       }
 
       if (event === 'SIGNED_OUT') {
-        // If another tab or transient race triggered SIGNED_OUT while we did not explicitly sign out,
-        // verify whether a valid session still exists in storage before clearing user state.
-        if (!explicitSignOutRef.current) {
-          try {
-            const { data } = await supabase.auth.getSession();
-            if (mounted && data?.session?.user) {
-              updateSessionStable(data.session);
-              updateUserStable(data.session.user);
-              return;
-            }
-          } catch {
-            // Fall through to sign out cleanup if session cannot be recovered
+        // Ignore stale SIGNED_OUT events emitted mid-login/signup transition
+        if (authTransitionRef.current) {
+          return;
+        }
+
+        // If another tab or transient race triggered SIGNED_OUT while the user did NOT click Sign Out,
+        // verify whether a valid session still exists or can be safely restored before clearing state.
+        if (!hasRecentExplicitSignOut()) {
+          if (!signOutRecoveryPromiseRef.current) {
+            signOutRecoveryPromiseRef.current = (async (): Promise<boolean> => {
+              try {
+                const { data } = await supabase.auth.getSession();
+                if (data?.session?.user) {
+                  if (mounted) {
+                    updateSessionStable(data.session);
+                    updateUserStable(data.session.user);
+                  }
+                  return true;
+                }
+
+                // Wait briefly in case another tab is finalizing a session write/rotation
+                await new Promise((r) => setTimeout(r, 150));
+                const { data: retryData } = await supabase.auth.getSession();
+                if (retryData?.session?.user) {
+                  if (mounted) {
+                    updateSessionStable(retryData.session);
+                    updateUserStable(retryData.session.user);
+                  }
+                  return true;
+                }
+
+                const prevSession = activeSessionRef.current;
+                if (prevSession?.access_token && prevSession?.refresh_token) {
+                  const accessStillValid =
+                    (prevSession.expires_at ?? 0) * 1000 > Date.now() + 15_000;
+
+                  if (accessStillValid) {
+                    const { data: userCheck, error: userErr } = await supabase.auth
+                      .getUser(prevSession.access_token)
+                      .catch((e) => ({ data: { user: null }, error: e }));
+
+                    if (userCheck?.user) {
+                      const restored = await supabase.auth
+                        .setSession({
+                          access_token: prevSession.access_token,
+                          refresh_token: prevSession.refresh_token,
+                        })
+                        .catch(() => null);
+                      if (restored?.data?.session?.user) {
+                        if (mounted) {
+                          updateSessionStable(restored.data.session);
+                          updateUserStable(restored.data.session.user);
+                        }
+                        return true;
+                      }
+                      if (mounted) {
+                        updateSessionStable(prevSession);
+                        updateUserStable(userCheck.user);
+                      }
+                      return true;
+                    }
+
+                    // Preserve non-expired session on transient offline/network failures
+                    const isRetryableNetworkErr =
+                      Boolean(userErr) &&
+                      (userErr?.name === 'AuthRetryableFetchError' ||
+                        userErr?.status === 0 ||
+                        !userErr?.status);
+                    if (isRetryableNetworkErr) {
+                      if (mounted) {
+                        updateSessionStable(prevSession);
+                        updateUserStable(prevSession.user);
+                      }
+                      return true;
+                    }
+                  }
+
+                  // Attempt single-flight refresh with the last known refresh token
+                  const refreshed = await supabase.auth
+                    .refreshSession({ refresh_token: prevSession.refresh_token })
+                    .catch((e) => ({ data: { session: null, user: null }, error: e }));
+
+                  if (refreshed?.data?.session?.user) {
+                    if (mounted) {
+                      updateSessionStable(refreshed.data.session);
+                      updateUserStable(refreshed.data.session.user);
+                    }
+                    return true;
+                  }
+
+                  const refreshErr: any = refreshed?.error;
+                  const isRetryableRefreshErr =
+                    Boolean(refreshErr) &&
+                    (refreshErr?.name === 'AuthRetryableFetchError' ||
+                      refreshErr?.status === 0 ||
+                      !refreshErr?.status);
+                  if (isRetryableRefreshErr && (prevSession.expires_at ?? 0) * 1000 > Date.now()) {
+                    return true;
+                  }
+                }
+                return false;
+              } catch {
+                return false;
+              } finally {
+                signOutRecoveryPromiseRef.current = null;
+              }
+            })();
+          }
+
+          const recovered = await signOutRecoveryPromiseRef.current;
+          if (recovered || !mounted) {
+            return;
           }
         }
 
@@ -379,7 +495,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       mounted = false;
       subscription.unsubscribe();
     };
-  }, [isConfigured, loadUserProfile, updateSessionStable, updateUserStable]);
+  }, [isConfigured, loadUserProfile, updateSessionStable, updateUserStable, hasRecentExplicitSignOut]);
 
   const signUp = async (
     fullName: string,
@@ -390,6 +506,9 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       return { success: false, error: configError || 'Supabase is not configured.' };
     }
 
+    explicitSignOutRef.current = false;
+    safeStorage.removeItem('absu_explicit_signout_ts');
+    authTransitionRef.current = true;
     try {
       const { data, error } = await supabase.auth.signUp({
         email: email.trim(),
@@ -410,6 +529,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       // If user was created and session established immediately:
       if (data.session && data.user) {
         explicitSignOutRef.current = false;
+        safeStorage.removeItem('absu_explicit_signout_ts');
         updateSessionStable(data.session);
         updateUserStable(data.user);
         // Save initial profile row with name
@@ -433,6 +553,8 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : 'Registration failed';
       return { success: false, error: msg };
+    } finally {
+      authTransitionRef.current = false;
     }
   };
 
@@ -444,6 +566,9 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       return { success: false, error: configError || 'Supabase is not configured.' };
     }
 
+    explicitSignOutRef.current = false;
+    safeStorage.removeItem('absu_explicit_signout_ts');
+    authTransitionRef.current = true;
     try {
       const { data, error } = await supabase.auth.signInWithPassword({
         email: email.trim(),
@@ -456,6 +581,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
       if (data.session && data.user) {
         explicitSignOutRef.current = false;
+        safeStorage.removeItem('absu_explicit_signout_ts');
         updateSessionStable(data.session);
         updateUserStable(data.user);
         await loadUserProfile(data.user.id, data.user.email, {
@@ -469,11 +595,14 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : 'Sign in failed';
       return { success: false, error: msg };
+    } finally {
+      authTransitionRef.current = false;
     }
   };
 
   const signOut = async () => {
     explicitSignOutRef.current = true;
+    safeStorage.setItem('absu_explicit_signout_ts', String(Date.now()));
     if (user) {
       await unregisterAllPushChannels(user.id).catch(() => {});
     }

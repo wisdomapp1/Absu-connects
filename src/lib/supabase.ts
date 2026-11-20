@@ -42,12 +42,97 @@ export function getSupabaseConfigError(): string | null {
 
 import { getSafeStorage } from '../utils/safeStorage.ts';
 
-// Single shared Supabase client instance with session persistence & automatic token refresh
-export const supabase: SupabaseClient = createClient(supabaseUrl, supabaseAnonKey, {
-  auth: {
-    persistSession: true,
-    autoRefreshToken: true,
-    detectSessionInUrl: true,
-    storage: getSafeStorage() as any,
-  },
-});
+const inProcessQueues = new Map<string, Promise<unknown>>();
+
+async function runInProcessLock<R>(name: string, fn: () => Promise<R>): Promise<R> {
+  const previous = inProcessQueues.get(name) ?? Promise.resolve();
+  const next = previous.catch(() => undefined).then(() => fn());
+  inProcessQueues.set(
+    name,
+    next.catch(() => undefined)
+  );
+  return next;
+}
+
+/**
+ * Serializes auth storage/refresh operations across open browser tabs using the
+ * Navigator LockManager API when available, with orphan-lock recovery and a
+ * safe in-process mutex fallback for restricted WebViews or iframes.
+ */
+async function safeCrossTabAuthLock<R>(
+  name: string,
+  acquireTimeout: number,
+  fn: () => Promise<R>
+): Promise<R> {
+  const lockManager =
+    typeof navigator !== 'undefined' && navigator?.locks && typeof navigator.locks.request === 'function'
+      ? navigator.locks
+      : null;
+
+  if (!lockManager) {
+    return runInProcessLock(name, fn);
+  }
+
+  const effectiveTimeout = acquireTimeout > 0 ? acquireTimeout : 8000;
+  const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+  let timer: ReturnType<typeof setTimeout> | null = null;
+
+  if (controller) {
+    timer = setTimeout(() => {
+      try {
+        controller.abort();
+      } catch {
+        // Ignore abort failures
+      }
+    }, effectiveTimeout);
+  }
+
+  try {
+    return await lockManager.request(
+      name,
+      controller ? { mode: 'exclusive', signal: controller.signal } : { mode: 'exclusive' },
+      async (lock) => {
+        if (timer) clearTimeout(timer);
+        if (!lock) {
+          return runInProcessLock(name, fn);
+        }
+        return await fn();
+      }
+    );
+  } catch (err: any) {
+    if (timer) clearTimeout(timer);
+
+    // Our own timeout fired (an orphaned background tab held the lock): steal cleanly once
+    if (err?.name === 'AbortError' && controller?.signal.aborted) {
+      try {
+        return await lockManager.request(
+          name,
+          { mode: 'exclusive', steal: true },
+          async () => await fn()
+        );
+      } catch {
+        return runInProcessLock(name, fn);
+      }
+    }
+
+    // SecurityError / unsupported LockManager inside sandboxed iframes or WebViews
+    return runInProcessLock(name, fn);
+  }
+}
+
+const globalScope = globalThis as typeof globalThis & {
+  __absuSupabaseClient?: SupabaseClient;
+};
+
+// Single shared Supabase client instance with session persistence, cross-tab lock & automatic token refresh
+export const supabase: SupabaseClient =
+  globalScope.__absuSupabaseClient ??
+  (globalScope.__absuSupabaseClient = createClient(supabaseUrl, supabaseAnonKey, {
+    auth: {
+      persistSession: true,
+      autoRefreshToken: true,
+      detectSessionInUrl: true,
+      storage: getSafeStorage() as any,
+      lock: safeCrossTabAuthLock,
+    },
+  }));

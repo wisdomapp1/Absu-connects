@@ -22,7 +22,11 @@ export const AdminInvitationsTab: React.FC<AdminInvitationsTabProps> = ({ token 
       setLoading(true);
       setError(null);
       const res = await adminService.getInvitations(token);
-      setInvitations(res.invitations || []);
+      if (res && res.success === false) {
+        setError(res.error || 'Failed to fetch invitations');
+      } else {
+        setInvitations(res.invitations || []);
+      }
     } catch (err: any) {
       setError(err.message || 'Failed to fetch invitations');
     } finally {
@@ -46,6 +50,10 @@ export const AdminInvitationsTab: React.FC<AdminInvitationsTabProps> = ({ token 
       setError(null);
       setSuccess(null);
       const res = await adminService.sendInvitation(token, email.trim());
+      if (res && res.success === false) {
+        setError(res.error || 'Failed to dispatch invitation');
+        return;
+      }
       setSuccess(res.message || `Invitation sent to ${email}`);
       setEmail('');
       fetchInvitations();
@@ -62,6 +70,10 @@ export const AdminInvitationsTab: React.FC<AdminInvitationsTabProps> = ({ token 
       setError(null);
       setSuccess(null);
       const res = await adminService.sendInvitation(token, invEmail);
+      if (res && res.success === false) {
+        setError(res.error || 'Failed to resend invitation');
+        return;
+      }
       setSuccess(res.message || `Invitation resent to ${invEmail}`);
       fetchInvitations();
     } catch (err: any) {

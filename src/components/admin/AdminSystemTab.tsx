@@ -67,7 +67,11 @@ export const AdminSystemTab: React.FC<AdminSystemTabProps> = ({ token }) => {
       setSavingSettings(true);
       setError(null);
       setSuccess(null);
-      await adminService.updateSettings(token, settings);
+      const res = await adminService.updateSettings(token, settings);
+      if (res && !res.success) {
+        setError(res.error || 'Failed to update platform settings');
+        return;
+      }
       setSuccess('Platform settings updated successfully');
     } catch (err: any) {
       setError(err.message || 'Failed to update platform settings');

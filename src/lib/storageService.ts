@@ -276,6 +276,34 @@ export async function decodeAndValidateImageFile(file: File): Promise<{
  * Applies client-side image compression for photos and validates type & size for both photos and videos.
  * Never falls back to Base64 data URLs or fake placeholder paths.
  */
+let inFlightUploadSessionRefresh: Promise<any> | null = null;
+
+async function getActiveUploadSession() {
+  try {
+    const { data } = await supabase.auth.getSession();
+    const session = data?.session || null;
+    if (!session) return null;
+
+    const expiresAtMs = (session.expires_at ?? 0) * 1000;
+    const isNearExpiry = expiresAtMs > 0 && expiresAtMs - Date.now() < 30_000;
+    if (isNearExpiry && session.refresh_token) {
+      if (!inFlightUploadSessionRefresh) {
+        inFlightUploadSessionRefresh = supabase.auth
+          .refreshSession()
+          .then((res) => res?.data?.session || session)
+          .catch(() => session)
+          .finally(() => {
+            inFlightUploadSessionRefresh = null;
+          });
+      }
+      return await inFlightUploadSessionRefresh;
+    }
+    return session;
+  } catch {
+    return null;
+  }
+}
+
 export async function uploadPostMediaToSupabaseStorage(
   userId: string,
   fileOrBuffer: File | Blob | ArrayBuffer | string,
@@ -284,12 +312,8 @@ export async function uploadPostMediaToSupabaseStorage(
 ): Promise<{ success: boolean; media?: PostMediaUploadItem; error?: string }> {
   try {
     // 1. Verify active Supabase session and ensure scoped path matches authenticated user
-    let { data: sessionData } = await supabase.auth.getSession();
-    if (!sessionData?.session?.user) {
-      const refreshed = await supabase.auth.refreshSession().catch(() => ({ data: { session: null } }));
-      sessionData = refreshed.data;
-    }
-    const effectiveUserId = sessionData?.session?.user?.id || userId;
+    const activeSession = await getActiveUploadSession();
+    const effectiveUserId = activeSession?.user?.id || userId;
     if (!effectiveUserId) {
       return {
         success: false,
@@ -980,11 +1004,7 @@ export async function uploadProfileAvatarToStorage(
 
   try {
     // 1. Verify active Supabase session and ensure scoped path matches authenticated user
-    let session = (await supabase.auth.getSession()).data.session;
-    if (!session || !session.user) {
-      const refreshed = await supabase.auth.refreshSession();
-      session = refreshed.data.session;
-    }
+    const session = await getActiveUploadSession();
     const effectiveUserId = session?.user?.id || userId;
     if (!effectiveUserId) {
       return {
@@ -1449,11 +1469,7 @@ export async function uploadStoryMediaToStorage(
   }
 
   try {
-    let session = (await supabase.auth.getSession()).data.session;
-    if (!session || !session.user) {
-      const refreshed = await supabase.auth.refreshSession();
-      session = refreshed.data.session;
-    }
+    const session = await getActiveUploadSession();
     const effectiveUserId = session?.user?.id || userId;
     if (!effectiveUserId) {
       return { success: false, error: 'Please sign in to upload your story.' };

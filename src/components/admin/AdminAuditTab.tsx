@@ -18,7 +18,11 @@ export const AdminAuditTab: React.FC<AdminAuditTabProps> = ({ token }) => {
       setLoading(true);
       setError(null);
       const res = await adminService.getAuditLogs(token);
-      setLogs(res.logs || []);
+      if (res && res.success === false) {
+        setError(res.error || 'Failed to fetch audit logs');
+      } else {
+        setLogs(res.logs || []);
+      }
     } catch (err: any) {
       setError(err.message || 'Failed to fetch audit logs');
     } finally {

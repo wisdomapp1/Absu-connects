@@ -41,9 +41,46 @@ const memoryStorageAdapter: SafeStorageApi = {
   },
 };
 
+// Keys where memoryStorageAdapter holds newer data after a failed web-storage write
+const memoryPreferredKeys = new Set<string>();
+
+function isProtectedStorageKey(key: string): boolean {
+  return (
+    key.startsWith('sb-') ||
+    key.startsWith('absu_onboarding_') ||
+    key.startsWith('absu_user_onboarded_') ||
+    key === 'absu_theme' ||
+    key === 'absu_explicit_signout_ts'
+  );
+}
+
+function freeNonEssentialStorageSpace(storage: Storage): void {
+  try {
+    const candidateKeys: string[] = [];
+    for (let i = 0; i < storage.length; i++) {
+      const k = storage.key(i);
+      if (k && !isProtectedStorageKey(k)) {
+        candidateKeys.push(k);
+      }
+    }
+    for (const k of candidateKeys) {
+      try {
+        storage.removeItem(k);
+      } catch {
+        // Ignore individual removal failures
+      }
+    }
+  } catch {
+    // Ignore enumeration errors
+  }
+}
+
 function wrapWebStorage(storage: Storage): SafeStorageApi {
   return {
     getItem(key: string): string | null {
+      if (memoryPreferredKeys.has(key)) {
+        return memoryStorageAdapter.getItem(key);
+      }
       try {
         const val = storage.getItem(key);
         if (val !== null) {
@@ -55,15 +92,26 @@ function wrapWebStorage(storage: Storage): SafeStorageApi {
       }
     },
     setItem(key: string, value: string): void {
-      memoryStorageAdapter.setItem(key, value);
+      const serialized = String(value);
+      memoryStorageAdapter.setItem(key, serialized);
       try {
-        storage.setItem(key, value);
+        storage.setItem(key, serialized);
+        memoryPreferredKeys.delete(key);
       } catch {
-        // Already preserved in memoryStorageAdapter
+        // QuotaExceededError or transient write error: evict non-essential keys and retry once
+        freeNonEssentialStorageSpace(storage);
+        try {
+          storage.setItem(key, serialized);
+          memoryPreferredKeys.delete(key);
+        } catch {
+          // Ensure stale web-storage data does not shadow the newer in-memory value
+          memoryPreferredKeys.add(key);
+        }
       }
     },
     removeItem(key: string): void {
       memoryStorageAdapter.removeItem(key);
+      memoryPreferredKeys.delete(key);
       try {
         storage.removeItem(key);
       } catch {
@@ -72,6 +120,7 @@ function wrapWebStorage(storage: Storage): SafeStorageApi {
     },
     clear(): void {
       memoryStorageAdapter.clear();
+      memoryPreferredKeys.clear();
       try {
         storage.clear();
       } catch {
