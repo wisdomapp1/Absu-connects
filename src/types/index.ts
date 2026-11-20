@@ -1,0 +1,206 @@
+export interface User {
+  id: string;
+  name: string;
+  avatar: string;
+  handle: string;
+  department: string;
+  faculty: string;
+  level: string; // e.g. "300 Level"
+  campus: string; // e.g. "Uturu (Main Campus)"
+  bio: string;
+  interests: string[];
+  mutualFriendsCount?: number;
+  isVerified?: boolean;
+  avatarAssetId?: string;
+  relationshipState: 'self' | 'none' | 'request_sent' | 'request_received' | 'friends';
+}
+
+export interface Comment {
+  id: string;
+  postId: string;
+  parentId?: string | null;
+  author: {
+    id: string;
+    name: string;
+    avatar: string;
+    department: string;
+    level: string;
+  };
+  content: string;
+  createdAt: string;
+  updatedAt?: string;
+  isEdited?: boolean;
+  likesCount: number;
+  isLiked?: boolean;
+  replies?: Comment[];
+}
+
+export type PostCategory = 'General' | 'Campus Update' | 'Academic' | 'Hostel Life' | 'Event';
+export type PostAudience = 'Public' | 'Friends Only' | 'Campus Only';
+
+export interface PostMediaItem {
+  id?: string;
+  secure_url: string;
+  asset_id?: string;
+  format?: string;
+  bytes?: number;
+  width?: number;
+  height?: number;
+  kind: 'image' | 'video';
+  provider?: string;
+  position?: number;
+}
+
+export interface AttachedMediaItem {
+  id: string;
+  file?: File;
+  buffer?: ArrayBuffer;
+  previewUrl: string;
+  type: 'image' | 'video';
+  name: string;
+  sizeLabel?: string;
+  duration?: number;
+  isPreset?: boolean;
+}
+
+export interface Post {
+  id: string;
+  author: User;
+  content: string;
+  mediaUrl?: string;
+  mediaType?: 'image' | 'video';
+  mediaItems?: PostMediaItem[];
+  category: PostCategory;
+  categoryHashtag?: '#Event' | '#CampusUpdates' | '#GeneralPost';
+  audience: PostAudience;
+  createdAt: string;
+  likesCount: number;
+  isLiked: boolean;
+  isSaved: boolean;
+  comments: Comment[];
+  commentsCount?: number;
+  isPinned?: boolean;
+  pageId?: string;
+  isPagePost?: boolean;
+  communityId?: string;
+  communityName?: string;
+  communitySlug?: string;
+  communityImageUrl?: string;
+}
+
+export interface FriendRequest {
+  id: string;
+  user: User;
+  createdAt: string;
+  mutualCount: number;
+  type: 'received' | 'sent';
+}
+
+export interface MessageAttachment {
+  id: string;
+  message_id: string;
+  uploader_id: string;
+  file_name: string;
+  bytes: number;
+  format?: string;
+  kind: 'image' | 'video' | 'audio' | 'pdf' | 'document';
+  asset_id: string;
+  secure_url?: string;
+  provider: string;
+  thumbnail_url?: string;
+  created_at: string;
+}
+
+export interface Message {
+  id: string;
+  senderId: string;
+  text: string;
+  timestamp: string;
+  isOutgoing: boolean;
+  createdAtRaw?: string;
+  isSeen?: boolean;
+  status?: 'sending' | 'sent' | 'delivered' | 'seen' | 'failed' | 'queued';
+  attachments?: MessageAttachment[];
+}
+
+export interface Conversation {
+  id: string;
+  participant: User;
+  lastMessage: string;
+  lastMessageTime: string;
+  unreadCount: number;
+  messages: Message[];
+}
+
+export type NotificationType =
+  | 'friend_request'
+  | 'friend_accept'
+  | 'like'
+  | 'comment'
+  | 'mention'
+  | 'message'
+  | 'campus_notice'
+  | 'game_invitation'
+  | 'community_invite'
+  | 'community_approved'
+  | 'community_rejected'
+  | 'community_post'
+  | 'event_reminder'
+  | 'event_update'
+  | 'welcome_discovery'
+  | 'discovery_suggestion'
+  | 'discovery_reminder';
+
+export interface NotificationItem {
+  id: string;
+  type: NotificationType;
+  title?: string;
+  entityType?: string;
+  actor: {
+    id: string;
+    name: string;
+    avatar: string;
+  };
+  content: string;
+  timestamp: string;
+  createdAt?: string;
+  isRead: boolean;
+  isArchived?: boolean;
+  actionUrl?: string;
+  targetPostId?: string;
+  targetCommentId?: string;
+  targetParentCommentId?: string;
+  conversationId?: string;
+}
+
+export type FeedFilter = 'for-you' | 'friends' | 'campus' | 'communities' | 'events';
+export type FriendTab = 'discover' | 'requests' | 'sent' | 'friends';
+export type MainNavTab = 'home' | 'friends' | 'messages' | 'alerts' | 'more';
+export type ActiveView =
+  | MainNavTab
+  | 'profile'
+  | 'user-profile'
+  | 'conversation'
+  | 'contact-info'
+  | 'games'
+  | 'search'
+  | 'marketplace'
+  | 'settings'
+  | 'saved'
+  | 'events'
+  | 'event-detail'
+  | 'organizer-centre'
+  | 'communities'
+  | 'community-detail'
+  | 'activity'
+  | 'safety'
+  | 'help'
+  | 'about'
+  | 'mr-anonymous'
+  | 'post-detail';
+
+export interface ToastMessage {
+  id: string;
+  message: string;
+  type?: 'success' | 'info' | 'warning';
+}

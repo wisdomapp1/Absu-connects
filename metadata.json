@@ -1,0 +1,6 @@
+{
+  "name": "ABSU Connect",
+  "description": "The campus social network for Abia State University — discover friends, connect with peers, share moments, and explore campus life.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

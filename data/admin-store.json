@@ -1,0 +1,24 @@
+{
+  "restrictions": {},
+  "warnings": [],
+  "reportResolutions": {},
+  "auditLogs": [],
+  "platformSettings": {
+    "maintenanceMode": false,
+    "maintenanceMessage": "ABSU Connect is briefly undergoing scheduled maintenance. Services will resume shortly.",
+    "broadcastBanner": {
+      "active": false,
+      "text": "",
+      "type": "info"
+    },
+    "features": {
+      "postingEnabled": true,
+      "messagingEnabled": true,
+      "registrationOpen": true
+    }
+  },
+  "invitations": [],
+  "announcements": [],
+  "moderatedPosts": {},
+  "anonymousSubmissions": []
+}
