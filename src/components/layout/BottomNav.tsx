@@ -1,7 +1,7 @@
 import React from 'react';
 import { useApp } from '../../context/AppContext.tsx';
 import type { MainNavTab } from '../../types/index.ts';
-import { Home, Users, MessageSquare, Bell, Menu } from 'lucide-react';
+import { Home, Clapperboard, Users, MessageSquare, Bell, Menu } from 'lucide-react';
 
 interface NavItem {
   id: MainNavTab;
@@ -11,10 +11,12 @@ interface NavItem {
 }
 
 export const BottomNav: React.FC = () => {
-  const { activeTab, setActiveTab, unreadMessagesCount, unreadNotificationsCount } = useApp();
+  const { activeTab, activeView, setActiveTab, unreadMessagesCount, unreadNotificationsCount } = useApp();
+  const isReelsMode = activeView === 'reels';
 
   const navItems: NavItem[] = [
     { id: 'home', label: 'Home', icon: Home },
+    { id: 'reels', label: 'Reels', icon: Clapperboard },
     { id: 'friends', label: 'Friends', icon: Users },
     { id: 'messages', label: 'Messages', icon: MessageSquare, badgeCount: unreadMessagesCount },
     { id: 'alerts', label: 'Alerts', icon: Bell, badgeCount: unreadNotificationsCount },
@@ -23,10 +25,14 @@ export const BottomNav: React.FC = () => {
 
   return (
     <nav
-      className="md:hidden fixed bottom-0 left-0 right-0 z-40 bg-[var(--color-bg-card)]/95 backdrop-blur-md border-t border-[var(--color-border)] pb-[env(safe-area-inset-bottom)] transition-colors shadow-lg"
+      className={`md:hidden fixed bottom-0 left-0 right-0 z-40 backdrop-blur-md border-t pb-[env(safe-area-inset-bottom)] transition-colors shadow-lg ${
+        isReelsMode
+          ? 'bg-black/95 border-white/15'
+          : 'bg-[var(--color-bg-card)]/95 border-[var(--color-border)]'
+      }`}
       aria-label="Mobile Navigation"
     >
-      <div className="grid grid-cols-5 h-16 max-w-lg mx-auto px-1">
+      <div className="grid grid-cols-6 h-16 max-w-lg mx-auto px-0.5">
         {navItems.map((item) => {
           const isActive = activeTab === item.id;
           const IconComponent = item.icon;
@@ -37,18 +43,26 @@ export const BottomNav: React.FC = () => {
               onClick={() => setActiveTab(item.id)}
               className={`flex flex-col items-center justify-center min-h-[44px] min-w-[44px] py-1 transition-all relative ${
                 isActive
-                  ? 'text-[var(--color-primary)] font-semibold'
+                  ? isReelsMode
+                    ? 'text-white font-semibold'
+                    : 'text-[var(--color-primary)] font-semibold'
+                  : isReelsMode
+                  ? 'text-white/65 hover:text-white'
                   : 'text-[var(--color-text-secondary)] hover:text-[var(--color-text-primary)]'
               }`}
               aria-label={item.label}
               aria-current={isActive ? 'page' : undefined}
             >
               <div
-                className={`relative px-3 py-1 rounded-full transition-colors flex items-center justify-center ${
-                  isActive ? 'bg-[var(--color-primary-subtle)]' : ''
+                className={`relative px-2.5 py-1 rounded-full transition-colors flex items-center justify-center ${
+                  isActive
+                    ? isReelsMode
+                      ? 'bg-white/20'
+                      : 'bg-[var(--color-primary-subtle)]'
+                    : ''
                 }`}
               >
-                <IconComponent className="w-[22px] h-[22px] stroke-[2.2]" />
+                <IconComponent className="w-[21px] h-[21px] stroke-[2.2]" />
 
                 {/* Unread badge */}
                 {Boolean(item.badgeCount && item.badgeCount > 0) && (
@@ -58,7 +72,7 @@ export const BottomNav: React.FC = () => {
                 )}
               </div>
 
-              <span className="text-[11px] leading-tight tracking-tight mt-0.5">
+              <span className="text-[10px] sm:text-[11px] leading-tight tracking-tight mt-0.5 truncate max-w-full">
                 {item.label}
               </span>
             </button>

@@ -715,7 +715,8 @@ export async function uploadChatAttachmentToStorage(
   const isAudio =
     file.type.startsWith('audio/') ||
     Boolean(file.name.match(/\.(mp3|m4a|wav|ogg|aac)$/i)) ||
-    (file.name.startsWith('voice_note_') && file.name.toLowerCase().endsWith('.webm'));
+    ((file.name.startsWith('voice_note_') || file.name.startsWith('voicenote_')) &&
+      file.name.toLowerCase().endsWith('.webm'));
   const isImage = !isAudio && (file.type.startsWith('image/') || Boolean(file.name.match(/\.(jpg|jpeg|png|webp|avif|gif)$/i)));
   const isVideo = !isAudio && !isImage && (file.type.startsWith('video/') || Boolean(file.name.match(/\.(mp4|webm|mov|m4v)$/i)));
   const isPdf = file.type === 'application/pdf' || file.name.toLowerCase().endsWith('.pdf');

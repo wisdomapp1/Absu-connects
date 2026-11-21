@@ -1,4 +1,5 @@
 import { supabase } from './supabase.ts';
+import { isCloudinaryConfigured } from './cloudinaryService.ts';
 
 export interface AdminStats {
   totalAccounts: number;
@@ -1411,7 +1412,7 @@ export const adminService = {
       uptime_seconds: st?.uptimeSeconds ?? 0,
       memory_usage_mb: st?.environment?.memoryUsageMb ?? 0,
       service_role_configured: st?.auth?.serviceRoleKeyConfigured ?? false,
-      cloudinary_configured: true,
+      cloudinary_configured: isCloudinaryConfigured(),
       platform_settings: {
         maintenance_mode: settingsRes.settings?.maintenanceMode ?? false,
         read_only_mode: !(settingsRes.settings?.features?.postingEnabled ?? true),

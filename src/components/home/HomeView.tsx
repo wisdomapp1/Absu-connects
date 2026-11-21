@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
 import { useApp } from '../../context/AppContext.tsx';
 import { PostComposer } from './PostComposer.tsx';
 import { AnonymousPostFeedCard } from './AnonymousPostFeedCard.tsx';
@@ -7,11 +7,17 @@ import { AnonymousSubmissionModal } from '../anonymous/AnonymousSubmissionModal.
 import { DiscoverPeopleRow } from './DiscoverPeopleRow.tsx';
 import { FeedFilters } from './FeedFilters.tsx';
 import { PostCard } from './PostCard.tsx';
+import { StoriesBar } from '../stories/StoriesBar.tsx';
+import { CreateStoryModal } from '../stories/CreateStoryModal.tsx';
+import { StoryViewerModal } from '../stories/StoryViewerModal.tsx';
+import { fetchActiveStories, sortStoryGroups } from '../../lib/storyService.ts';
+import type { UserStoryGroup } from '../../types/stories.ts';
 import { filterPosts } from '../../utils/logic.ts';
 import { Loader2, Sparkles } from 'lucide-react';
 
 export const HomeView: React.FC = () => {
   const {
+    currentUser,
     posts,
     loadingPosts,
     loadingMorePosts,
@@ -20,14 +26,91 @@ export const HomeView: React.FC = () => {
     feedFilter,
     setCreatePostModalOpen,
     refreshPosts,
+    addToast,
   } = useApp();
   const [anonIntroOpen, setAnonIntroOpen] = useState(false);
   const [anonSubmitOpen, setAnonSubmitOpen] = useState(false);
+
+  // Stories state
+  const [storyGroups, setStoryGroups] = useState<UserStoryGroup[]>([]);
+  const [loadingStories, setLoadingStories] = useState<boolean>(true);
+  const [createStoryOpen, setCreateStoryOpen] = useState<boolean>(false);
+  const [storyViewerOpen, setStoryViewerOpen] = useState<boolean>(false);
+  const [selectedStoryGroupIdx, setSelectedStoryGroupIdx] = useState<number>(0);
+
+  const loadStories = useCallback(async () => {
+    if (!currentUser.id) {
+      setStoryGroups([]);
+      setLoadingStories(false);
+      return;
+    }
+    try {
+      const groups = await fetchActiveStories(currentUser.id);
+      setStoryGroups(groups);
+    } finally {
+      setLoadingStories(false);
+    }
+  }, [currentUser.id]);
+
+  useEffect(() => {
+    setLoadingStories(true);
+    loadStories();
+  }, [loadStories]);
+
+  const handleStoryViewed = useCallback(
+    (storyId: string) => {
+      setStoryGroups((prev) =>
+        sortStoryGroups(
+          prev.map((g) => ({
+            ...g,
+            stories: g.stories.map((s) =>
+              s.id === storyId ? { ...s, has_viewed: true } : s
+            ),
+          })),
+          currentUser.id || undefined
+        )
+      );
+    },
+    [currentUser.id]
+  );
+
+  const handleStoryDeleted = useCallback(
+    (storyId: string) => {
+      setStoryGroups((prev) =>
+        sortStoryGroups(
+          prev
+            .map((g) => ({
+              ...g,
+              stories: g.stories.filter((s) => s.id !== storyId),
+            }))
+            .filter((g) => g.stories.length > 0),
+          currentUser.id || undefined
+        )
+      );
+    },
+    [currentUser.id]
+  );
 
   const displayedPosts = filterPosts(posts, feedFilter);
 
   return (
     <div className="flex flex-col gap-4">
+      {/* 0. Campus Stories Bar */}
+      <StoriesBar
+        currentUserId={currentUser.id || undefined}
+        currentUserProfile={{
+          name: currentUser.name,
+          avatar_url: currentUser.avatar,
+        }}
+        storyGroups={storyGroups}
+        loading={loadingStories}
+        onSelectGroup={(idx) => {
+          setSelectedStoryGroupIdx(idx);
+          setStoryViewerOpen(true);
+        }}
+        onAddStory={() => setCreateStoryOpen(true)}
+      />
+
       {/* 1. Post Composer */}
       <PostComposer onOpenAnonymous={() => setAnonIntroOpen(true)} />
 
@@ -107,6 +190,30 @@ export const HomeView: React.FC = () => {
           )}
         </div>
       )}
+
+      {/* Stories Modals */}
+      <CreateStoryModal
+        isOpen={createStoryOpen}
+        onClose={() => setCreateStoryOpen(false)}
+        userId={currentUser.id}
+        onStoryCreated={loadStories}
+        onShowToast={(msg, type) =>
+          addToast(msg, type === 'error' ? 'warning' : type || 'info')
+        }
+      />
+
+      <StoryViewerModal
+        isOpen={storyViewerOpen}
+        onClose={() => setStoryViewerOpen(false)}
+        storyGroups={storyGroups}
+        initialGroupIndex={selectedStoryGroupIdx}
+        currentUserId={currentUser.id}
+        onStoryDeleted={handleStoryDeleted}
+        onStoryViewed={handleStoryViewed}
+        onShowToast={(msg, type) =>
+          addToast(msg, type === 'error' ? 'warning' : type || 'info')
+        }
+      />
 
       {/* Anonymous Submissions Modals */}
       <AnonymousIntroModal

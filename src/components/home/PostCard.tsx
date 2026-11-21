@@ -1,6 +1,6 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { useApp } from '../../context/AppContext.tsx';
-import type { Post, Comment } from '../../types/index.ts';
+import type { Post, Comment, PostMediaItem } from '../../types/index.ts';
 import { Avatar } from '../common/Avatar.tsx';
 import { LinkifiedText } from '../common/LinkifiedText.tsx';
 import {
@@ -11,6 +11,10 @@ import {
   toggleRealCommentReaction,
 } from '../../lib/postService.ts';
 import { resolveSinglePostMediaSignedUrl } from '../../lib/storageService.ts';
+import {
+  buildCloudinaryVideoDeliveryUrl,
+  buildCloudinaryVideoPosterUrl,
+} from '../../lib/cloudinaryService.ts';
 import { createRealNotification } from '../../lib/notificationService.ts';
 import { sendPrivacySafePush } from '../../lib/pushService.ts';
 import {
@@ -80,16 +84,45 @@ const findNewestCommentByActor = (list: Comment[], actorId: string): Comment | n
   return flat.length > 0 ? flat[flat.length - 1] : null;
 };
 
-const FeedVideoPlayer: React.FC<{ src: string }> = ({ src }) => {
+const FeedVideoPlayer: React.FC<{ src: string; item?: PostMediaItem }> = ({ src, item }) => {
   const videoRef = useRef<HTMLVideoElement>(null);
   const [isPlaying, setIsPlaying] = useState(false);
   const [showControls, setShowControls] = useState(false);
   const [hasError, setHasError] = useState(false);
   const [retryKey, setRetryKey] = useState(0);
 
+  const deliverySrc = buildCloudinaryVideoDeliveryUrl(src, {
+    trimStart: item?.trim_start,
+    trimEnd: item?.trim_end,
+    isMuted: item?.is_muted,
+    aspectRatio: item?.aspect_ratio,
+  });
+  const posterSrc =
+    item?.thumbnail_url ||
+    buildCloudinaryVideoPosterUrl(src, { timeOffset: item?.trim_start ?? 0 }) ||
+    undefined;
+
+  const isTrimmedClientFallback =
+    !src.includes('/video/upload/') &&
+    typeof item?.trim_start === 'number' &&
+    typeof item?.trim_end === 'number' &&
+    item.trim_end > item.trim_start;
+
+  const aspectClass =
+    item?.aspect_ratio === '1:1'
+      ? 'aspect-square max-h-[500px]'
+      : item?.aspect_ratio === '9:16'
+      ? 'aspect-[9/16] max-h-[520px] mx-auto'
+      : item?.aspect_ratio === '16:9'
+      ? 'aspect-video max-h-[500px]'
+      : 'max-h-[500px]';
+
   const togglePlay = () => {
     if (!videoRef.current || hasError) return;
     if (videoRef.current.paused) {
+      if (isTrimmedClientFallback && typeof item?.trim_start === 'number' && videoRef.current.currentTime < item.trim_start) {
+        videoRef.current.currentTime = item.trim_start;
+      }
       videoRef.current.play().catch(() => {});
       setIsPlaying(true);
       setShowControls(true);
@@ -109,7 +142,7 @@ const FeedVideoPlayer: React.FC<{ src: string }> = ({ src }) => {
             setHasError(false);
             setRetryKey((k) => k + 1);
           }}
-          className="min-h-[40px] px-3.5 py-1.5 rounded-xl bg-white/15 hover:bg-white/25 text-white text-xs font-semibold flex items-center gap-1.5"
+          className="min-h-[44px] px-3.5 py-1.5 rounded-xl bg-white/15 hover:bg-white/25 text-white text-xs font-semibold flex items-center gap-1.5"
         >
           <RefreshCw className="w-3.5 h-3.5" />
           <span>Retry Video</span>
@@ -119,18 +152,34 @@ const FeedVideoPlayer: React.FC<{ src: string }> = ({ src }) => {
   }
 
   return (
-    <div className="relative group rounded-2xl overflow-hidden bg-neutral-950 flex items-center justify-center max-h-[500px] w-full">
+    <div className={`relative group rounded-2xl overflow-hidden bg-neutral-950 flex items-center justify-center w-full ${aspectClass}`}>
       <video
         key={retryKey}
         ref={videoRef}
-        src={src}
+        src={deliverySrc}
+        poster={posterSrc}
+        muted={Boolean(item?.is_muted)}
         playsInline
         preload="metadata"
         controls={showControls}
+        onLoadedMetadata={(e) => {
+          if (isTrimmedClientFallback && typeof item?.trim_start === 'number') {
+            e.currentTarget.currentTime = item.trim_start;
+          }
+        }}
+        onTimeUpdate={(e) => {
+          if (
+            isTrimmedClientFallback &&
+            typeof item?.trim_end === 'number' &&
+            e.currentTarget.currentTime >= item.trim_end
+          ) {
+            e.currentTarget.currentTime = item.trim_start || 0;
+          }
+        }}
         onPlay={() => setIsPlaying(true)}
         onPause={() => setIsPlaying(false)}
         onError={() => setHasError(true)}
-        className="w-full max-h-[500px] object-contain rounded-2xl"
+        className={`w-full h-full ${item?.aspect_ratio && item.aspect_ratio !== 'original' ? 'object-cover' : 'object-contain'} max-h-[500px] rounded-2xl`}
       />
       {!isPlaying && (
         <button
@@ -865,7 +914,18 @@ export const PostCard: React.FC<PostCardProps> = ({
                 ) : isVideo ? (
                   <video
                     key={retryCount}
-                    src={effectiveUrl}
+                    src={buildCloudinaryVideoDeliveryUrl(effectiveUrl, {
+                      trimStart: item.trim_start,
+                      trimEnd: item.trim_end,
+                      isMuted: item.is_muted,
+                      aspectRatio: item.aspect_ratio,
+                    })}
+                    poster={
+                      item.thumbnail_url ||
+                      buildCloudinaryVideoPosterUrl(effectiveUrl, { timeOffset: item.trim_start ?? 0 }) ||
+                      undefined
+                    }
+                    muted={Boolean(item.is_muted)}
                     controls
                     playsInline
                     preload="metadata"
@@ -914,7 +974,7 @@ export const PostCard: React.FC<PostCardProps> = ({
           return (
             <div className="mt-3 rounded-2xl overflow-hidden border border-[var(--color-border)] bg-black/90">
               {isSingleVideo && !isBroken ? (
-                <FeedVideoPlayer src={singleMedia} />
+                <FeedVideoPlayer src={singleMedia} item={singleItem} />
               ) : isBroken ? (
                 <div className="p-6 text-center flex flex-col items-center justify-center gap-2.5 min-h-[180px]">
                   <p className="text-xs font-semibold text-white">Photo could not be loaded</p>

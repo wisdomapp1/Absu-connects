@@ -1,10 +1,16 @@
 import { supabase } from './supabase.ts';
 import type { Story, UserStoryGroup, StoryMediaType, StoryViewItem } from '../types/stories.ts';
 import {
-  uploadStoryMediaToStorage,
   resolveStoryMediaSignedUrl,
   deleteStoryMediaFromStorage,
 } from './storageService.ts';
+import {
+  uploadMediaToCloudinary,
+  deleteCloudinaryAssets,
+  buildCloudinaryVideoPosterUrl,
+  extractCloudinaryPublicId,
+} from './cloudinaryService.ts';
+import { compressImageForUpload, validatePostVideoFile } from './mediaCompression.ts';
 import { getOrCreateDirectConversation, sendRealMessage } from './messageService.ts';
 import type { User } from '../types/index.ts';
 
@@ -50,20 +56,63 @@ export function sortStoryGroups(
 export async function fetchActiveStories(currentUserId?: string): Promise<UserStoryGroup[]> {
   try {
     const nowIso = new Date().toISOString();
-    const { data: storiesData, error: storiesErr } = await supabase
+
+    let storiesData: any[] | null = null;
+    let storiesErr: any = null;
+
+    const extRes = await supabase
       .from('stories')
       .select(`
         id,
         user_id,
         media_type,
         storage_path,
+        media_url,
+        provider,
+        cloudinary_public_id,
+        cloudinary_resource_type,
+        duration_seconds,
+        thumbnail_url,
         text_content,
         caption,
+        background_color,
+        font_style,
+        deleted_at,
         created_at,
         expires_at
       `)
       .gt('expires_at', nowIso)
+      .is('deleted_at', null)
       .order('created_at', { ascending: true });
+
+    if (
+      extRes.error &&
+      (extRes.error.code === '42703' ||
+        extRes.error.code === 'PGRST204' ||
+        extRes.error.message?.toLowerCase().includes('column'))
+    ) {
+      const coreRes = await supabase
+        .from('stories')
+        .select(`
+          id,
+          user_id,
+          media_type,
+          storage_path,
+          text_content,
+          caption,
+          background_color,
+          font_style,
+          created_at,
+          expires_at
+        `)
+        .gt('expires_at', nowIso)
+        .order('created_at', { ascending: true });
+      storiesData = coreRes.data;
+      storiesErr = coreRes.error;
+    } else {
+      storiesData = extRes.data;
+      storiesErr = extRes.error;
+    }
 
     if (storiesErr || !storiesData || storiesData.length === 0) {
       if (storiesErr) {
@@ -113,9 +162,16 @@ export async function fetchActiveStories(currentUserId?: string): Promise<UserSt
 
     const resolvedStories: Story[] = await Promise.all(
       storiesData.map(async (row) => {
-        let signedUrl = row.storage_path;
-        if (row.storage_path && row.media_type !== 'text') {
-          signedUrl = await resolveStoryMediaSignedUrl(row.storage_path);
+        const rawMediaRef = row.media_url || row.storage_path || '';
+        const isDirectUrl =
+          row.provider === 'cloudinary' ||
+          rawMediaRef.startsWith('https://') ||
+          rawMediaRef.startsWith('http://') ||
+          rawMediaRef.startsWith('data:');
+
+        let signedUrl = rawMediaRef;
+        if (rawMediaRef && row.media_type !== 'text' && !isDirectUrl) {
+          signedUrl = await resolveStoryMediaSignedUrl(rawMediaRef);
         }
 
         const author = profileMap.get(row.user_id);
@@ -127,8 +183,16 @@ export async function fetchActiveStories(currentUserId?: string): Promise<UserSt
           user_id: row.user_id,
           media_type: row.media_type as StoryMediaType,
           storage_path: signedUrl,
+          media_url: row.media_url || signedUrl,
+          provider: row.provider || (signedUrl.includes('res.cloudinary.com') ? 'cloudinary' : 'supabase'),
+          cloudinary_public_id: row.cloudinary_public_id || null,
+          cloudinary_resource_type: row.cloudinary_resource_type || null,
+          duration_seconds: row.duration_seconds ?? null,
+          thumbnail_url: row.thumbnail_url || null,
           text_content: row.text_content,
           caption: row.caption,
+          background_color: row.background_color || null,
+          font_style: row.font_style || null,
           created_at: row.created_at,
           expires_at: row.expires_at,
           has_viewed: viewedStorySet.has(row.id),
@@ -176,8 +240,8 @@ export async function fetchActiveStories(currentUserId?: string): Promise<UserSt
 }
 
 /**
- * Create a new 24-hour story (Text, Image, or Video) strictly via Supabase Storage ('story-media') & Supabase DB ('stories').
- * Client never sets `created_at` or `expires_at` manually; PostgreSQL handles defaults/triggers.
+ * Create a new 24-hour story (Text, Image, or Video) via Cloudinary (`absu-connect/stories`) & Supabase DB (`stories`).
+ * Writes both `storage_path` (MPV1 compat) and `media_url` / Cloudinary metadata (MPV2).
  */
 export async function createStory(params: {
   userId: string;
@@ -189,11 +253,41 @@ export async function createStory(params: {
   backgroundColor?: string;
   fontStyle?: string;
   onProgress?: (msg: string) => void;
-}): Promise<{ success: boolean; story?: Story; error?: string }> {
-  let uploadedStoragePath: string | null = null;
+  onPercent?: (percent: number) => void;
+  signal?: AbortSignal;
+}): Promise<{ success: boolean; story?: Story; error?: string; aborted?: boolean }> {
+  let uploadedPublicId: string | null = null;
+  let uploadedResourceType: 'image' | 'video' = 'image';
+
+  const rollbackCloudinary = async () => {
+    if (uploadedPublicId) {
+      await deleteCloudinaryAssets([
+        {
+          public_id: uploadedPublicId,
+          resource_type: uploadedResourceType,
+          entity_type: 'story',
+        },
+      ]).catch(() => {});
+    }
+  };
 
   try {
-    const { userId, mediaType, file, fallbackUrl, textContent, caption, onProgress } = params;
+    const {
+      userId,
+      mediaType,
+      file,
+      textContent,
+      caption,
+      backgroundColor,
+      fontStyle,
+      onProgress,
+      onPercent,
+      signal,
+    } = params;
+
+    if (signal?.aborted) {
+      return { success: false, aborted: true, error: 'Story upload cancelled.' };
+    }
 
     const { data: sessionData } = await supabase.auth.getSession();
     const effectiveUserId = sessionData?.session?.user?.id || userId;
@@ -202,58 +296,118 @@ export async function createStory(params: {
     }
 
     let resolvedMediaUrl: string | null = null;
+    let durationSeconds: number | null = null;
+    let thumbnailUrl: string | null = null;
 
     if (mediaType === 'image' || mediaType === 'video') {
       if (!file) {
         return { success: false, error: 'Please choose an image or video to post.' };
       }
 
-      onProgress?.(`Uploading ${mediaType} story to Supabase Storage...`);
-      const sbResult = await uploadStoryMediaToStorage(
-        effectiveUserId,
-        file,
-        mediaType,
+      let fileToUpload = file;
+      if (mediaType === 'video') {
+        const vidVal = await validatePostVideoFile(fileToUpload);
+        if (!vidVal.valid) {
+          return { success: false, error: vidVal.error || 'Invalid story video.' };
+        }
+        durationSeconds = vidVal.metadata?.duration ?? null;
+      } else {
+        onProgress?.('Optimizing photo story...');
+        const comp = await compressImageForUpload(fileToUpload, 2.5, 1920);
+        fileToUpload = comp.file;
+      }
+
+      const cldRes = await uploadMediaToCloudinary(fileToUpload, 'story', {
         onProgress,
-        fallbackUrl
-      );
-      if (!sbResult.success || !sbResult.path) {
+        onPercent,
+        signal,
+        maxBytes: 50 * 1024 * 1024,
+      });
+
+      if (!cldRes.success || !cldRes.secure_url) {
         return {
           success: false,
-          error: sbResult.error || 'Failed to upload story media to Supabase Storage.',
+          aborted: cldRes.aborted,
+          error: cldRes.error || 'Failed to upload story media to Cloudinary.',
         };
       }
-      uploadedStoragePath = sbResult.path;
-      resolvedMediaUrl = sbResult.url || sbResult.path;
+
+      uploadedPublicId = cldRes.public_id || cldRes.asset_id || null;
+      uploadedResourceType = mediaType === 'video' ? 'video' : 'image';
+      resolvedMediaUrl = cldRes.secure_url;
+      if (mediaType === 'video') {
+        durationSeconds = durationSeconds ?? cldRes.duration ?? null;
+        thumbnailUrl = buildCloudinaryVideoPosterUrl(cldRes.secure_url) || null;
+      }
     } else if (mediaType === 'text') {
       if (!textContent || textContent.trim().length === 0) {
         return { success: false, error: 'Please write something for your text story.' };
       }
+      onPercent?.(50);
     }
 
-    onProgress?.('Saving story to Supabase...');
+    if (signal?.aborted) {
+      await rollbackCloudinary();
+      return { success: false, aborted: true, error: 'Story upload cancelled.' };
+    }
 
-    const { data: sbData, error: insertError } = await supabase
+    onProgress?.('Saving story...');
+    onPercent?.(95);
+
+    const extendedPayload: Record<string, any> = {
+      user_id: effectiveUserId,
+      media_type: mediaType,
+      storage_path: resolvedMediaUrl,
+      media_url: resolvedMediaUrl,
+      provider: resolvedMediaUrl ? 'cloudinary' : null,
+      cloudinary_public_id: uploadedPublicId,
+      cloudinary_resource_type: resolvedMediaUrl ? uploadedResourceType : null,
+      duration_seconds: durationSeconds,
+      thumbnail_url: thumbnailUrl,
+      cleanup_status: 'pending',
+      text_content: mediaType === 'text' ? textContent?.trim() : null,
+      caption: caption?.trim() || null,
+      background_color: backgroundColor || null,
+      font_style: fontStyle || null,
+    };
+
+    let { data: sbData, error: insertError } = await supabase
       .from('stories')
-      .insert({
-        user_id: effectiveUserId,
-        media_type: mediaType,
-        storage_path: uploadedStoragePath,
-        text_content: mediaType === 'text' ? textContent?.trim() : null,
-        caption: caption?.trim() || null,
-      })
+      .insert(extendedPayload)
       .select()
       .single();
 
+    if (
+      insertError &&
+      (insertError.code === '42703' ||
+        insertError.code === 'PGRST204' ||
+        insertError.message?.toLowerCase().includes('schema cache') ||
+        insertError.message?.toLowerCase().includes('column'))
+    ) {
+      const corePayload: Record<string, any> = {
+        user_id: effectiveUserId,
+        media_type: mediaType,
+        storage_path: resolvedMediaUrl,
+        text_content: mediaType === 'text' ? textContent?.trim() : null,
+        caption: caption?.trim() || null,
+        background_color: backgroundColor || null,
+        font_style: fontStyle || null,
+      };
+      const fallbackRes = await supabase.from('stories').insert(corePayload).select().single();
+      sbData = fallbackRes.data;
+      insertError = fallbackRes.error;
+    }
+
     if (insertError || !sbData) {
       console.error('[Stories] Supabase stories insert error:', insertError?.message);
-      if (uploadedStoragePath) {
-        await deleteStoryMediaFromStorage(uploadedStoragePath);
-      }
+      await rollbackCloudinary();
       return {
         success: false,
         error: insertError?.message || 'Failed to save story record in database.',
       };
     }
+
+    onPercent?.(100);
 
     return {
       success: true,
@@ -261,20 +415,24 @@ export async function createStory(params: {
         id: sbData.id,
         user_id: sbData.user_id,
         media_type: sbData.media_type as StoryMediaType,
-        storage_path:
-          resolvedMediaUrl ||
-          (sbData.storage_path ? await resolveStoryMediaSignedUrl(sbData.storage_path) : null),
+        storage_path: resolvedMediaUrl || sbData.storage_path || null,
+        media_url: sbData.media_url || resolvedMediaUrl || sbData.storage_path || null,
+        provider: sbData.provider || (resolvedMediaUrl ? 'cloudinary' : null),
+        cloudinary_public_id: sbData.cloudinary_public_id || uploadedPublicId,
+        cloudinary_resource_type: sbData.cloudinary_resource_type || (resolvedMediaUrl ? uploadedResourceType : null),
+        duration_seconds: sbData.duration_seconds ?? durationSeconds,
+        thumbnail_url: sbData.thumbnail_url ?? thumbnailUrl,
         text_content: sbData.text_content,
         caption: sbData.caption,
+        background_color: sbData.background_color || backgroundColor || null,
+        font_style: sbData.font_style || fontStyle || null,
         created_at: sbData.created_at,
         expires_at: sbData.expires_at,
         has_viewed: true,
       },
     };
   } catch (err: unknown) {
-    if (uploadedStoragePath) {
-      await deleteStoryMediaFromStorage(uploadedStoragePath);
-    }
+    await rollbackCloudinary();
     const msg = err instanceof Error ? err.message : 'Failed to publish story';
     return { success: false, error: msg };
   }
@@ -480,27 +638,83 @@ export async function fetchStoryInsights(storyId: string): Promise<{
 }
 
 /**
- * Delete a story from Supabase and clean up its `story-media` storage object.
+ * Delete a story and remove its Cloudinary or legacy Storage asset.
+ * If Cloudinary deletion fails transiently, soft-deletes the story immediately so scheduled cleanup retries.
  */
 export async function deleteStory(
   storyId: string,
   storagePath?: string | null
 ): Promise<{ success: boolean; error?: string }> {
   try {
-    const { data: storyRow } = await supabase
+    let storyRow: any = null;
+    const extSel = await supabase
       .from('stories')
-      .select('storage_path')
+      .select('id, storage_path, media_url, provider, media_type, cloudinary_public_id, cloudinary_resource_type')
       .eq('id', storyId)
       .maybeSingle();
+
+    if (extSel.error) {
+      const coreSel = await supabase
+        .from('stories')
+        .select('id, storage_path, media_type')
+        .eq('id', storyId)
+        .maybeSingle();
+      storyRow = coreSel.data;
+    } else {
+      storyRow = extSel.data;
+    }
+
+    const mediaRef = storyRow?.media_url || storyRow?.storage_path || storagePath || '';
+    const isCloudinary =
+      storyRow?.provider === 'cloudinary' ||
+      Boolean(storyRow?.cloudinary_public_id) ||
+      String(mediaRef).includes('res.cloudinary.com');
+
+    let cloudCleanupSucceeded = true;
+
+    if (isCloudinary) {
+      const publicId =
+        storyRow?.cloudinary_public_id || extractCloudinaryPublicId(mediaRef);
+      if (publicId) {
+        const resType: 'image' | 'video' =
+          storyRow?.cloudinary_resource_type === 'video' || storyRow?.media_type === 'video'
+            ? 'video'
+            : 'image';
+        const delRes = await deleteCloudinaryAssets([
+          {
+            public_id: publicId,
+            resource_type: resType,
+            entity_type: 'story',
+            entity_id: storyId,
+          },
+        ]);
+        cloudCleanupSucceeded = delRes.success;
+      }
+    }
+
+    if (isCloudinary && !cloudCleanupSucceeded) {
+      // Soft-delete immediately so story disappears from active feed and cron retries Cloudinary cleanup
+      const { error: softErr } = await supabase
+        .from('stories')
+        .update({
+          deleted_at: new Date().toISOString(),
+          cleanup_status: 'pending',
+        })
+        .eq('id', storyId);
+
+      if (!softErr) {
+        return { success: true };
+      }
+      // If deleted_at column is not yet migrated, proceed with hard delete
+    }
 
     const { error } = await supabase.from('stories').delete().eq('id', storyId);
     if (error) {
       return { success: false, error: error.message };
     }
 
-    const rawPath = storyRow?.storage_path || storagePath;
-    if (rawPath && !rawPath.startsWith('http')) {
-      await deleteStoryMediaFromStorage(rawPath);
+    if (!isCloudinary && mediaRef && !mediaRef.startsWith('http')) {
+      await deleteStoryMediaFromStorage(mediaRef);
     }
     return { success: true };
   } catch (err: unknown) {

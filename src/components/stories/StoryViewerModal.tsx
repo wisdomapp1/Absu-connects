@@ -10,6 +10,21 @@ import {
 import { Avatar } from '../common/Avatar.tsx';
 import { Volume2, VolumeX } from 'lucide-react';
 
+const ALLOWED_STORY_GRADIENTS: Record<string, string> = {
+  'from-blue-600 via-indigo-700 to-slate-950': 'from-blue-600 via-indigo-700 to-slate-950',
+  'from-rose-600 via-pink-700 to-slate-950': 'from-rose-600 via-pink-700 to-slate-950',
+  'from-emerald-600 via-teal-700 to-slate-950': 'from-emerald-600 via-teal-700 to-slate-950',
+  'from-purple-600 via-fuchsia-800 to-slate-950': 'from-purple-600 via-fuchsia-800 to-slate-950',
+  'from-amber-500 via-orange-600 to-rose-950': 'from-amber-500 via-orange-600 to-rose-950',
+  'from-slate-900 via-neutral-900 to-black': 'from-slate-900 via-neutral-900 to-black',
+};
+
+const ALLOWED_STORY_FONTS: Record<string, string> = {
+  classic: 'font-sans font-bold',
+  serif: 'font-serif font-bold',
+  mono: 'font-mono font-bold',
+};
+
 interface StoryViewerModalProps {
   isOpen: boolean;
   onClose: () => void;
@@ -51,11 +66,13 @@ export const StoryViewerModal: React.FC<StoryViewerModalProps> = ({
   const [mediaRetryKey, setMediaRetryKey] = useState(0);
   const [isMuted, setIsMuted] = useState(false);
   const [videoDurationMs, setVideoDurationMs] = useState<number>(15000);
+  const [dragOffsetY, setDragOffsetY] = useState(0);
 
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const timerRef = useRef<number | null>(null);
   const viewedInSessionRef = useRef<Set<string>>(new Set());
   const wasOpenRef = useRef(false);
+  const touchStartRef = useRef<{ x: number; y: number } | null>(null);
   const storyGroupsRef = useRef(storyGroups);
   storyGroupsRef.current = storyGroups;
   const onStoryViewedRef = useRef(onStoryViewed);
@@ -236,13 +253,47 @@ export const StoryViewerModal: React.FC<StoryViewerModalProps> = ({
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/95 select-none">
-      {/* Container simulating mobile story viewport */}
+      {/* Container simulating mobile story viewport with swipe-down-to-close */}
       <div
-        className="relative w-full max-w-md h-full max-h-[92vh] sm:rounded-3xl overflow-hidden bg-slate-950 flex flex-col justify-between shadow-2xl"
+        className="relative w-full max-w-md h-full max-h-[92vh] sm:rounded-3xl overflow-hidden bg-slate-950 flex flex-col justify-between shadow-2xl transition-transform duration-150"
+        style={
+          dragOffsetY > 0
+            ? {
+                transform: `translateY(${dragOffsetY}px)`,
+                opacity: Math.max(0.4, 1 - dragOffsetY / 320),
+              }
+            : undefined
+        }
         onMouseDown={() => setIsPaused(true)}
         onMouseUp={() => setIsPaused(false)}
-        onTouchStart={() => setIsPaused(true)}
-        onTouchEnd={() => setIsPaused(false)}
+        onTouchStart={(e) => {
+          setIsPaused(true);
+          const touch = e.touches[0];
+          if (touch && !showInsights) {
+            touchStartRef.current = { x: touch.clientX, y: touch.clientY };
+          }
+        }}
+        onTouchMove={(e) => {
+          if (!touchStartRef.current || showInsights) return;
+          const touch = e.touches[0];
+          if (!touch) return;
+          const dy = touch.clientY - touchStartRef.current.y;
+          const dx = Math.abs(touch.clientX - touchStartRef.current.x);
+          if (dy > 14 && dy > dx) {
+            setDragOffsetY(dy);
+          }
+        }}
+        onTouchEnd={() => {
+          setIsPaused(false);
+          if (dragOffsetY >= 90) {
+            setDragOffsetY(0);
+            touchStartRef.current = null;
+            onClose();
+            return;
+          }
+          setDragOffsetY(0);
+          touchStartRef.current = null;
+        }}
       >
         {/* Progress Bars */}
         <div className="absolute top-0 inset-x-0 z-30 p-3 pt-4 flex space-x-1.5 bg-gradient-to-b from-black/80 to-transparent">
@@ -369,8 +420,17 @@ export const StoryViewerModal: React.FC<StoryViewerModalProps> = ({
 
           {/* Text Story */}
           {currentStory.media_type === 'text' && (
-            <div className="w-full h-full bg-gradient-to-tr from-indigo-900 via-blue-800 to-sky-700 flex items-center justify-center p-8 text-center">
-              <p className="text-white text-xl sm:text-2xl font-bold leading-relaxed tracking-wide drop-shadow-md">
+            <div
+              className={`w-full h-full bg-gradient-to-tr ${
+                (currentStory.background_color && ALLOWED_STORY_GRADIENTS[currentStory.background_color]) ||
+                'from-indigo-900 via-blue-800 to-sky-700'
+              } flex items-center justify-center p-8 text-center`}
+            >
+              <p
+                className={`text-white text-xl sm:text-2xl leading-relaxed tracking-wide drop-shadow-md ${
+                  (currentStory.font_style && ALLOWED_STORY_FONTS[currentStory.font_style]) || 'font-bold'
+                }`}
+              >
                 {currentStory.text_content}
               </p>
             </div>
@@ -401,7 +461,7 @@ export const StoryViewerModal: React.FC<StoryViewerModalProps> = ({
           {currentStory.media_type === 'image' && !mediaError && (
             <img
               key={`${currentStory.id}-${mediaRetryKey}`}
-              src={currentStory.storage_path || ''}
+              src={currentStory.media_url || currentStory.storage_path || ''}
               alt="Story"
               referrerPolicy="no-referrer"
               onError={() => setMediaError(true)}
@@ -414,7 +474,8 @@ export const StoryViewerModal: React.FC<StoryViewerModalProps> = ({
             <video
               key={`${currentStory.id}-${mediaRetryKey}`}
               ref={videoRef}
-              src={currentStory.storage_path || ''}
+              src={currentStory.media_url || currentStory.storage_path || ''}
+              poster={currentStory.thumbnail_url || undefined}
               onLoadedMetadata={(e) => {
                 const dur = e.currentTarget.duration;
                 if (Number.isFinite(dur) && dur > 0) {

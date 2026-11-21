@@ -33,18 +33,59 @@ export function registerStoryRoutes(app: Express) {
       const currentUserId = req.query.userId as string | undefined;
       const nowIso = new Date().toISOString();
 
-      const { data: dbStories, error } = await sb
+      let storiesData: any[] | null = null;
+      let storiesErr: any = null;
+
+      const extRes = await sb
         .from('stories')
-        .select('id, user_id, media_type, storage_path, text_content, caption, created_at, expires_at')
+        .select(`
+          id,
+          user_id,
+          media_type,
+          storage_path,
+          media_url,
+          provider,
+          cloudinary_public_id,
+          cloudinary_resource_type,
+          duration_seconds,
+          thumbnail_url,
+          text_content,
+          caption,
+          background_color,
+          font_style,
+          deleted_at,
+          created_at,
+          expires_at
+        `)
         .gt('expires_at', nowIso)
+        .is('deleted_at', null)
         .order('created_at', { ascending: true });
 
-      if (error) {
-        res.status(500).json({ success: false, error: error.message });
+      if (
+        extRes.error &&
+        (extRes.error.code === '42703' ||
+          extRes.error.code === 'PGRST204' ||
+          extRes.error.message?.toLowerCase().includes('schema cache') ||
+          extRes.error.message?.toLowerCase().includes('column'))
+      ) {
+        const coreRes = await sb
+          .from('stories')
+          .select('id, user_id, media_type, storage_path, text_content, caption, created_at, expires_at')
+          .gt('expires_at', nowIso)
+          .order('created_at', { ascending: true });
+        storiesData = coreRes.data;
+        storiesErr = coreRes.error;
+      } else {
+        storiesData = extRes.data;
+        storiesErr = extRes.error;
+      }
+
+      if (storiesErr) {
+        res.status(500).json({ success: false, error: storiesErr.message });
         return;
       }
 
-      const stories = dbStories || [];
+      const stories = storiesData || [];
       const userIds = Array.from(new Set(stories.map((s) => s.user_id)));
       const storyIds = stories.map((s) => s.id);
       const profileMap = new Map<string, any>();
@@ -59,18 +100,18 @@ export function registerStoryRoutes(app: Express) {
         }
       }
 
-      // Batch sign private story-media storage paths
+      // Batch sign private legacy story-media storage paths
       const mediaPaths = Array.from(
         new Set(
           stories
+            .map((s) => (s.media_url || s.storage_path || '') as string)
             .filter(
-              (s) =>
-                s.storage_path &&
-                s.media_type !== 'text' &&
-                !s.storage_path.startsWith('http://') &&
-                !s.storage_path.startsWith('https://')
+              (ref) =>
+                Boolean(ref) &&
+                !ref.startsWith('http://') &&
+                !ref.startsWith('https://') &&
+                !ref.startsWith('data:')
             )
-            .map((s) => s.storage_path as string)
         )
       );
 
@@ -108,14 +149,19 @@ export function registerStoryRoutes(app: Express) {
       for (const story of stories) {
         const author = profileMap.get(story.user_id);
         const displayName = author?.display_name || author?.username || 'ABSU Student';
+        const rawRef = story.media_url || story.storage_path || '';
         const resolvedPath =
-          story.storage_path && signedUrlMap.has(story.storage_path)
-            ? signedUrlMap.get(story.storage_path)
-            : story.storage_path;
+          story.media_type === 'text'
+            ? null
+            : rawRef && signedUrlMap.has(rawRef)
+            ? signedUrlMap.get(rawRef)
+            : rawRef || null;
 
         const resolvedStory = {
           ...story,
           storage_path: resolvedPath,
+          media_url: story.media_url || resolvedPath,
+          provider: story.provider || (String(resolvedPath || '').includes('res.cloudinary.com') ? 'cloudinary' : 'supabase'),
           raw_storage_path: story.storage_path,
           has_viewed: viewedSet.has(story.id),
           has_reacted: reactedSet.has(story.id),
@@ -165,49 +211,94 @@ export function registerStoryRoutes(app: Express) {
     }
   });
 
-  // 2. Publish a new 24-hour story to Supabase
+  // 2. Publish a new 24-hour story to Supabase (MPV2 Cloudinary + MPV1 schema compatibility)
   app.post('/api/stories', async (req: Request, res: Response) => {
     try {
       const sb = createUserClient(req);
       const userId = req.body.userId || req.body.user_id;
       const mediaType = req.body.mediaType || req.body.media_type;
       const storagePath = req.body.storagePath || req.body.storage_path;
+      const mediaUrl = req.body.mediaUrl || req.body.media_url || storagePath || null;
+      const provider = req.body.provider || (String(mediaUrl || '').includes('res.cloudinary.com') ? 'cloudinary' : null);
+      const cloudinaryPublicId = req.body.cloudinaryPublicId || req.body.cloudinary_public_id || null;
+      const cloudinaryResourceType = req.body.cloudinaryResourceType || req.body.cloudinary_resource_type || null;
+      const durationSeconds = req.body.durationSeconds ?? req.body.duration_seconds ?? null;
+      const thumbnailUrl = req.body.thumbnailUrl || req.body.thumbnail_url || null;
+      const backgroundColor = req.body.backgroundColor || req.body.background_color || null;
+      const fontStyle = req.body.fontStyle || req.body.font_style || null;
       const textContent = req.body.textContent || req.body.text_content;
       const caption = req.body.caption;
+      const expiresAt =
+        req.body.expiresAt ||
+        req.body.expires_at ||
+        new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
 
       if (!userId || !mediaType) {
         res.status(400).json({ success: false, error: 'Missing required parameters (userId and mediaType are required).' });
         return;
       }
 
-      const { data, error } = await sb
+      const extendedPayload: Record<string, any> = {
+        user_id: userId,
+        media_type: mediaType,
+        storage_path: mediaUrl || null,
+        media_url: mediaUrl || null,
+        provider: provider || 'supabase',
+        cloudinary_public_id: cloudinaryPublicId,
+        cloudinary_resource_type: cloudinaryResourceType,
+        duration_seconds: durationSeconds,
+        thumbnail_url: thumbnailUrl,
+        cleanup_status: cloudinaryPublicId ? 'pending' : 'not_needed',
+        text_content: textContent ? String(textContent).trim() : null,
+        caption: caption ? String(caption).trim() : null,
+        background_color: backgroundColor,
+        font_style: fontStyle,
+        expires_at: expiresAt,
+      };
+
+      let { data, error } = await sb
         .from('stories')
-        .insert({
-          user_id: userId,
-          media_type: mediaType,
-          storage_path: storagePath || null,
-          text_content: textContent ? String(textContent).trim() : null,
-          caption: caption ? String(caption).trim() : null,
-        })
+        .insert(extendedPayload)
         .select()
         .single();
+
+      if (
+        error &&
+        (error.code === '42703' ||
+          error.code === 'PGRST204' ||
+          error.message?.toLowerCase().includes('schema cache') ||
+          error.message?.toLowerCase().includes('column'))
+      ) {
+        const corePayload: Record<string, any> = {
+          user_id: userId,
+          media_type: mediaType,
+          storage_path: mediaUrl || null,
+          text_content: textContent ? String(textContent).trim() : null,
+          caption: caption ? String(caption).trim() : null,
+          expires_at: expiresAt,
+        };
+        const retryRes = await sb.from('stories').insert(corePayload).select().single();
+        data = retryRes.data;
+        error = retryRes.error;
+      }
 
       if (error || !data) {
         res.status(400).json({ success: false, error: error?.message || 'Failed to save story' });
         return;
       }
 
-      let signedUrl = data.storage_path;
+      let signedUrl = data.media_url || data.storage_path || mediaUrl;
       if (
-        data.storage_path &&
+        signedUrl &&
         data.media_type !== 'text' &&
-        !data.storage_path.startsWith('http://') &&
-        !data.storage_path.startsWith('https://')
+        !signedUrl.startsWith('http://') &&
+        !signedUrl.startsWith('https://') &&
+        !signedUrl.startsWith('data:')
       ) {
         try {
           const { data: signRes } = await sb.storage
             .from('story-media')
-            .createSignedUrl(data.storage_path, 86400);
+            .createSignedUrl(signedUrl, 86400);
           if (signRes?.signedUrl) {
             signedUrl = signRes.signedUrl;
           }
@@ -221,6 +312,14 @@ export function registerStoryRoutes(app: Express) {
         story: {
           ...data,
           storage_path: signedUrl,
+          media_url: data.media_url || signedUrl,
+          provider: data.provider || provider,
+          cloudinary_public_id: data.cloudinary_public_id || cloudinaryPublicId,
+          cloudinary_resource_type: data.cloudinary_resource_type || cloudinaryResourceType,
+          duration_seconds: data.duration_seconds ?? durationSeconds,
+          thumbnail_url: data.thumbnail_url ?? thumbnailUrl,
+          background_color: data.background_color ?? backgroundColor,
+          font_style: data.font_style ?? fontStyle,
           raw_storage_path: data.storage_path,
         },
       });

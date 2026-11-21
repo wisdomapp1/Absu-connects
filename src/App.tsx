@@ -12,6 +12,7 @@ import { BottomNav } from './components/layout/BottomNav.tsx';
 import { DesktopSidebar } from './components/layout/DesktopSidebar.tsx';
 import { DesktopRightSidebar } from './components/layout/DesktopRightSidebar.tsx';
 import { HomeView } from './components/home/HomeView.tsx';
+import { ReelsView } from './components/reels/ReelsView.tsx';
 import { PostDetailView } from './components/home/PostDetailView.tsx';
 import { FriendsView } from './components/friends/FriendsView.tsx';
 import { MessagesInbox } from './components/messages/MessagesInbox.tsx';
@@ -131,6 +132,8 @@ const AppContent: React.FC = () => {
     switch (activeView) {
       case 'home':
         return <HomeView />;
+      case 'reels':
+        return <ReelsView />;
       case 'friends':
         return <FriendsView />;
       case 'messages':
@@ -174,6 +177,7 @@ const AppContent: React.FC = () => {
   };
 
   const isDedicatedChatView = activeView === 'conversation' || activeView === 'contact-info';
+  const isDedicatedReelsView = activeView === 'reels' && !searchOpen;
 
   return (
     <div
@@ -186,8 +190,8 @@ const AppContent: React.FC = () => {
         </div>
       )}
 
-      {/* 1. Global Application Header (Hidden on mobile during DM / Contact Info for true native full-screen experience) */}
-      <div className={isDedicatedChatView ? 'hidden md:block shrink-0' : 'block shrink-0'}>
+      {/* 1. Global Application Header (Hidden on mobile during DM / Contact Info / Reels for native full-screen experience) */}
+      <div className={isDedicatedChatView || isDedicatedReelsView ? 'hidden md:block shrink-0' : 'block shrink-0'}>
         <Header />
       </div>
 
@@ -196,6 +200,15 @@ const AppContent: React.FC = () => {
         <main className="flex-1 w-full mx-auto p-0 sm:px-4 sm:py-3 flex justify-center h-full min-h-0 overflow-hidden">
           <div className="w-full max-w-3xl flex-1 flex flex-col h-full min-h-0 overflow-hidden">
             {renderActiveView()}
+          </div>
+        </main>
+      ) : isDedicatedReelsView ? (
+        <main className="flex-1 min-h-0 max-w-6xl w-full mx-auto px-0 md:px-6 flex justify-center gap-6 overflow-hidden pb-16 md:pb-0">
+          <div className="hidden md:block h-full overflow-y-auto overscroll-y-contain py-4 sm:py-6 shrink-0">
+            <DesktopSidebar />
+          </div>
+          <div className="flex-1 h-full min-h-0 flex items-center justify-center overflow-hidden">
+            <ReelsView />
           </div>
         </main>
       ) : (

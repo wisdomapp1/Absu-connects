@@ -10,7 +10,8 @@ import { UserFriendsModal } from './UserFriendsModal.tsx';
 import { ProfilePhotoModal } from './ProfilePhotoModal.tsx';
 import { MR_ANONYMOUS_PAGE_ID } from '../../lib/pageService.ts';
 import { EXCLUDED_STUDENT_IDS, fetchProfileById } from '../../lib/profileService.ts';
-import { fetchUserPosts } from '../../lib/postService.ts';
+import { fetchUserPosts, fetchSavedPosts } from '../../lib/postService.ts';
+import { isVideoPost } from '../../lib/reelsService.ts';
 import { CreatePageModal } from '../pages/CreatePageModal.tsx';
 import type { User, Post } from '../../types/index.ts';
 import {
@@ -34,6 +35,8 @@ import {
   Trash2,
   Building2,
   AlertTriangle,
+  Bookmark,
+  Clapperboard,
 } from 'lucide-react';
 
 interface ProfileViewProps {
@@ -60,7 +63,10 @@ export const ProfileView: React.FC<ProfileViewProps> = ({ isAnotherUser = false 
   } = useApp();
   const { signOut } = useAuth();
 
-  const [activeTab, setActiveTab] = useState<'posts' | 'about'>('posts');
+  const [activeTab, setActiveTab] = useState<'posts' | 'saved' | 'about'>('posts');
+  const [savedFilter, setSavedFilter] = useState<'all' | 'reels'>('all');
+  const [fetchedSavedPosts, setFetchedSavedPosts] = useState<Post[] | null>(null);
+  const [loadingSaved, setLoadingSaved] = useState(false);
   const [friendsModalOpen, setFriendsModalOpen] = useState(false);
   const [photoModalOpen, setPhotoModalOpen] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
@@ -127,6 +133,60 @@ export const ProfileView: React.FC<ProfileViewProps> = ({ isAnotherUser = false 
       cancelled = true;
     };
   }, [profileUser?.id, currentUser.id, posts.length]);
+
+  // Reset tab when switching into another user's profile
+  React.useEffect(() => {
+    if (!isMe && activeTab === 'saved') {
+      setActiveTab('posts');
+    }
+  }, [isMe, activeTab]);
+
+  // Load saved posts for own profile when Saved tab is opened or posts bookmark state changes
+  React.useEffect(() => {
+    if (!isMe || !currentUser.id || activeTab !== 'saved') return;
+    let cancelled = false;
+    setLoadingSaved(true);
+    fetchSavedPosts(currentUser.id)
+      .then((loaded) => {
+        if (!cancelled) {
+          setFetchedSavedPosts(loaded);
+        }
+      })
+      .catch(() => {})
+      .finally(() => {
+        if (!cancelled) setLoadingSaved(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [isMe, currentUser.id, activeTab]);
+
+  const mySavedPosts = React.useMemo(() => {
+    if (!isMe) return [];
+    const contextSaved = posts.filter((p) => p.isSaved);
+    const contextMap = new Map(posts.map((p) => [p.id, p]));
+    const merged = new Map<string, Post>();
+
+    for (const p of contextSaved) {
+      merged.set(p.id, p);
+    }
+    for (const dbPost of fetchedSavedPosts || []) {
+      const liveVersion = contextMap.get(dbPost.id);
+      if (liveVersion) {
+        if (liveVersion.isSaved) merged.set(liveVersion.id, liveVersion);
+      } else {
+        merged.set(dbPost.id, dbPost);
+      }
+    }
+    return Array.from(merged.values());
+  }, [isMe, posts, fetchedSavedPosts]);
+
+  const mySavedReels = React.useMemo(
+    () => mySavedPosts.filter((p) => isVideoPost(p)),
+    [mySavedPosts]
+  );
+
+  const displayedSavedPosts = savedFilter === 'reels' ? mySavedReels : mySavedPosts;
 
   // If viewing another user and profile is still loading
   if (isAnotherUser && !profileUser && loadingProfile) {
@@ -435,11 +495,12 @@ export const ProfileView: React.FC<ProfileViewProps> = ({ isAnotherUser = false 
           </div>
         </div>
 
-        {/* Tabs: Posts / About */}
-        <div className="flex border-t border-[var(--color-border)] bg-[var(--color-bg-main)] px-4">
+        {/* Tabs: Posts / Saved (own profile) / About */}
+        <div className="flex border-t border-[var(--color-border)] bg-[var(--color-bg-main)] px-4 overflow-x-auto no-scrollbar">
           <button
+            type="button"
             onClick={() => setActiveTab('posts')}
-            className={`py-3 px-4 text-xs font-bold border-b-2 transition-colors ${
+            className={`min-h-[44px] py-3 px-4 text-xs font-bold border-b-2 transition-colors whitespace-nowrap shrink-0 ${
               activeTab === 'posts'
                 ? 'border-[var(--color-primary)] text-[var(--color-primary)]'
                 : 'border-transparent text-[var(--color-text-secondary)] hover:text-[var(--color-text-primary)]'
@@ -447,9 +508,24 @@ export const ProfileView: React.FC<ProfileViewProps> = ({ isAnotherUser = false 
           >
             Posts ({userPosts.length})
           </button>
+          {isMe && (
+            <button
+              type="button"
+              onClick={() => setActiveTab('saved')}
+              className={`min-h-[44px] py-3 px-4 text-xs font-bold border-b-2 transition-colors whitespace-nowrap shrink-0 flex items-center gap-1.5 ${
+                activeTab === 'saved'
+                  ? 'border-[var(--color-primary)] text-[var(--color-primary)]'
+                  : 'border-transparent text-[var(--color-text-secondary)] hover:text-[var(--color-text-primary)]'
+              }`}
+            >
+              <Bookmark className="w-3.5 h-3.5" />
+              <span>Saved{mySavedPosts.length > 0 ? ` (${mySavedPosts.length})` : ''}</span>
+            </button>
+          )}
           <button
+            type="button"
             onClick={() => setActiveTab('about')}
-            className={`py-3 px-4 text-xs font-bold border-b-2 transition-colors ${
+            className={`min-h-[44px] py-3 px-4 text-xs font-bold border-b-2 transition-colors whitespace-nowrap shrink-0 ${
               activeTab === 'about'
                 ? 'border-[var(--color-primary)] text-[var(--color-primary)]'
                 : 'border-transparent text-[var(--color-text-secondary)] hover:text-[var(--color-text-primary)]'
@@ -472,6 +548,97 @@ export const ProfileView: React.FC<ProfileViewProps> = ({ isAnotherUser = false 
             </div>
           ) : (
             userPosts.map((post) => <PostCard key={post.id} post={post} />)
+          )}
+        </div>
+      )}
+
+      {isMe && activeTab === 'saved' && (
+        <div className="flex flex-col gap-3">
+          <div className="flex items-center justify-between gap-2 bg-[var(--color-bg-card)] border border-[var(--color-border)] rounded-2xl p-2">
+            <div className="flex items-center gap-1.5">
+              <button
+                type="button"
+                onClick={() => setSavedFilter('all')}
+                className={`min-h-[38px] px-3.5 rounded-xl text-xs font-bold transition-colors ${
+                  savedFilter === 'all'
+                    ? 'bg-[var(--color-primary)] text-white'
+                    : 'text-[var(--color-text-secondary)] hover:text-[var(--color-text-primary)]'
+                }`}
+              >
+                All Saved ({mySavedPosts.length})
+              </button>
+              <button
+                type="button"
+                onClick={() => setSavedFilter('reels')}
+                className={`min-h-[38px] px-3.5 rounded-xl text-xs font-bold transition-colors flex items-center gap-1.5 ${
+                  savedFilter === 'reels'
+                    ? 'bg-[var(--color-primary)] text-white'
+                    : 'text-[var(--color-text-secondary)] hover:text-[var(--color-text-primary)]'
+                }`}
+              >
+                <Clapperboard className="w-3.5 h-3.5" />
+                <span>Saved Reels ({mySavedReels.length})</span>
+              </button>
+            </div>
+          </div>
+
+          {loadingSaved && displayedSavedPosts.length === 0 ? (
+            <div className="p-10 flex items-center justify-center bg-[var(--color-bg-card)] border border-[var(--color-border)] rounded-2xl">
+              <Loader2 className="w-6 h-6 animate-spin text-[var(--color-primary)]" />
+            </div>
+          ) : displayedSavedPosts.length === 0 ? (
+            <div className="p-8 text-center bg-[var(--color-bg-card)] border border-[var(--color-border)] rounded-2xl flex flex-col items-center gap-2.5">
+              <div className="w-11 h-11 rounded-2xl bg-[var(--color-bg-main)] border border-[var(--color-border)] flex items-center justify-center text-[var(--color-text-secondary)]">
+                {savedFilter === 'reels' ? (
+                  <Clapperboard className="w-5 h-5" />
+                ) : (
+                  <Bookmark className="w-5 h-5" />
+                )}
+              </div>
+              <p className="text-sm font-bold text-[var(--color-text-primary)]">
+                {savedFilter === 'reels' ? 'No saved Reels yet' : 'No saved posts yet'}
+              </p>
+              <p className="text-xs text-[var(--color-text-secondary)] max-w-sm">
+                {savedFilter === 'reels'
+                  ? 'Bookmark any video in Reels to keep it right here for replay.'
+                  : 'Save campus updates, notes, or Reels from your feed to revisit them here.'}
+              </p>
+              {savedFilter === 'reels' && (
+                <button
+                  type="button"
+                  onClick={() => navigateTo('reels')}
+                  className="mt-1 min-h-[40px] px-4 rounded-xl bg-[var(--color-primary)] text-white text-xs font-bold flex items-center gap-1.5"
+                >
+                  <Clapperboard className="w-3.5 h-3.5" />
+                  <span>Explore Reels</span>
+                </button>
+              )}
+            </div>
+          ) : (
+            displayedSavedPosts.map((post) => {
+              const hasVideo = isVideoPost(post);
+              return (
+                <div key={post.id} className="flex flex-col gap-1.5">
+                  {hasVideo && (
+                    <div className="flex items-center justify-between px-3 py-2 rounded-xl bg-[var(--color-bg-card)] border border-[var(--color-border)]">
+                      <span className="text-[11px] font-bold text-[var(--color-text-secondary)] flex items-center gap-1.5">
+                        <Clapperboard className="w-3.5 h-3.5 text-[var(--color-primary)]" />
+                        <span>Saved Video Reel</span>
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => navigateTo('reels', { postId: post.id })}
+                        className="min-h-[36px] px-3 py-1 rounded-lg bg-[var(--color-primary)] hover:bg-[var(--color-primary-hover)] text-white text-xs font-bold flex items-center gap-1.5"
+                      >
+                        <Clapperboard className="w-3.5 h-3.5" />
+                        <span>Watch in Reels</span>
+                      </button>
+                    </div>
+                  )}
+                  <PostCard post={post} />
+                </div>
+              );
+            })
           )}
         </div>
       )}

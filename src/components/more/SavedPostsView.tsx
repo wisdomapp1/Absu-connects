@@ -1,14 +1,16 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import { useApp } from '../../context/AppContext.tsx';
 import { fetchSavedPosts } from '../../lib/postService.ts';
+import { isVideoPost } from '../../lib/reelsService.ts';
 import type { Post } from '../../types/index.ts';
 import { PostCard } from '../home/PostCard.tsx';
-import { ArrowLeft, Bookmark, Sparkles, Loader2 } from 'lucide-react';
+import { ArrowLeft, Bookmark, Sparkles, Loader2, Clapperboard } from 'lucide-react';
 
 export const SavedPostsView: React.FC = () => {
   const { posts, currentUser, goBack, navigateTo } = useApp();
   const [hydratedSaved, setHydratedSaved] = useState<Post[] | null>(null);
   const [loading, setLoading] = useState(true);
+  const [filterTab, setFilterTab] = useState<'all' | 'reels'>('all');
 
   useEffect(() => {
     let cancelled = false;
@@ -32,7 +34,7 @@ export const SavedPostsView: React.FC = () => {
   }, [currentUser.id]);
 
   // Merge context saved posts + hydrated DB saved posts cleanly without duplicates
-  const savedPosts = React.useMemo(() => {
+  const savedPosts = useMemo(() => {
     const contextSaved = posts.filter((p) => p.isSaved);
     const contextMap = new Map(posts.map((p) => [p.id, p]));
     const merged = new Map<string, Post>();
@@ -51,65 +53,139 @@ export const SavedPostsView: React.FC = () => {
     return Array.from(merged.values());
   }, [posts, hydratedSaved]);
 
+  const savedReels = useMemo(
+    () => savedPosts.filter((post) => isVideoPost(post)),
+    [savedPosts]
+  );
+
+  const displayedPosts = filterTab === 'reels' ? savedReels : savedPosts;
+
   return (
     <div className="flex flex-col gap-4">
       {/* Back to More */}
       <button
         onClick={goBack}
-        className="self-start flex items-center gap-2 px-3 py-1.5 rounded-xl bg-[var(--color-bg-card)] border border-[var(--color-border)] text-xs font-semibold text-[var(--color-text-secondary)] hover:text-[var(--color-text-primary)] transition-colors min-h-[36px]"
+        className="self-start flex items-center gap-2 px-3 py-1.5 rounded-xl bg-[var(--color-bg-card)] border border-[var(--color-border)] text-xs font-semibold text-[var(--color-text-secondary)] hover:text-[var(--color-text-primary)] transition-colors min-h-[44px]"
       >
         <ArrowLeft className="w-4 h-4" />
         <span>Back to More</span>
       </button>
 
-      {/* Header */}
-      <div className="bg-[var(--color-bg-card)] border border-[var(--color-border)] rounded-2xl p-4 sm:p-5 shadow-sm transition-colors">
-        <div className="flex items-center gap-2.5 mb-1">
-          <div className="w-8 h-8 rounded-xl bg-[var(--color-primary-subtle)] text-[var(--color-primary)] flex items-center justify-center">
-            <Bookmark className="w-4 h-4" />
+      {/* Header & Filter Strip */}
+      <div className="bg-[var(--color-bg-card)] border border-[var(--color-border)] rounded-2xl overflow-hidden shadow-sm transition-colors">
+        <div className="p-4 sm:p-5">
+          <div className="flex items-center gap-2.5 mb-1">
+            <div className="w-8 h-8 rounded-xl bg-[var(--color-primary-subtle)] text-[var(--color-primary)] flex items-center justify-center">
+              <Bookmark className="w-4 h-4" />
+            </div>
+            <h1 className="text-xl sm:text-2xl font-extrabold text-[var(--color-text-primary)]">
+              Saved Posts
+            </h1>
           </div>
-          <h1 className="text-xl sm:text-2xl font-extrabold text-[var(--color-text-primary)]">
-            Saved Posts
-          </h1>
+          <p className="text-xs text-[var(--color-text-secondary)]">
+            Announcements, lecture notes, discussions, and Reels bookmarked for later.
+          </p>
         </div>
-        <p className="text-xs text-[var(--color-text-secondary)]">
-          Important announcements, academic notes, and peer discussions you saved for later.
-        </p>
+
+        <div className="flex border-t border-[var(--color-border)] bg-[var(--color-bg-main)] px-4">
+          <button
+            type="button"
+            onClick={() => setFilterTab('all')}
+            className={`min-h-[44px] px-4 text-xs font-bold border-b-2 transition-colors flex items-center gap-1.5 ${
+              filterTab === 'all'
+                ? 'border-[var(--color-primary)] text-[var(--color-primary)]'
+                : 'border-transparent text-[var(--color-text-secondary)] hover:text-[var(--color-text-primary)]'
+            }`}
+          >
+            <Bookmark className="w-3.5 h-3.5" />
+            <span>All Saved ({savedPosts.length})</span>
+          </button>
+          <button
+            type="button"
+            onClick={() => setFilterTab('reels')}
+            className={`min-h-[44px] px-4 text-xs font-bold border-b-2 transition-colors flex items-center gap-1.5 ${
+              filterTab === 'reels'
+                ? 'border-[var(--color-primary)] text-[var(--color-primary)]'
+                : 'border-transparent text-[var(--color-text-secondary)] hover:text-[var(--color-text-primary)]'
+            }`}
+          >
+            <Clapperboard className="w-3.5 h-3.5" />
+            <span>Saved Reels ({savedReels.length})</span>
+          </button>
+        </div>
       </div>
 
       {/* Content */}
-      {loading && savedPosts.length === 0 ? (
+      {loading && displayedPosts.length === 0 ? (
         <div className="p-10 flex items-center justify-center bg-[var(--color-bg-card)] border border-[var(--color-border)] rounded-2xl">
           <Loader2 className="w-6 h-6 animate-spin text-[var(--color-primary)]" />
         </div>
-      ) : savedPosts.length === 0 ? (
+      ) : displayedPosts.length === 0 ? (
         <div className="p-8 text-center bg-[var(--color-bg-card)] border border-[var(--color-border)] rounded-2xl flex flex-col items-center justify-center gap-3">
           <div className="w-12 h-12 rounded-2xl bg-[var(--color-bg-main)] border border-[var(--color-border)] flex items-center justify-center text-[var(--color-text-secondary)]">
-            <Bookmark className="w-6 h-6" />
+            {filterTab === 'reels' ? (
+              <Clapperboard className="w-6 h-6" />
+            ) : (
+              <Bookmark className="w-6 h-6" />
+            )}
           </div>
           <div>
             <h3 className="text-sm font-bold text-[var(--color-text-primary)]">
-              No saved posts yet
+              {filterTab === 'reels' ? 'No saved Reels yet' : 'No saved posts yet'}
             </h3>
             <p className="text-xs text-[var(--color-text-secondary)] max-w-sm mt-1">
-              Tap the bookmark icon on any post in your campus feed to save it here for quick reference.
+              {filterTab === 'reels'
+                ? 'Tap the bookmark icon while watching Reels to save videos here for quick replay.'
+                : 'Tap the bookmark icon on any post or Reel to save it here for quick reference.'}
             </p>
           </div>
           <button
-            onClick={() => navigateTo('home')}
-            className="mt-2 px-4 py-2 rounded-xl bg-[var(--color-primary)] text-white text-xs font-bold hover:bg-[var(--color-primary-hover)] transition-all flex items-center gap-1.5"
+            type="button"
+            onClick={() => navigateTo(filterTab === 'reels' ? 'reels' : 'home')}
+            className="mt-2 min-h-[44px] px-4 py-2 rounded-xl bg-[var(--color-primary)] text-white text-xs font-bold hover:bg-[var(--color-primary-hover)] transition-all flex items-center gap-1.5"
           >
-            <Sparkles className="w-3.5 h-3.5" />
-            <span>Explore Campus Feed</span>
+            {filterTab === 'reels' ? (
+              <>
+                <Clapperboard className="w-3.5 h-3.5" />
+                <span>Explore Reels</span>
+              </>
+            ) : (
+              <>
+                <Sparkles className="w-3.5 h-3.5" />
+                <span>Explore Campus Feed</span>
+              </>
+            )}
           </button>
         </div>
       ) : (
         <div className="flex flex-col gap-3">
-          {savedPosts.map((post) => (
-            <PostCard key={post.id} post={post} />
-          ))}
+          {displayedPosts.map((post) => {
+            const hasVideo = isVideoPost(post);
+            return (
+              <div key={post.id} className="flex flex-col gap-1.5">
+                {hasVideo && (
+                  <div className="flex items-center justify-between px-3 py-2 rounded-xl bg-[var(--color-bg-card)] border border-[var(--color-border)]">
+                    <span className="text-[11px] font-bold text-[var(--color-text-secondary)] flex items-center gap-1.5">
+                      <Clapperboard className="w-3.5 h-3.5 text-[var(--color-primary)]" />
+                      <span>Saved Video Reel</span>
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => navigateTo('reels', { postId: post.id })}
+                      className="min-h-[36px] px-3 py-1 rounded-lg bg-[var(--color-primary)] hover:bg-[var(--color-primary-hover)] text-white text-xs font-bold flex items-center gap-1.5 transition-all active:scale-95"
+                    >
+                      <Clapperboard className="w-3.5 h-3.5" />
+                      <span>Watch in Reels</span>
+                    </button>
+                  </div>
+                )}
+                <PostCard post={post} />
+              </div>
+            );
+          })}
         </div>
       )}
     </div>
   );
 };
+

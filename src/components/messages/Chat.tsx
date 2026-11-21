@@ -2,6 +2,15 @@ import React, { useState, useRef, useEffect, useCallback } from 'react';
 import { useChat } from '../../hooks/useChat.ts';
 import { Avatar } from '../common/Avatar.tsx';
 import type { Message } from '../../types/index.ts';
+import { VoiceNoteBubble } from './VoiceNoteBubble.tsx';
+import {
+  safeReadAndPrepareImage,
+  safeReadAndPrepareVideo,
+  safeReadGenericAttachment,
+  categorizeMediaError,
+  type MediaRecoveryState,
+} from '../../lib/mediaRecovery.ts';
+import { MediaRecoveryBanner } from '../common/MediaRecoveryBanner.tsx';
 import {
   ArrowLeft,
   Send,
@@ -18,6 +27,9 @@ import {
   WifiOff,
   Loader2,
   Film,
+  FileText,
+  Music,
+  RotateCcw,
 } from 'lucide-react';
 
 interface ChatProps {
@@ -48,6 +60,7 @@ export const Chat: React.FC<ChatProps> = ({
   const [replyingTo, setReplyingTo] = useState<Message | null>(null);
   const [activeMenuMsgId, setActiveMenuMsgId] = useState<string | null>(null);
   const [deletedMsgIds, setDeletedMsgIds] = useState<Set<string>>(new Set());
+  const [mediaRecovery, setMediaRecovery] = useState<MediaRecoveryState | null>(null);
 
   const {
     messages,
@@ -56,7 +69,11 @@ export const Chat: React.FC<ChatProps> = ({
     hasMore,
     isPartnerTyping,
     isOffline,
+    uploadProgress,
+    cancelUpload,
     sendMessage,
+    retryMessage,
+    deleteMessage,
     sendTypingIndicator,
     loadMoreMessages,
   } = useChat(chatId);
@@ -94,13 +111,78 @@ export const Chat: React.FC<ChatProps> = ({
     }
   }, [hasMore, loadingMore, loadMoreMessages]);
 
-  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = Array.from(e.target.files || []);
-    if (files.length === 0) return;
-    setPendingFiles((prev) => [...prev, ...files]);
-    const urls = files.map((f) => URL.createObjectURL(f));
-    setPreviewUrls((prev) => [...prev, ...urls]);
     e.target.value = '';
+    if (files.length === 0) return;
+
+    const maxBytes = 25 * 1024 * 1024;
+    const validFiles: File[] = [];
+    const validUrls: string[] = [];
+    let lastRecovery: MediaRecoveryState | null = null;
+
+    for (const file of files) {
+      const isPdf = file.type === 'application/pdf' || Boolean(file.name.match(/\.pdf$/i));
+      const isImage = !isPdf && (file.type.startsWith('image/') || Boolean(file.name.match(/\.(jpg|jpeg|png|webp|avif|gif)$/i)));
+      const isVideo = !isPdf && (file.type.startsWith('video/') || Boolean(file.name.match(/\.(mp4|mov|webm|m4v|ogg)$/i)));
+      const isAudio = !isPdf && (file.type.startsWith('audio/') || Boolean(file.name.match(/\.(mp3|m4a|wav|ogg|aac)$/i)));
+
+      if (!isImage && !isVideo && !isAudio && !isPdf) {
+        lastRecovery = categorizeMediaError(
+          new Error(`"${file.name}" is not a supported photo, video, audio, or PDF file.`),
+          { fileName: file.name }
+        );
+        continue;
+      }
+
+      if (isImage) {
+        if (file.size > maxBytes) {
+          lastRecovery = categorizeMediaError(
+            new Error(`"${file.name}" (${(file.size / (1024 * 1024)).toFixed(1)} MB) exceeds 25 MB limit.`),
+            { fileName: file.name }
+          );
+          continue;
+        }
+        const preparedImg = await safeReadAndPrepareImage(file);
+        if (!preparedImg.ok || !preparedImg.file || !preparedImg.previewUrl) {
+          lastRecovery = preparedImg.recovery || null;
+          continue;
+        }
+        validFiles.push(preparedImg.file);
+        validUrls.push(preparedImg.previewUrl);
+        continue;
+      }
+
+      if (isVideo) {
+        const preparedVid = await safeReadAndPrepareVideo(file, {
+          maxBytes,
+          maxDurationSeconds: 40,
+        });
+        if (!preparedVid.ok || !preparedVid.file || !preparedVid.previewUrl) {
+          lastRecovery = preparedVid.recovery || null;
+          continue;
+        }
+        validFiles.push(preparedVid.file);
+        validUrls.push(preparedVid.previewUrl);
+        continue;
+      }
+
+      const preparedGen = await safeReadGenericAttachment(file, { maxBytes });
+      if (!preparedGen.ok || !preparedGen.file || !preparedGen.previewUrl) {
+        lastRecovery = preparedGen.recovery || null;
+        continue;
+      }
+      validFiles.push(preparedGen.file);
+      validUrls.push(preparedGen.previewUrl);
+    }
+
+    if (validFiles.length > 0) {
+      setMediaRecovery(null);
+      setPendingFiles((prev) => [...prev, ...validFiles]);
+      setPreviewUrls((prev) => [...prev, ...validUrls]);
+    } else if (lastRecovery) {
+      setMediaRecovery(lastRecovery);
+    }
   };
 
   const removePendingFile = (idx: number) => {
@@ -184,7 +266,7 @@ export const Chat: React.FC<ChatProps> = ({
         ref={fileInputRef}
         type="file"
         multiple
-        accept="image/*,video/*"
+        accept="image/*,video/*,audio/*,application/pdf"
         onChange={handleFileChange}
         className="hidden"
       />
@@ -282,17 +364,42 @@ export const Chat: React.FC<ChatProps> = ({
                         {att.kind === 'image' ? (
                           <img
                             src={att.secure_url}
-                            alt="Attachment"
+                            alt={att.file_name || 'Attachment'}
                             className="w-full max-h-60 object-cover rounded-xl"
                             loading="lazy"
                           />
-                        ) : (
+                        ) : att.kind === 'video' ? (
                           <video
                             src={att.secure_url}
+                            poster={att.thumbnail_url || undefined}
                             controls
                             playsInline
-                            className="w-full max-h-60 object-contain rounded-xl"
+                            preload="metadata"
+                            className="w-full max-h-60 object-contain rounded-xl bg-black"
                           />
+                        ) : att.kind === 'audio' || Boolean(att.file_name?.match(/\.(mp3|m4a|wav|ogg|aac)$/i)) || Boolean(att.file_name?.match(/^voice_?note_/i)) ? (
+                          <VoiceNoteBubble
+                            src={att.secure_url}
+                            fileName={att.file_name}
+                            isOutgoing={msg.isOutgoing}
+                            status={msg.status}
+                            isSeen={msg.isSeen}
+                            onRetry={() => retryMessage(msg.id)}
+                          />
+                        ) : (
+                          <a
+                            href={att.secure_url || '#'}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className={`flex items-center gap-2 p-2 rounded-xl border text-xs ${
+                              msg.isOutgoing
+                                ? 'bg-white/15 border-white/25 text-white'
+                                : 'bg-[var(--color-bg-main)] border-[var(--color-border)] text-[var(--color-text-primary)]'
+                            }`}
+                          >
+                            <FileText className="w-4 h-4 shrink-0" />
+                            <span className="truncate font-semibold">{att.file_name}</span>
+                          </a>
                         )}
                       </div>
                     ))}
@@ -306,12 +413,22 @@ export const Chat: React.FC<ChatProps> = ({
               <div className="text-[10px] text-[var(--color-text-secondary)] mt-1 px-1 flex items-center gap-1.5">
                 <span>{msg.timestamp}</span>
                 {renderStatus(msg)}
+                {msg.status === 'failed' && msg.isOutgoing && (
+                  <button
+                    type="button"
+                    onClick={() => retryMessage(msg.id)}
+                    className="inline-flex items-center gap-1 text-[10px] font-bold text-rose-500 hover:underline"
+                  >
+                    <RotateCcw className="w-2.5 h-2.5" />
+                    <span>Retry</span>
+                  </button>
+                )}
               </div>
 
               {/* Context menu */}
               {activeMenuMsgId === msg.id && (
                 <div
-                  className={`absolute z-30 top-full mt-1 bg-[var(--color-bg-card)] border border-[var(--color-border)] shadow-xl rounded-xl p-1.5 min-w-[130px] ${
+                  className={`absolute z-30 top-full mt-1 bg-[var(--color-bg-card)] border border-[var(--color-border)] shadow-xl rounded-xl p-1.5 min-w-[155px] ${
                     msg.isOutgoing ? 'right-0' : 'left-0'
                   }`}
                 >
@@ -322,7 +439,7 @@ export const Chat: React.FC<ChatProps> = ({
                       setActiveMenuMsgId(null);
                       inputRef.current?.focus();
                     }}
-                    className="w-full flex items-center gap-2 px-2.5 py-1 text-xs hover:bg-[var(--color-primary-subtle)] rounded-lg text-left"
+                    className="w-full min-h-[36px] flex items-center gap-2 px-2.5 py-1 text-xs hover:bg-[var(--color-primary-subtle)] rounded-lg text-left"
                   >
                     <Reply className="w-3.5 h-3.5" />
                     <span>Reply</span>
@@ -334,10 +451,23 @@ export const Chat: React.FC<ChatProps> = ({
                         navigator.clipboard?.writeText(msg.text);
                         setActiveMenuMsgId(null);
                       }}
-                      className="w-full flex items-center gap-2 px-2.5 py-1 text-xs hover:bg-[var(--color-primary-subtle)] rounded-lg text-left"
+                      className="w-full min-h-[36px] flex items-center gap-2 px-2.5 py-1 text-xs hover:bg-[var(--color-primary-subtle)] rounded-lg text-left"
                     >
                       <Copy className="w-3.5 h-3.5" />
                       <span>Copy</span>
+                    </button>
+                  )}
+                  {msg.isOutgoing && !msg.id.startsWith('temp_') && (
+                    <button
+                      type="button"
+                      onClick={async () => {
+                        setActiveMenuMsgId(null);
+                        await deleteMessage(msg.id);
+                      }}
+                      className="w-full min-h-[36px] flex items-center gap-2 px-2.5 py-1 text-xs text-rose-500 hover:bg-rose-500/10 rounded-lg text-left"
+                    >
+                      <Trash2 className="w-3.5 h-3.5" />
+                      <span>Delete for everyone</span>
                     </button>
                   )}
                   <button
@@ -346,10 +476,10 @@ export const Chat: React.FC<ChatProps> = ({
                       setDeletedMsgIds((prev) => new Set(prev).add(msg.id));
                       setActiveMenuMsgId(null);
                     }}
-                    className="w-full flex items-center gap-2 px-2.5 py-1 text-xs text-rose-500 hover:bg-rose-500/10 rounded-lg text-left"
+                    className="w-full min-h-[36px] flex items-center gap-2 px-2.5 py-1 text-xs text-rose-500 hover:bg-rose-500/10 rounded-lg text-left"
                   >
                     <Trash2 className="w-3.5 h-3.5" />
-                    <span>Delete</span>
+                    <span>Delete for me</span>
                   </button>
                 </div>
               )}
@@ -389,18 +519,63 @@ export const Chat: React.FC<ChatProps> = ({
       {/* Pending Files Preview */}
       {previewUrls.length > 0 && (
         <div className="p-2 border-t border-[var(--color-border)] bg-[var(--color-bg-card)] flex items-center gap-2 overflow-x-auto">
-          {previewUrls.map((url, i) => (
-            <div key={i} className="relative rounded-lg overflow-hidden shrink-0 border border-[var(--color-border)]">
-              <img src={url} alt="Preview" className="w-12 h-12 object-cover" />
-              <button
-                type="button"
-                onClick={() => removePendingFile(i)}
-                className="absolute top-0.5 right-0.5 p-0.5 bg-black/60 text-white rounded-full"
-              >
-                <X className="w-2.5 h-2.5" />
-              </button>
+          {previewUrls.map((url, i) => {
+            const file = pendingFiles[i];
+            const isVideo = file?.type.startsWith('video/');
+            const isAudio = file?.type.startsWith('audio/');
+            const isPdf = file?.type === 'application/pdf' || Boolean(file?.name.match(/\.pdf$/i));
+            return (
+              <div key={i} className="relative rounded-lg overflow-hidden shrink-0 border border-[var(--color-border)]">
+                {isVideo ? (
+                  <div className="w-12 h-12 bg-black flex items-center justify-center text-violet-400">
+                    <Film className="w-5 h-5" />
+                  </div>
+                ) : isAudio ? (
+                  <div className="w-12 h-12 bg-violet-600/20 flex items-center justify-center text-violet-400">
+                    <Music className="w-5 h-5" />
+                  </div>
+                ) : isPdf ? (
+                  <div className="w-12 h-12 bg-amber-500/15 flex items-center justify-center text-amber-500">
+                    <FileText className="w-5 h-5" />
+                  </div>
+                ) : (
+                  <img src={url} alt="Preview" className="w-12 h-12 object-cover" />
+                )}
+                <button
+                  type="button"
+                  onClick={() => removePendingFile(i)}
+                  className="absolute top-0.5 right-0.5 p-0.5 bg-black/60 text-white rounded-full"
+                >
+                  <X className="w-2.5 h-2.5" />
+                </button>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {/* Upload Progress Indicator */}
+      {uploadProgress !== null && (
+        <div className="px-3 py-2 border-t border-[var(--color-border)] bg-[var(--color-bg-card)] flex items-center justify-between gap-2">
+          <div className="flex-1 min-w-0 space-y-1">
+            <div className="flex items-center justify-between text-[11px] font-semibold text-[var(--color-text-secondary)]">
+              <span>Uploading media...</span>
+              <span className="font-mono text-[var(--color-primary)]">{Math.round(uploadProgress)}%</span>
             </div>
-          ))}
+            <div className="w-full h-1.5 rounded-full bg-[var(--color-bg-main)] overflow-hidden">
+              <div
+                className="h-full bg-[var(--color-primary)] transition-all duration-200 rounded-full"
+                style={{ width: `${Math.min(100, Math.max(4, uploadProgress))}%` }}
+              />
+            </div>
+          </div>
+          <button
+            type="button"
+            onClick={cancelUpload}
+            className="min-h-[36px] px-2.5 rounded-lg text-[11px] font-bold text-rose-500 border border-rose-500/30"
+          >
+            Cancel
+          </button>
         </div>
       )}
 
@@ -423,6 +598,17 @@ export const Chat: React.FC<ChatProps> = ({
               </button>
             ))}
           </div>
+        </div>
+      )}
+
+      {/* Media Selection Recovery Banner */}
+      {mediaRecovery && (
+        <div className="px-3 py-2 border-t border-[var(--color-border)] bg-[var(--color-bg-card)] shrink-0">
+          <MediaRecoveryBanner
+            recovery={mediaRecovery}
+            onChooseAgain={() => fileInputRef.current?.click()}
+            onDismiss={() => setMediaRecovery(null)}
+          />
         </div>
       )}
 

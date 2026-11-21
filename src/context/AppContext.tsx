@@ -22,6 +22,7 @@ import { useAuth } from './AuthContext.tsx';
 import { supabase } from '../lib/supabase.ts';
 import {
   fetchFeedPostsPage,
+  fetchSinglePostById,
   createRealPost,
   deleteRealPost,
   toggleRealPostReaction,
@@ -29,6 +30,7 @@ import {
   createRealComment,
   PostMediaAttachment,
 } from '../lib/postService.ts';
+import { checkPostHasVideo, isVideoPost } from '../lib/reelsService.ts';
 import {
   fetchAllProfiles,
   saveProfileToSupabase,
@@ -70,9 +72,15 @@ import {
   unblockRealUser,
 } from '../lib/moderationService.ts';
 import {
-  uploadPostMediaToSupabaseStorage,
-  deletePostMediaFilesFromStorage,
-} from '../lib/storageService.ts';
+  uploadMediaToCloudinary,
+  deleteCloudinaryAssets,
+  buildCloudinaryVideoPosterUrl,
+  type DeleteCloudinaryAssetInput,
+} from '../lib/cloudinaryService.ts';
+import {
+  compressImageForUpload,
+  validatePostVideoFile,
+} from '../lib/mediaCompression.ts';
 import { adminService, isSuperAdminEmail } from '../lib/adminService.ts';
 import {
   sendPrivacySafePush,
@@ -154,11 +162,16 @@ export interface AppContextType {
     content: string,
     category: PostCategory,
     audience: PostAudience,
-    mediaFileOrUrl?: File | string | Array<File | string>,
-    callbacks?: { onProgress?: (step: string) => void; onError?: (error: string) => void }
+    mediaFileOrUrl?: File | string | AttachedMediaItem | Array<File | string | AttachedMediaItem>,
+    callbacks?: {
+      onProgress?: (step: string) => void;
+      onPercent?: (percent: number) => void;
+      onError?: (error: string) => void;
+      signal?: AbortSignal;
+    }
   ) => Promise<boolean>;
   toggleLike: (postId: string) => Promise<void>;
-  toggleSave: (postId: string) => void;
+  toggleSave: (postId: string, explicitWasSaved?: boolean) => Promise<void>;
   addComment: (postId: string, text: string, parentId?: string | null) => Promise<void>;
   deletePost: (postId: string) => Promise<void>;
   hidePost: (postId: string) => void;
@@ -459,7 +472,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         const parentCommentId = params.get('parentCommentId') || null;
         const openComments = params.get('openComments') === '1' || Boolean(commentId);
         if (view) {
-          const mainTabs: MainNavTab[] = ['home', 'friends', 'messages', 'alerts', 'more'];
+          const mainTabs: MainNavTab[] = ['home', 'reels', 'friends', 'messages', 'alerts', 'more'];
           const tab: MainNavTab = mainTabs.includes(view as MainNavTab)
             ? (view as MainNavTab)
             : view === 'conversation' || view === 'contact-info'
@@ -595,7 +608,15 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   }, []);
 
   const setActiveTab = (tab: MainNavTab) => {
+    if (tab === 'reels') {
+      // Clear any previous deep-link target when user taps the main Reels nav tab directly
+      setSelectedPostId(null);
+      setSelectedPostNavContext(null);
+    }
     if (activeTabRef.current === tab && activeViewRef.current === tab) {
+      if (tab === 'reels' && typeof window !== 'undefined') {
+        window.dispatchEvent(new CustomEvent('absu:reels-reset-top'));
+      }
       return;
     }
     setActiveTabState(tab);
@@ -640,10 +661,11 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     if (options?.postId) {
       const currentEntry = navHistoryRef.current[navHistoryRef.current.length - 1];
       const isDuplicatePostNav =
-        activeViewRef.current === 'post-detail' &&
-        targetView === 'post-detail' &&
+        activeViewRef.current === targetView &&
+        (targetView === 'post-detail' || targetView === 'reels') &&
         currentEntry?.postId === options.postId &&
-        (currentEntry?.commentId || null) === (options.commentId || null);
+        (currentEntry?.commentId || null) === (options.commentId || null) &&
+        Boolean(currentEntry?.openComments) === Boolean(options.openComments || options.commentId);
 
       setSelectedPostId(options.postId);
       setSelectedPostNavContext({
@@ -657,6 +679,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       if (isDuplicatePostNav) {
         return;
       }
+    } else if (targetView === 'reels') {
+      setSelectedPostId(null);
+      setSelectedPostNavContext(null);
     }
     if (options?.convId) {
       setSelectedConversationId(options.convId);
@@ -674,12 +699,13 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       });
     }
 
-    const nextTab: MainNavTab = ['home', 'friends', 'messages', 'alerts', 'more'].includes(targetView)
+    const mainTabs: MainNavTab[] = ['home', 'reels', 'friends', 'messages', 'alerts', 'more'];
+    const nextTab: MainNavTab = mainTabs.includes(targetView as MainNavTab)
       ? (targetView as MainNavTab)
       : activeTabRef.current;
 
     setActiveView(targetView);
-    if (['home', 'friends', 'messages', 'alerts', 'more'].includes(targetView)) {
+    if (mainTabs.includes(targetView as MainNavTab)) {
       setActiveTabState(targetView as MainNavTab);
     }
 
@@ -690,7 +716,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       convId: options?.convId || (targetView === 'conversation' ? options?.convId || null : null),
       communityId: options?.communityId || (targetView === 'community-detail' ? options?.communityId || null : null),
       eventId: options?.eventId || (targetView === 'event-detail' ? options?.eventId || null : null),
-      postId: options?.postId || (targetView === 'post-detail' ? options?.postId || null : null),
+      postId: options?.postId || (targetView === 'post-detail' || targetView === 'reels' ? options?.postId || null : null),
       commentId: options?.commentId || null,
       parentCommentId: options?.parentCommentId || null,
       openComments: Boolean(options?.openComments || options?.commentId),
@@ -740,7 +766,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       setActiveView(prevEntry.view);
       if (prevEntry.tab) {
         setActiveTabState(prevEntry.tab);
-      } else if (['home', 'friends', 'messages', 'alerts', 'more'].includes(prevEntry.view as any)) {
+      } else if (['home', 'reels', 'friends', 'messages', 'alerts', 'more'].includes(prevEntry.view as any)) {
         setActiveTabState(prevEntry.view as MainNavTab);
       }
 
@@ -1524,6 +1550,12 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       if (currentView === 'home') {
         await Promise.all([loadPosts(), loadUsersAndFriends()]);
         return { success: true, message: 'Campus feed updated' };
+      } else if (currentView === 'reels') {
+        if (typeof window !== 'undefined') {
+          window.dispatchEvent(new CustomEvent('absu:refresh-reels'));
+        }
+        await loadPosts();
+        return { success: true, message: 'Reels updated' };
       } else if (currentView === 'friends') {
         await loadUsersAndFriends();
         return { success: true, message: 'Friends & requests updated' };
@@ -1552,13 +1584,18 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     }
   }, [loadPosts, loadUsersAndFriends, loadConversations, loadNotifications]);
 
-  // Post Actions (Connected to Real Supabase Backend — Supabase Storage Only)
+  // Post Actions (Connected to Cloudinary `absu-connect/posts` & Real Supabase Backend)
   const createPost = async (
     content: string,
     category: PostCategory,
     audience: PostAudience,
-    mediaFileOrUrl?: File | string | Array<File | string>,
-    callbacks?: { onProgress?: (step: string) => void; onError?: (error: string) => void }
+    mediaFileOrUrl?: File | string | AttachedMediaItem | Array<File | string | AttachedMediaItem>,
+    callbacks?: {
+      onProgress?: (step: string) => void;
+      onPercent?: (percent: number) => void;
+      onError?: (error: string) => void;
+      signal?: AbortSignal;
+    }
   ): Promise<boolean> => {
     if (!auth.user) {
       const msg = 'Please sign in to publish posts.';
@@ -1577,27 +1614,52 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       return false;
     }
 
-    const rawItems: Array<File | string> = Array.isArray(mediaFileOrUrl)
+    if (callbacks?.signal?.aborted) {
+      callbacks?.onError?.('Post publishing was cancelled.');
+      return false;
+    }
+
+    const rawInputItems: Array<File | string | AttachedMediaItem> = Array.isArray(mediaFileOrUrl)
       ? mediaFileOrUrl
       : mediaFileOrUrl
       ? [mediaFileOrUrl]
       : [];
 
+    if (rawInputItems.length > 4) {
+      const msg = 'You can attach up to 4 photos or videos per post.';
+      callbacks?.onError?.(msg);
+      addToast(msg, 'warning');
+      return false;
+    }
+
     const mediaList: PostMediaAttachment[] = [];
-    const uploadedStoragePaths: string[] = [];
+    const uploadedCloudinary: DeleteCloudinaryAssetInput[] = [];
 
-    for (let i = 0; i < rawItems.length; i++) {
-      const item = rawItems[i];
+    const rollbackCloudinary = async () => {
+      if (uploadedCloudinary.length > 0) {
+        await deleteCloudinaryAssets(uploadedCloudinary).catch(() => {});
+      }
+    };
+
+    for (let i = 0; i < rawInputItems.length; i++) {
+      if (callbacks?.signal?.aborted) {
+        await rollbackCloudinary();
+        const msg = 'Post publishing was cancelled.';
+        callbacks?.onError?.(msg);
+        return false;
+      }
+
+      const rawItem = rawInputItems[i];
       let fileToUpload: File | null = null;
+      let attachedMeta: AttachedMediaItem | null = null;
 
-      if (item instanceof File) {
-        fileToUpload = item;
-      } else if (typeof item === 'string' && item.trim()) {
-        // Convert campus preset or local asset URL to a File so ALL newly uploaded post media lives in Supabase Storage
-        const trimmedUrl = item.trim();
+      if (rawItem instanceof File) {
+        fileToUpload = rawItem;
+      } else if (typeof rawItem === 'string' && rawItem.trim()) {
+        const trimmedUrl = rawItem.trim();
         try {
-          callbacks?.onProgress?.(`Preparing photo (${i + 1}/${rawItems.length})...`);
-          const resp = await fetch(trimmedUrl);
+          callbacks?.onProgress?.(`Preparing photo (${i + 1}/${rawInputItems.length})...`);
+          const resp = await fetch(trimmedUrl, { signal: callbacks?.signal });
           if (!resp.ok) {
             throw new Error(`Could not load selected campus preset image (${resp.status}).`);
           }
@@ -1608,69 +1670,172 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
             lastModified: Date.now(),
           });
         } catch (presetErr: unknown) {
-          if (uploadedStoragePaths.length > 0) {
-            await deletePostMediaFilesFromStorage(uploadedStoragePaths);
-          }
-          const msg = presetErr instanceof Error ? presetErr.message : 'Failed to prepare selected photo.';
+          await rollbackCloudinary();
+          const aborted = callbacks?.signal?.aborted || (presetErr instanceof DOMException && presetErr.name === 'AbortError');
+          const msg = aborted
+            ? 'Post publishing was cancelled.'
+            : presetErr instanceof Error
+            ? presetErr.message
+            : 'Failed to prepare selected photo.';
           callbacks?.onError?.(msg);
-          addToast(`${msg} Post was not published.`, 'warning');
+          if (!aborted) addToast(`${msg} Post was not published.`, 'warning');
           return false;
+        }
+      } else if (rawItem && typeof rawItem === 'object') {
+        attachedMeta = rawItem;
+        if (rawItem.buffer && rawItem.name) {
+          fileToUpload = new File([rawItem.buffer], rawItem.name, {
+            type: rawItem.file?.type || (rawItem.type === 'video' ? 'video/mp4' : 'image/jpeg'),
+            lastModified: Date.now(),
+          });
+        } else if (rawItem.file) {
+          fileToUpload = rawItem.file;
+        } else if (rawItem.previewUrl) {
+          try {
+            callbacks?.onProgress?.(`Preparing preset photo (${i + 1}/${rawInputItems.length})...`);
+            const resp = await fetch(rawItem.previewUrl, { signal: callbacks?.signal });
+            if (!resp.ok) throw new Error('Could not load selected preset photo.');
+            const blob = await resp.blob();
+            const ext = blob.type.includes('webp') ? 'webp' : blob.type.includes('png') ? 'png' : 'jpg';
+            fileToUpload = new File([blob], `campus_photo_${i + 1}.${ext}`, {
+              type: blob.type || 'image/webp',
+              lastModified: Date.now(),
+            });
+          } catch (presetErr: unknown) {
+            await rollbackCloudinary();
+            const msg = presetErr instanceof Error ? presetErr.message : 'Failed to prepare selected photo.';
+            callbacks?.onError?.(msg);
+            return false;
+          }
         }
       }
 
-      if (fileToUpload) {
-        const isVideo =
-          fileToUpload.type.startsWith('video/') ||
-          Boolean(fileToUpload.name.match(/\.(mp4|webm|mov|m4v|ogg)$/i));
+      if (!fileToUpload) continue;
 
-        if (isVideo) {
-          if (uploadedStoragePaths.length > 0) {
-            await deletePostMediaFilesFromStorage(uploadedStoragePaths);
-          }
-          const msg = 'Video posting is currently disabled. Please choose photos only.';
+      const isVideo =
+        attachedMeta?.type === 'video' ||
+        fileToUpload.type.startsWith('video/') ||
+        Boolean(fileToUpload.name.match(/\.(mp4|webm|mov|m4v|ogg)$/i));
+
+      let durationSeconds = attachedMeta?.videoSettings?.duration ?? attachedMeta?.duration;
+
+      if (isVideo) {
+        callbacks?.onProgress?.(`Checking video (${i + 1}/${rawInputItems.length})...`);
+        const vidVal = await validatePostVideoFile(fileToUpload);
+        if (!vidVal.valid) {
+          await rollbackCloudinary();
+          const msg = vidVal.error || 'Video must be 60 seconds or shorter and under 50 MB.';
           callbacks?.onError?.(msg);
           addToast(msg, 'warning');
           return false;
         }
+        durationSeconds = vidVal.metadata?.duration ?? durationSeconds;
+      } else {
+        callbacks?.onProgress?.(`Optimizing photo (${i + 1}/${rawInputItems.length})...`);
+        const compressed = await compressImageForUpload(fileToUpload, 2.0, 1920);
+        fileToUpload = compressed.file;
+      }
 
-        const stepMsg = `Uploading photo (${i + 1}/${rawItems.length}) to Supabase Storage...`;
-        callbacks?.onProgress?.(stepMsg);
-        addToast(stepMsg, 'info');
+      const label = isVideo ? 'video' : 'photo';
+      callbacks?.onProgress?.(`Uploading ${label} (${i + 1}/${rawInputItems.length})...`);
 
-        const sbRes = await uploadPostMediaToSupabaseStorage(
-          auth.user.id,
-          fileToUpload,
-          (status) => callbacks?.onProgress?.(`${status} (${i + 1}/${rawItems.length})`)
-        );
+      const cldRes = await uploadMediaToCloudinary(fileToUpload, 'post', {
+        signal: callbacks?.signal,
+        maxBytes: 50 * 1024 * 1024,
+        onProgress: (status) => callbacks?.onProgress?.(`${status} (${i + 1}/${rawInputItems.length})`),
+        onPercent: (itemPct) => {
+          const overallPct = Math.min(95, Math.round(((i + itemPct / 100) / rawInputItems.length) * 90));
+          callbacks?.onPercent?.(overallPct);
+        },
+      });
 
-        if (sbRes.success && sbRes.media) {
-          uploadedStoragePaths.push(sbRes.media.asset_id);
-          mediaList.push({
-            secure_url: sbRes.media.secure_url,
-            asset_id: sbRes.media.asset_id,
-            format: sbRes.media.format,
-            bytes: sbRes.media.bytes,
-            width: sbRes.media.width,
-            height: sbRes.media.height,
-            kind: 'image',
-            provider: 'supabase',
-            position: i,
-          });
-        } else {
-          // Clean up any media uploaded earlier in this batch so no orphaned files remain
-          if (uploadedStoragePaths.length > 0) {
-            await deletePostMediaFilesFromStorage(uploadedStoragePaths);
-          }
-          const finalErr = sbRes.error || 'Media upload to Supabase Storage failed.';
-          console.error('[createPost Media Upload Error]', finalErr);
-          callbacks?.onError?.(finalErr);
+      if (!cldRes.success || !cldRes.secure_url) {
+        await rollbackCloudinary();
+        const finalErr = cldRes.aborted
+          ? 'Post publishing was cancelled.'
+          : cldRes.error || `Failed to upload ${label} to Cloudinary.`;
+        callbacks?.onError?.(finalErr);
+        if (!cldRes.aborted) {
           addToast(`${finalErr} Post was not published.`, 'warning');
-          return false;
+        }
+        return false;
+      }
+
+      const publicId = cldRes.public_id || cldRes.asset_id;
+      if (publicId) {
+        uploadedCloudinary.push({
+          public_id: publicId,
+          resource_type: isVideo ? 'video' : 'image',
+          entity_type: 'post',
+        });
+      }
+
+      let thumbnailUrl: string | undefined = isVideo
+        ? buildCloudinaryVideoPosterUrl(cldRes.secure_url, {
+            timeOffset: attachedMeta?.videoSettings?.startTime ?? 0,
+          }) || undefined
+        : undefined;
+
+      // Upload custom captured poster frame if user snapped a thumbnail inside VideoEditorModal
+      if (isVideo && attachedMeta?.videoSettings?.posterDataUrl?.startsWith('data:image/')) {
+        try {
+          const posterResp = await fetch(attachedMeta.videoSettings.posterDataUrl);
+          const posterBlob = await posterResp.blob();
+          const posterFile = new File([posterBlob], `poster_${i + 1}.jpg`, {
+            type: posterBlob.type || 'image/jpeg',
+          });
+          const posterCld = await uploadMediaToCloudinary(posterFile, 'post', {
+            signal: callbacks?.signal,
+          });
+          if (posterCld.success && posterCld.secure_url) {
+            thumbnailUrl = posterCld.secure_url;
+            if (posterCld.public_id) {
+              uploadedCloudinary.push({
+                public_id: posterCld.public_id,
+                resource_type: 'image',
+                entity_type: 'post',
+              });
+            }
+          }
+        } catch {
+          // Non-blocking fallback to Cloudinary frame extraction URL
         }
       }
+
+      const vs = attachedMeta?.videoSettings;
+      mediaList.push({
+        secure_url: cldRes.secure_url,
+        asset_id: publicId || cldRes.secure_url,
+        cloudinary_public_id: publicId,
+        cloudinary_resource_type: isVideo ? 'video' : 'image',
+        format: cldRes.format,
+        bytes: cldRes.bytes,
+        width: cldRes.width,
+        height: cldRes.height,
+        duration_seconds:
+          typeof durationSeconds === 'number' && Number.isFinite(durationSeconds)
+            ? durationSeconds
+            : cldRes.duration,
+        thumbnail_url: thumbnailUrl,
+        trim_start: vs?.startTime,
+        trim_end: vs?.endTime,
+        is_muted: vs?.isMuted,
+        aspect_ratio: vs?.aspectRatio,
+        kind: isVideo ? 'video' : 'image',
+        provider: 'cloudinary',
+        position: i,
+      });
+    }
+
+    if (callbacks?.signal?.aborted) {
+      await rollbackCloudinary();
+      callbacks?.onError?.('Post publishing was cancelled.');
+      return false;
     }
 
     callbacks?.onProgress?.('Saving post...');
+    callbacks?.onPercent?.(97);
+
     const visibility = audience === 'Friends Only' ? 'friends' : audience === 'Campus Only' ? 'campus' : 'public';
     const res = await createRealPost({
       authorId: auth.user.id,
@@ -1680,12 +1845,18 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     });
 
     if (res.success && res.post) {
+      callbacks?.onPercent?.(100);
       setPosts((prev) => [res.post!, ...prev]);
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(
+          new CustomEvent('absu:post-created', { detail: { post: res.post } })
+        );
+      }
       addToast('Post published to campus feed!', 'success');
-      // Background sync to ensure reactions/relations are fresh
       loadPosts();
       return true;
     } else {
+      await rollbackCloudinary();
       const errMsg = res.error || 'Failed to publish post to database.';
       callbacks?.onError?.(errMsg);
       addToast(errMsg, 'warning');
@@ -1699,10 +1870,18 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       return;
     }
 
-    const targetPost = posts.find((p) => p.id === postId);
-    const wasLiked = targetPost?.isLiked ?? false;
+    let targetPost = posts.find((p) => p.id === postId);
+    let wasLiked = targetPost?.isLiked ?? false;
 
-    // Optimistic UI update
+    if (!targetPost) {
+      const fetched = await fetchSinglePostById(postId, auth.user.id).catch(() => null);
+      if (fetched?.status === 'ok' && fetched.post) {
+        targetPost = fetched.post;
+        wasLiked = fetched.post.isLiked;
+      }
+    }
+
+    // Optimistic UI update for Home/Profile cached posts
     setPosts((prev) =>
       prev.map((p) => {
         if (p.id === postId) {
@@ -1717,7 +1896,6 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     const res = await toggleRealPostReaction(postId, auth.user.id);
     if (!res.success) {
       addToast(res.error || 'Reaction could not be saved', 'warning');
-      // Revert optimistic update
       setPosts((prev) =>
         prev.map((p) => {
           if (p.id === postId) {
@@ -1728,7 +1906,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           return p;
         })
       );
-    } else if (!wasLiked && targetPost && targetPost.author.id !== auth.user.id) {
+    } else if (!wasLiked && res.isLiked && targetPost && targetPost.author.id !== auth.user.id) {
       const isPagePost = Boolean(
         targetPost.pageId ||
         targetPost.isPagePost ||
@@ -1738,7 +1916,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
       // Only dispatch individual student notification if target is a real peer (not a campus community page)
       if (!isPagePost) {
-        const deepUrl = `/?view=post-detail&postId=${postId}`;
+        const targetIsVideo = isVideoPost(targetPost) || (await checkPostHasVideo(postId));
+        const targetView = targetIsVideo ? 'reels' : 'post-detail';
+        const deepUrl = `/?view=${targetView}&postId=${postId}`;
         createRealNotification({
           recipientId: targetPost.author.id,
           actorId: auth.user.id,
@@ -1746,6 +1926,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           entityType: 'post',
           entityId: postId,
           postId,
+          body: targetIsVideo ? 'liked your reel.' : 'liked your post.',
           senderName: currentUser.name,
           url: deepUrl,
         }).catch(() => {});
@@ -1760,25 +1941,19 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     }
   };
 
-  const toggleSave = async (postId: string) => {
+  const toggleSave = async (postId: string, explicitWasSaved?: boolean) => {
     const target = posts.find((p) => p.id === postId);
-    const wasSaved = target?.isSaved ?? false;
+    const wasSaved = explicitWasSaved !== undefined ? explicitWasSaved : (target?.isSaved ?? false);
+    const nextSaved = !wasSaved;
 
     setPosts((prev) =>
-      prev.map((post) => {
-        if (post.id === postId) {
-          const isSaved = !post.isSaved;
-          addToast(isSaved ? 'Post bookmarked' : 'Removed from bookmarks', 'info');
-          return { ...post, isSaved };
-        }
-        return post;
-      })
+      prev.map((post) => (post.id === postId ? { ...post, isSaved: nextSaved } : post))
     );
+    addToast(nextSaved ? 'Saved to bookmarks' : 'Removed from bookmarks', 'info');
 
     if (!auth.user) return;
     const res = await toggleSavePostInDb(postId, auth.user.id, wasSaved);
     if (!res.success) {
-      // Revert if persistence failed
       setPosts((prev) =>
         prev.map((post) => (post.id === postId ? { ...post, isSaved: wasSaved } : post))
       );
@@ -1882,8 +2057,12 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         }
       }
 
+      const targetIsVideo = cachedPost
+        ? isVideoPost(cachedPost)
+        : await checkPostHasVideo(postId);
+
       const qs = new URLSearchParams({
-        view: 'post-detail',
+        view: targetIsVideo ? 'reels' : 'post-detail',
         postId,
         commentId: createdComment.id,
         openComments: '1',
@@ -1932,7 +2111,13 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           postId,
           commentId: createdComment.id,
           parentCommentId: parentId || undefined,
-          body: parentId ? 'replied to a comment on your post.' : 'commented on your post.',
+          body: parentId
+            ? targetIsVideo
+              ? 'replied to a comment on your reel.'
+              : 'replied to a comment on your post.'
+            : targetIsVideo
+            ? 'commented on your reel.'
+            : 'commented on your post.',
           senderName: currentUser.name,
           url: deepUrl,
         }).catch(() => {});

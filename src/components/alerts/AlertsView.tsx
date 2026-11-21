@@ -4,6 +4,7 @@ import { useAuth } from '../../context/AuthContext.tsx';
 import type { NotificationItem, NotificationType } from '../../types/index.ts';
 import { Avatar } from '../common/Avatar.tsx';
 import { safeStorage } from '../../utils/safeStorage.ts';
+import { checkPostHasVideo, isVideoPost } from '../../lib/reelsService.ts';
 import {
   Bell,
   Heart,
@@ -24,6 +25,7 @@ export const AlertsView: React.FC = () => {
     notifications,
     loadingNotifications,
     refreshNotifications,
+    posts,
     conversations,
     markNotificationAsRead,
     markAllNotificationsAsRead,
@@ -86,7 +88,16 @@ export const AlertsView: React.FC = () => {
     }
   };
 
-  const handleNotificationClick = (item: NotificationItem) => {
+  const resolvePostAlertDestination = async (postId: string, item: NotificationItem): Promise<'reels' | 'post-detail'> => {
+    if (item.targetIsVideo === true) return 'reels';
+    const cached = posts.find((p) => p.id === postId);
+    if (cached && isVideoPost(cached)) return 'reels';
+    if (item.targetIsVideo === false) return 'post-detail';
+    const hasVideo = await checkPostHasVideo(postId).catch(() => false);
+    return hasVideo ? 'reels' : 'post-detail';
+  };
+
+  const handleNotificationClick = async (item: NotificationItem) => {
     const now = Date.now();
     if (lastClickRef.current.id === item.id && now - lastClickRef.current.ts < 500) {
       return;
@@ -152,7 +163,8 @@ export const AlertsView: React.FC = () => {
         entityTypeLower === 'comment_reaction' ||
         Boolean(item.targetCommentId || item.targetParentCommentId);
 
-      navigateTo('post-detail', {
+      const targetView = await resolvePostAlertDestination(item.targetPostId, item);
+      navigateTo(targetView, {
         postId: item.targetPostId,
         commentId: item.targetCommentId || null,
         parentCommentId: item.targetParentCommentId || null,
@@ -160,7 +172,8 @@ export const AlertsView: React.FC = () => {
         actorId: item.actor.id,
       });
     } else if (item.targetPostId) {
-      navigateTo('post-detail', {
+      const targetView = await resolvePostAlertDestination(item.targetPostId, item);
+      navigateTo(targetView, {
         postId: item.targetPostId,
         commentId: item.targetCommentId || null,
         parentCommentId: item.targetParentCommentId || null,

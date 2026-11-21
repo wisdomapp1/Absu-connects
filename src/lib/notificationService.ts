@@ -446,11 +446,54 @@ export async function fetchUserNotifications(
       });
     }
 
+    // Batch-resolve whether referenced target posts contain video so alerts route to Reels vs PostDetail
+    const targetPostIds = Array.from(
+      new Set(
+        rawList
+          .map((item) => item.targetPostId)
+          .filter((id): id is string => Boolean(id && isValidUuid(id)))
+      )
+    );
+    const videoPostIdSet = new Set<string>();
+    if (targetPostIds.length > 0) {
+      try {
+        const { data: mediaRows } = await supabase
+          .from('post_media')
+          .select('post_id, kind, format, secure_url')
+          .in('post_id', targetPostIds);
+        for (const m of (mediaRows || []) as Array<{
+          post_id?: string;
+          kind?: string;
+          format?: string;
+          secure_url?: string;
+        }>) {
+          if (!m.post_id) continue;
+          const fmt = (m.format || '').toLowerCase();
+          const url = (m.secure_url || '').toLowerCase();
+          const isVid =
+            m.kind === 'video' ||
+            fmt === 'mp4' ||
+            fmt === 'webm' ||
+            fmt === 'mov' ||
+            fmt === 'm4v' ||
+            url.includes('/video/') ||
+            Boolean(url.match(/\.(mp4|webm|mov|ogg|m4v)(\?.*)?$/i));
+          if (isVid) videoPostIdSet.add(m.post_id);
+        }
+      } catch {
+        // Non-blocking fallback; AlertsView also verifies lazily if undefined
+      }
+    }
+
     // WhatsApp-Like Conversation-Level Deduplication for Active Message Alerts
     const activeUnreadMessageConvs = new Set<string>();
     const deduplicatedResult: NotificationItem[] = [];
 
-    for (const item of rawList) {
+    for (const rawItem of rawList) {
+      const item: NotificationItem = rawItem.targetPostId
+        ? { ...rawItem, targetIsVideo: videoPostIdSet.has(rawItem.targetPostId) }
+        : rawItem;
+
       if (item.type === 'message' && !item.isRead && !item.isArchived) {
         const dedupeKey = item.conversationId || `sender_${item.actor.id}`;
         if (activeUnreadMessageConvs.has(dedupeKey)) {

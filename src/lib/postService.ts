@@ -7,6 +7,12 @@ import {
   extractPostMediaStoragePath,
 } from './storageService.ts';
 
+import {
+  deleteCloudinaryAssets,
+  extractCloudinaryPublicId,
+  type DeleteCloudinaryAssetInput,
+} from './cloudinaryService.ts';
+
 export interface SupabasePostRow {
   id: string;
   author_id: string;
@@ -34,6 +40,14 @@ export interface SupabasePostRow {
     kind?: 'image' | 'video';
     provider?: string;
     position?: number;
+    cloudinary_public_id?: string;
+    cloudinary_resource_type?: 'image' | 'video' | 'raw' | 'auto';
+    duration_seconds?: number;
+    thumbnail_url?: string;
+    trim_start?: number;
+    trim_end?: number;
+    is_muted?: boolean;
+    aspect_ratio?: '16:9' | '1:1' | '9:16' | 'original';
   }>;
   post_reactions?: Array<{
     post_id: string;
@@ -152,8 +166,16 @@ export function mapSupabasePostToFrontend(
         (m.secure_url || '').match(/\.(mp4|webm|mov|ogg|m4v)(\?.*)?$/i)
         ? 'video'
         : 'image') as 'image' | 'video',
-      provider: m.provider || 'supabase',
+      provider: m.provider || (m.secure_url?.includes('res.cloudinary.com') ? 'cloudinary' : 'supabase'),
       position: m.position ?? idx,
+      cloudinary_public_id: m.cloudinary_public_id,
+      cloudinary_resource_type: m.cloudinary_resource_type,
+      duration_seconds: m.duration_seconds,
+      thumbnail_url: m.thumbnail_url,
+      trim_start: m.trim_start,
+      trim_end: m.trim_end,
+      is_muted: m.is_muted,
+      aspect_ratio: m.aspect_ratio,
     }))
     .sort((a, b) => (a.position ?? 0) - (b.position ?? 0));
 
@@ -332,7 +354,7 @@ export async function toggleSavePostInDb(
   }
 }
 
-async function getOptionalAuthHeaders(): Promise<Record<string, string>> {
+export async function getOptionalAuthHeaders(): Promise<Record<string, string>> {
   try {
     const { data } = await supabase.auth.getSession();
     const token = data.session?.access_token;
@@ -342,14 +364,14 @@ async function getOptionalAuthHeaders(): Promise<Record<string, string>> {
   }
 }
 
-async function parseApiJson(res: Response | null): Promise<any | null> {
+export async function parseApiJson(res: Response | null): Promise<any | null> {
   if (!res) return null;
   const ct = (res.headers.get('content-type') || '').toLowerCase();
   if (!ct.includes('application/json')) return null;
   return await res.json().catch(() => null);
 }
 
-async function fetchModeratedPostIds(): Promise<Set<string>> {
+export async function fetchModeratedPostIds(): Promise<Set<string>> {
   const moderatedSet = new Set<string>();
   try {
     const modRes = await fetch('/api/content/moderated-posts').catch(() => null);
@@ -369,7 +391,7 @@ async function fetchModeratedPostIds(): Promise<Set<string>> {
   return moderatedSet;
 }
 
-async function getDirectSafetyContext(currentUserId?: string): Promise<{
+export async function getDirectSafetyContext(currentUserId?: string): Promise<{
   friendIds: Set<string>;
   blockedIds: Set<string>;
 }> {
@@ -424,7 +446,7 @@ const CLIENT_CORE_SELECT = `
   comments(id)
 `;
 
-async function hydratePostRowsFromSupabase(rows: SupabasePostRow[]): Promise<SupabasePostRow[]> {
+export async function hydratePostRowsFromSupabase(rows: SupabasePostRow[]): Promise<SupabasePostRow[]> {
   if (rows.length === 0) return rows;
 
   const missingAuthorIds = Array.from(
@@ -506,7 +528,7 @@ async function hydratePostRowsFromSupabase(rows: SupabasePostRow[]): Promise<Sup
   }
 }
 
-async function querySupabasePostsResilient(
+export async function querySupabasePostsResilient(
   applyFilters: (query: any) => any
 ): Promise<{ rows: SupabasePostRow[]; error?: string }> {
   const richRes = await applyFilters(supabase.from('posts').select(CLIENT_RICH_SELECT));
@@ -892,11 +914,68 @@ export interface PostMediaAttachment {
   kind?: 'image' | 'video';
   provider?: string;
   position?: number;
+  cloudinary_public_id?: string;
+  cloudinary_resource_type?: 'image' | 'video' | 'raw' | 'auto';
+  duration_seconds?: number;
+  thumbnail_url?: string;
+  trim_start?: number;
+  trim_end?: number;
+  is_muted?: boolean;
+  aspect_ratio?: '16:9' | '1:1' | '9:16' | 'original';
+}
+
+function collectPostRollbackAssets(mediaList: PostMediaAttachment[]): {
+  supabasePaths: string[];
+  cloudinaryAssets: DeleteCloudinaryAssetInput[];
+} {
+  const supabasePaths: string[] = [];
+  const cloudinaryAssets: DeleteCloudinaryAssetInput[] = [];
+
+  for (const m of mediaList) {
+    const isCloudinary =
+      m.provider === 'cloudinary' ||
+      Boolean(m.cloudinary_public_id) ||
+      Boolean(m.secure_url?.includes('res.cloudinary.com'));
+
+    if (isCloudinary) {
+      const publicId =
+        m.cloudinary_public_id ||
+        extractCloudinaryPublicId(m.asset_id) ||
+        extractCloudinaryPublicId(m.secure_url);
+      if (publicId) {
+        cloudinaryAssets.push({
+          public_id: publicId,
+          resource_type:
+            m.cloudinary_resource_type === 'video' || m.kind === 'video' ? 'video' : 'image',
+          entity_type: 'post',
+        });
+      }
+      const thumbPublicId = extractCloudinaryPublicId(m.thumbnail_url);
+      if (thumbPublicId && thumbPublicId !== publicId) {
+        cloudinaryAssets.push({
+          public_id: thumbPublicId,
+          resource_type: 'image',
+          entity_type: 'post',
+        });
+      }
+    } else if (m.asset_id) {
+      supabasePaths.push(m.asset_id);
+    }
+  }
+
+  return { supabasePaths, cloudinaryAssets };
+}
+
+async function cleanupUploadedPostMedia(mediaList: PostMediaAttachment[]): Promise<void> {
+  const { supabasePaths, cloudinaryAssets } = collectPostRollbackAssets(mediaList);
+  await Promise.all([
+    supabasePaths.length > 0 ? deletePostMediaFilesFromStorage(supabasePaths) : Promise.resolve(),
+    cloudinaryAssets.length > 0 ? deleteCloudinaryAssets(cloudinaryAssets) : Promise.resolve(),
+  ]);
 }
 
 /**
- * Create a real post in Supabase with optional multiple media items.
- * Uses Supabase Storage 'post-media' bucket.
+ * Create a real post in Supabase with optional multiple media items (Cloudinary MPV2 + Supabase Storage compatibility).
  * Cleans up orphaned files and posts on any failure.
  */
 export async function createRealPost(params: {
@@ -925,13 +1004,6 @@ export async function createRealPost(params: {
       postPayload.community_id = params.communityId;
     }
 
-    console.log('[Supabase Post Insert] Creating post row...', {
-      author_id: params.authorId,
-      community_id: params.communityId,
-      visibility: postPayload.visibility,
-      mediaCount: mediaList.length,
-    });
-
     const { data: postData, error: postError } = await supabase
       .from('posts')
       .insert(postPayload)
@@ -944,19 +1016,14 @@ export async function createRealPost(params: {
 
     if (postError || !postData) {
       console.error('[Supabase Post Error] Failed to insert post:', postError?.message);
-      // Clean up uploaded media in storage if post insertion fails
-      const storagePaths = mediaList
-        .map((m) => m.asset_id)
-        .filter(Boolean) as string[];
-      if (storagePaths.length > 0) {
-        await deletePostMediaFilesFromStorage(storagePaths);
-      }
+      await cleanupUploadedPostMedia(mediaList);
       return { success: false, error: postError?.message || 'Failed to create post.' };
     }
 
-    // Insert all post_media items if any attached — persist storage path, never temporary signed URLs
     if (mediaList.length > 0) {
-      const mediaPayloads = mediaList.map((m, idx) => {
+      const nowIso = new Date().toISOString();
+
+      const buildMediaRow = (m: PostMediaAttachment, idx: number, includeExtended: boolean) => {
         const mediaKind: 'image' | 'video' =
           m.kind ||
           (m.format === 'mp4' ||
@@ -965,34 +1032,75 @@ export async function createRealPost(params: {
             ? 'video'
             : 'image');
 
-        const persistentStoragePath = extractPostMediaStoragePath(
-          m.asset_id,
-          m.secure_url,
-          m.provider
-        );
+        const isCloudinary =
+          m.provider === 'cloudinary' ||
+          Boolean(m.cloudinary_public_id) ||
+          m.secure_url.includes('res.cloudinary.com');
 
-        return {
+        const persistentStoragePath = isCloudinary
+          ? null
+          : extractPostMediaStoragePath(m.asset_id, m.secure_url, m.provider);
+
+        const publicId =
+          m.cloudinary_public_id ||
+          (isCloudinary
+            ? extractCloudinaryPublicId(m.asset_id) || extractCloudinaryPublicId(m.secure_url)
+            : null);
+
+        const baseRow: Record<string, any> = {
           post_id: postData.id,
           uploader_id: params.authorId,
           kind: mediaKind,
-          provider: m.provider || 'supabase',
-          // Store persistent storage path for private post-media bucket; preserve public URLs only for public buckets/presets
-          secure_url: persistentStoragePath || m.secure_url,
-          asset_id: persistentStoragePath || m.asset_id || m.secure_url || `media_${postData.id}_${idx}`,
+          provider: m.provider || (isCloudinary ? 'cloudinary' : 'supabase'),
+          secure_url: isCloudinary ? m.secure_url : persistentStoragePath || m.secure_url,
+          asset_id: isCloudinary
+            ? publicId || m.asset_id || m.secure_url
+            : persistentStoragePath || m.asset_id || m.secure_url || `media_${postData.id}_${idx}`,
           format: m.format || null,
           bytes: m.bytes || null,
           width: m.width || null,
           height: m.height || null,
           position: m.position ?? idx,
-          created_at: new Date().toISOString(),
+          created_at: nowIso,
         };
-      });
 
-      console.log(`[Supabase Media Insert] Attaching ${mediaPayloads.length} post_media rows...`);
+        if (includeExtended) {
+          baseRow.cloudinary_public_id = publicId || null;
+          baseRow.cloudinary_resource_type = isCloudinary
+            ? m.cloudinary_resource_type || (mediaKind === 'video' ? 'video' : 'image')
+            : null;
+          baseRow.duration_seconds =
+            typeof m.duration_seconds === 'number' && Number.isFinite(m.duration_seconds)
+              ? m.duration_seconds
+              : null;
+          baseRow.thumbnail_url = m.thumbnail_url || null;
+          baseRow.trim_start =
+            typeof m.trim_start === 'number' && Number.isFinite(m.trim_start) ? m.trim_start : null;
+          baseRow.trim_end =
+            typeof m.trim_end === 'number' && Number.isFinite(m.trim_end) ? m.trim_end : null;
+          baseRow.is_muted = typeof m.is_muted === 'boolean' ? m.is_muted : false;
+          baseRow.aspect_ratio = m.aspect_ratio || null;
+        }
 
-      const { error: mediaError } = await supabase
-        .from('post_media')
-        .insert(mediaPayloads);
+        return baseRow;
+      };
+
+      const extendedPayloads = mediaList.map((m, idx) => buildMediaRow(m, idx, true));
+      let { error: mediaError } = await supabase.from('post_media').insert(extendedPayloads);
+
+      // Graceful MPV1 backward-compatibility fallback if MPV2 SQL columns aren't migrated yet
+      if (
+        mediaError &&
+        (mediaError.code === '42703' ||
+          mediaError.code === 'PGRST204' ||
+          mediaError.message?.toLowerCase().includes('schema cache') ||
+          (mediaError.message?.toLowerCase().includes('column') &&
+            !mediaError.message?.toLowerCase().includes('file_name')))
+      ) {
+        const corePayloads = mediaList.map((m, idx) => buildMediaRow(m, idx, false));
+        const retryRes = await supabase.from('post_media').insert(corePayloads);
+        mediaError = retryRes.error;
+      }
 
       if (mediaError) {
         console.error('[Supabase Media Insert Failed]', {
@@ -1001,16 +1109,8 @@ export async function createRealPost(params: {
           details: mediaError.details,
         });
 
-        // Clean up orphaned post so we don't leave broken content
         await supabase.from('posts').delete().eq('id', postData.id);
-
-        // Clean up uploaded files in post-media storage bucket
-        const storagePaths = mediaList
-          .map((m) => m.asset_id)
-          .filter(Boolean) as string[];
-        if (storagePaths.length > 0) {
-          await deletePostMediaFilesFromStorage(storagePaths);
-        }
+        await cleanupUploadedPostMedia(mediaList);
 
         const isMissingFileNameTrigger =
           mediaError.code === '42703' ||
@@ -1019,7 +1119,7 @@ export async function createRealPost(params: {
         return {
           success: false,
           error: isMissingFileNameTrigger
-            ? 'Database trigger mismatch on post_media (missing file_name). Run the MVP 1 SQL migration in Supabase SQL Editor to resolve.'
+            ? 'Database trigger mismatch on post_media (missing file_name). Run the SQL migration in Supabase SQL Editor to resolve.'
             : `Media metadata failed to save (${mediaError.message}). Please try again.`,
         };
       }
@@ -1035,48 +1135,82 @@ export async function createRealPost(params: {
       params.authorId
     );
 
-    console.log('[Supabase Post Published] Post successfully created with ID:', postData.id);
     return { success: true, post: frontendPost };
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : 'Failed to publish post';
     console.error('[Supabase Post Error] Unexpected exception:', msg);
-
-    // Clean up uploaded files on unexpected exception
-    const storagePaths = mediaList
-      .map((m) => m.asset_id)
-      .filter(Boolean) as string[];
-    if (storagePaths.length > 0) {
-      await deletePostMediaFilesFromStorage(storagePaths);
-    }
-
+    await cleanupUploadedPostMedia(mediaList);
     return { success: false, error: msg };
   }
 }
 
 /**
- * Delete a post from Supabase and remove associated storage media
+ * Delete a post from Supabase and remove associated Cloudinary and/or Storage media
  */
 export async function deleteRealPost(
   postId: string,
   userId: string
 ): Promise<{ success: boolean; error?: string }> {
   try {
-    // 1. Fetch attached media to clean up storage objects
-    const { data: mediaRows } = await supabase
+    // 1. Verify ownership and fetch attached media before DB delete
+    let mediaRows: Array<Record<string, any>> | null = null;
+    const { data: extRows, error: extErr } = await supabase
       .from('post_media')
-      .select('asset_id, provider')
+      .select('id, asset_id, provider, secure_url, kind, cloudinary_public_id, cloudinary_resource_type, thumbnail_url')
       .eq('post_id', postId);
 
+    if (extErr) {
+      const { data: coreRows } = await supabase
+        .from('post_media')
+        .select('id, asset_id, provider, secure_url, kind')
+        .eq('post_id', postId);
+      mediaRows = coreRows || [];
+    } else {
+      mediaRows = extRows || [];
+    }
+
+    // 2. Clean up Cloudinary assets FIRST while DB ownership records still exist for Edge Function verification
     if (mediaRows && mediaRows.length > 0) {
-      const pathsToDelete = mediaRows
-        .filter((m) => m.asset_id && m.provider === 'supabase')
-        .map((m) => m.asset_id as string);
-      if (pathsToDelete.length > 0) {
-        await deletePostMediaFilesFromStorage(pathsToDelete);
+      const cloudinaryAssets: DeleteCloudinaryAssetInput[] = [];
+      for (const m of mediaRows) {
+        const isCloudinary =
+          m.provider === 'cloudinary' ||
+          Boolean(m.cloudinary_public_id) ||
+          String(m.secure_url || '').includes('res.cloudinary.com');
+        if (!isCloudinary) continue;
+
+        const publicId =
+          m.cloudinary_public_id ||
+          extractCloudinaryPublicId(m.asset_id) ||
+          extractCloudinaryPublicId(m.secure_url);
+
+        if (publicId) {
+          cloudinaryAssets.push({
+            public_id: publicId,
+            resource_type:
+              m.cloudinary_resource_type === 'video' || m.kind === 'video' ? 'video' : 'image',
+            entity_type: 'post',
+            entity_id: postId,
+          });
+        }
+
+        const thumbPublicId = extractCloudinaryPublicId(m.thumbnail_url);
+        if (thumbPublicId && thumbPublicId !== publicId) {
+          cloudinaryAssets.push({
+            public_id: thumbPublicId,
+            resource_type: 'image',
+            entity_type: 'post',
+            entity_id: postId,
+          });
+        }
+      }
+
+      if (cloudinaryAssets.length > 0) {
+        await deleteCloudinaryAssets(cloudinaryAssets).catch(() => {});
       }
     }
 
-    // 2. Delete post row (cascades or deletes post_media/reactions)
+    // 3. Delete post row (cascades or deletes post_media/reactions)
     const { error } = await supabase
       .from('posts')
       .delete()
@@ -1086,6 +1220,17 @@ export async function deleteRealPost(
       console.warn('Supabase deletePost error:', error.message);
       return { success: false, error: error.message };
     }
+
+    // 4. Clean up legacy Supabase post-media files if any
+    if (mediaRows && mediaRows.length > 0) {
+      const pathsToDelete = mediaRows
+        .filter((m) => m.asset_id && m.provider !== 'cloudinary' && !String(m.secure_url || '').includes('res.cloudinary.com'))
+        .map((m) => m.asset_id as string);
+      if (pathsToDelete.length > 0) {
+        await deletePostMediaFilesFromStorage(pathsToDelete);
+      }
+    }
+
     return { success: true };
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : 'Failed to delete post';

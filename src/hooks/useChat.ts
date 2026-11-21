@@ -6,6 +6,7 @@ import {
   fetchConversationMessages,
   sendRealMessage,
   markConversationAsRead,
+  deleteRealMessage,
 } from '../lib/messageService.ts';
 import {
   getCachedMessages,
@@ -47,6 +48,7 @@ export function useChat(chatId: string | null | undefined) {
   const [loadingMore, setLoadingMore] = useState<boolean>(false);
   const [hasMore, setHasMore] = useState<boolean>(true);
   const [isPartnerTyping, setIsPartnerTyping] = useState<boolean>(false);
+  const [uploadProgress, setUploadProgress] = useState<number | null>(null);
   const [isOffline, setIsOffline] = useState<boolean>(() =>
     typeof navigator !== 'undefined' ? !navigator.onLine : false
   );
@@ -54,6 +56,7 @@ export function useChat(chatId: string | null | undefined) {
   const channelRef = useRef<any>(null);
   const typingTimerRef = useRef<any>(null);
   const lastTypingSentRef = useRef<number>(0);
+  const uploadAbortRef = useRef<AbortController | null>(null);
   const messagesMapRef = useRef<Map<string, Message>>(new Map());
   const failedPayloadsRef = useRef<Map<string, { text?: string; files?: File[] }>>(new Map());
   const syncLatestRef = useRef<() => Promise<void>>(async () => {});
@@ -313,6 +316,16 @@ export function useChat(chatId: string | null | undefined) {
           setIsPartnerTyping(false);
         }, 2500);
       })
+      // E. Peer deleted message for everyone
+      .on('broadcast', { event: 'message_deleted' }, (payload: any) => {
+        const deletedId = payload.payload?.messageId;
+        if (!deletedId) return;
+        setMessages((prev) => {
+          const next = prev.filter((m) => m.id !== deletedId);
+          setCachedMessages(chatId, next).catch(() => {});
+          return next;
+        });
+      })
       // Backup: postgres_changes for reliable message delivery & sender reconciliation
       .on(
         'postgres_changes',
@@ -467,15 +480,16 @@ export function useChat(chatId: string | null | undefined) {
 
       // Optimistic attachments preview (detect audio before video so voice notes render VoiceNoteBubble immediately)
       const tempAttachments: MessageAttachment[] = files.map((f, i) => {
-        const isAudio = f.type.startsWith('audio/') || Boolean(f.name.match(/\.(webm|mp3|m4a|wav|ogg|aac)$/i));
-        const isVideo = !isAudio && (f.type.startsWith('video/') || Boolean(f.name.match(/\.(mp4|mov|webm|m4v)$/i)));
+        const isPdf = f.type === 'application/pdf' || Boolean(f.name.match(/\.pdf$/i));
+        const isAudio = !isPdf && (f.type.startsWith('audio/') || Boolean(f.name.match(/\.(mp3|m4a|wav|ogg|aac)$/i)) || (f.name.startsWith('voicenote_') || f.name.startsWith('voice_note_')));
+        const isVideo = !isPdf && !isAudio && (f.type.startsWith('video/') || Boolean(f.name.match(/\.(mp4|mov|webm|m4v)$/i)));
         return {
           id: `att_temp_${i}_${Date.now()}`,
           message_id: tempId,
           uploader_id: currentUserId,
           file_name: f.name,
           bytes: f.size,
-          kind: isAudio ? 'audio' : isVideo ? 'video' : 'image',
+          kind: isPdf ? 'pdf' : isAudio ? 'audio' : isVideo ? 'video' : 'image',
           asset_id: `temp_${i}`,
           secure_url: URL.createObjectURL(f),
           provider: 'local',
@@ -522,6 +536,12 @@ export function useChat(chatId: string | null | undefined) {
       }
 
       // C. PERSISTENCE & BROADCAST
+      const abortController = files.length > 0 ? new AbortController() : null;
+      if (abortController) {
+        uploadAbortRef.current = abortController;
+        setUploadProgress(0);
+      }
+
       try {
         const compressedFiles: File[] = [];
         for (const f of files) {
@@ -538,7 +558,19 @@ export function useChat(chatId: string | null | undefined) {
           senderId: currentUserId,
           text: cleanText,
           files: compressedFiles.length > 0 ? compressedFiles : undefined,
+          onUploadProgress: files.length > 0 ? (pct) => setUploadProgress(pct) : undefined,
+          signal: abortController?.signal,
         });
+
+        if (res.aborted) {
+          setMessages((prev) => {
+            const next = prev.filter((m) => m.id !== tempId);
+            setCachedMessages(chatId, next).catch(() => {});
+            return next;
+          });
+          failedPayloadsRef.current.delete(tempId);
+          return false;
+        }
 
         if (res.success && res.message) {
           const confirmed = res.message;
@@ -594,7 +626,42 @@ export function useChat(chatId: string | null | undefined) {
           prev.map((m) => (m.id === tempId ? { ...m, status: 'failed' } : m))
         );
         return false;
+      } finally {
+        if (abortController && uploadAbortRef.current === abortController) {
+          uploadAbortRef.current = null;
+          setUploadProgress(null);
+        }
       }
+    },
+    [chatId, currentUserId]
+  );
+
+  const cancelUpload = useCallback(() => {
+    uploadAbortRef.current?.abort();
+  }, []);
+
+  const deleteMessage = useCallback(
+    async (msgId: string): Promise<boolean> => {
+      if (!chatId || !currentUserId || !msgId || msgId.startsWith('temp_')) return false;
+      const res = await deleteRealMessage(msgId, currentUserId);
+      if (!res.success) return false;
+
+      setMessages((prev) => {
+        const next = prev.filter((m) => m.id !== msgId);
+        setCachedMessages(chatId, next).catch(() => {});
+        return next;
+      });
+
+      if (channelRef.current) {
+        channelRef.current
+          .send({
+            type: 'broadcast',
+            event: 'message_deleted',
+            payload: { messageId: msgId },
+          })
+          .catch(() => {});
+      }
+      return true;
     },
     [chatId, currentUserId]
   );
@@ -651,9 +718,12 @@ export function useChat(chatId: string | null | undefined) {
     hasMore,
     isPartnerTyping,
     isOffline,
+    uploadProgress,
+    cancelUpload,
     loadMoreMessages,
     sendMessage: sendChatMessage,
     retryMessage,
+    deleteMessage,
     sendTypingIndicator,
   };
 }

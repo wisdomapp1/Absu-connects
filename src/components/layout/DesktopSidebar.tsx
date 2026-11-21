@@ -1,7 +1,7 @@
 import React from 'react';
 import { useApp } from '../../context/AppContext.tsx';
 import type { MainNavTab } from '../../types/index.ts';
-import { Home, Users, MessageSquare, Bell, Menu, Plus, Sparkles, EyeOff } from 'lucide-react';
+import { Home, Clapperboard, Users, MessageSquare, Bell, Menu, Plus, Sparkles, EyeOff } from 'lucide-react';
 import { Avatar } from '../common/Avatar.tsx';
 
 export const DesktopSidebar: React.FC = () => {
@@ -17,6 +17,7 @@ export const DesktopSidebar: React.FC = () => {
 
   const navItems = [
     { id: 'home' as MainNavTab, label: 'Home Feed', icon: Home },
+    { id: 'reels' as MainNavTab, label: 'Reels', icon: Clapperboard },
     { id: 'friends' as MainNavTab, label: 'Friends & Discovery', icon: Users },
     { id: 'messages' as MainNavTab, label: 'Messages', icon: MessageSquare, badgeCount: unreadMessagesCount },
     { id: 'alerts' as MainNavTab, label: 'Alerts', icon: Bell, badgeCount: unreadNotificationsCount },

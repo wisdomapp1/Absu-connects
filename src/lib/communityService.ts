@@ -10,7 +10,8 @@ import type {
 import type { Post, AttachedMediaItem } from '../types/index.ts';
 import { safeStorage } from '../utils/safeStorage.ts';
 import { fetchCommunityPostsFromSupabase, createRealPost, PostMediaAttachment } from './postService.ts';
-import { uploadPostMediaToSupabaseStorage, deletePostMediaFilesFromStorage } from './storageService.ts';
+import { uploadMediaToCloudinary, deleteCloudinaryAssets, type DeleteCloudinaryAssetInput } from './cloudinaryService.ts';
+import { compressImageForUpload, validatePostVideoFile } from './mediaCompression.ts';
 
 function purgeLegacyLocalCommunityCache() {
   try {
@@ -631,28 +632,60 @@ export async function createCommunityPost(
   content: string,
   attachments: AttachedMediaItem[] = []
 ): Promise<{ success: boolean; post?: Post; error?: string }> {
-  const uploadedPaths: string[] = [];
+  const limitedAttachments = attachments.slice(0, 4);
+  const uploadedCloudinary: DeleteCloudinaryAssetInput[] = [];
   const mediaList: PostMediaAttachment[] = [];
 
   try {
-    for (let i = 0; i < attachments.length; i++) {
-      const item = attachments[i];
+    for (let i = 0; i < limitedAttachments.length; i++) {
+      const item = limitedAttachments[i];
       if (!item.file) continue;
-      const uploadRes = await uploadPostMediaToSupabaseStorage(authorId, item.file);
-      if (!uploadRes.success || !uploadRes.media) {
-        if (uploadedPaths.length > 0) await deletePostMediaFilesFromStorage(uploadedPaths);
-        return { success: false, error: uploadRes.error || 'Failed to upload post media.' };
+
+      let fileToUpload = item.file;
+      let durationSeconds = item.videoSettings?.duration ?? item.duration;
+
+      if (item.type === 'video') {
+        const vidVal = await validatePostVideoFile(fileToUpload);
+        if (!vidVal.valid) {
+          if (uploadedCloudinary.length > 0) await deleteCloudinaryAssets(uploadedCloudinary);
+          return { success: false, error: vidVal.error || 'Invalid video attachment.' };
+        }
+        durationSeconds = vidVal.metadata?.duration ?? durationSeconds;
+      } else {
+        const comp = await compressImageForUpload(fileToUpload);
+        fileToUpload = comp.file;
       }
-      uploadedPaths.push(uploadRes.media.asset_id);
+
+      const cldRes = await uploadMediaToCloudinary(fileToUpload, 'post');
+      if (!cldRes.success || !cldRes.secure_url) {
+        if (uploadedCloudinary.length > 0) await deleteCloudinaryAssets(uploadedCloudinary);
+        return { success: false, error: cldRes.error || 'Failed to upload community media.' };
+      }
+
+      const publicId = cldRes.public_id || cldRes.asset_id;
+      if (publicId) {
+        uploadedCloudinary.push({
+          public_id: publicId,
+          resource_type: item.type === 'video' ? 'video' : 'image',
+          entity_type: 'post',
+        });
+      }
+
       mediaList.push({
-        secure_url: uploadRes.media.secure_url,
-        asset_id: uploadRes.media.asset_id,
-        format: uploadRes.media.format,
-        bytes: uploadRes.media.bytes,
-        width: uploadRes.media.width,
-        height: uploadRes.media.height,
-        kind: uploadRes.media.kind,
-        provider: 'supabase',
+        secure_url: cldRes.secure_url,
+        asset_id: publicId || cldRes.secure_url,
+        cloudinary_public_id: publicId,
+        cloudinary_resource_type: item.type === 'video' ? 'video' : 'image',
+        format: cldRes.format,
+        bytes: cldRes.bytes,
+        width: cldRes.width,
+        height: cldRes.height,
+        duration_seconds:
+          typeof durationSeconds === 'number' && Number.isFinite(durationSeconds)
+            ? durationSeconds
+            : cldRes.duration,
+        kind: item.type === 'video' ? 'video' : 'image',
+        provider: 'cloudinary',
         position: i,
       });
     }
@@ -665,7 +698,7 @@ export async function createCommunityPost(
       communityId,
     });
   } catch (err: unknown) {
-    if (uploadedPaths.length > 0) await deletePostMediaFilesFromStorage(uploadedPaths);
+    if (uploadedCloudinary.length > 0) await deleteCloudinaryAssets(uploadedCloudinary);
     return {
       success: false,
       error: err instanceof Error ? err.message : 'Failed to publish community post.',

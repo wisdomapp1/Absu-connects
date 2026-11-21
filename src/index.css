@@ -46,11 +46,13 @@
   }
 }
 
-/* Custom scrollbar for horizontal chip rows */
-.hide-scrollbar::-webkit-scrollbar {
+/* Custom scrollbar for horizontal chip rows and Reels vertical feed */
+.hide-scrollbar::-webkit-scrollbar,
+.no-scrollbar::-webkit-scrollbar {
   display: none;
 }
-.hide-scrollbar {
+.hide-scrollbar,
+.no-scrollbar {
   -ms-overflow-style: none;
   scrollbar-width: none;
 }

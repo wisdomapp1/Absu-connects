@@ -16,8 +16,13 @@ import {
 } from '../../lib/communityService.ts';
 import type { Community, CommunityMember } from '../../types/communities.ts';
 import type { Post, AttachedMediaItem } from '../../types/index.ts';
-import { decodeAndValidateImageFile, createInMemoryFile } from '../../lib/storageService.ts';
-import { validateImageFile, validateVideoFile } from '../../utils/logic.ts';
+import {
+  safeReadAndPrepareImage,
+  safeReadAndPrepareVideo,
+  categorizeMediaError,
+  type MediaRecoveryState,
+} from '../../lib/mediaRecovery.ts';
+import { MediaRecoveryBanner } from '../common/MediaRecoveryBanner.tsx';
 import { Avatar } from '../common/Avatar.tsx';
 import { LinkifiedText } from '../common/LinkifiedText.tsx';
 import { PostCard } from '../home/PostCard.tsx';
@@ -63,6 +68,7 @@ export const CommunityDetailView: React.FC<CommunityDetailViewProps> = ({
   const [postText, setPostText] = useState('');
   const [attachments, setAttachments] = useState<AttachedMediaItem[]>([]);
   const [posting, setPosting] = useState(false);
+  const [mediaRecovery, setMediaRecovery] = useState<MediaRecoveryState | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const loadAll = useCallback(async () => {
@@ -131,69 +137,86 @@ export const CommunityDetailView: React.FC<CommunityDetailViewProps> = ({
     e.target.value = '';
     if (files.length === 0) return;
 
-    const added: AttachedMediaItem[] = [];
-    let hadInvalid = false;
+    const remainingSlots = Math.max(0, 4 - attachments.length);
+    if (remainingSlots <= 0) {
+      addToast('Maximum 4 photos or videos allowed per community post.', 'warning');
+      return;
+    }
 
-    for (const file of files) {
+    const filesToProcess = files.slice(0, remainingSlots);
+    if (files.length > remainingSlots) {
+      addToast(`Only ${remainingSlots} more media item(s) can be added (4 max per post).`, 'warning');
+    }
+
+    const added: AttachedMediaItem[] = [];
+    let rejectedRecovery: MediaRecoveryState | null = null;
+
+    for (const file of filesToProcess) {
       const isVideo =
         file.type.startsWith('video/') ||
         Boolean(file.name.match(/\.(mp4|webm|mov|m4v|ogg)$/i));
       if (isVideo) {
-        const vCheck = validateVideoFile({ type: file.type, size: file.size, name: file.name });
-        if (!vCheck.valid) {
-          addToast(vCheck.error || `Invalid video "${file.name}"`, 'warning');
-          hadInvalid = true;
+        const preparedVid = await safeReadAndPrepareVideo(file, {
+          maxBytes: 50 * 1024 * 1024,
+          maxDurationSeconds: 60,
+        });
+        if (!preparedVid.ok || !preparedVid.file || !preparedVid.previewUrl) {
+          rejectedRecovery = preparedVid.recovery || null;
+          if (preparedVid.recovery?.message) {
+            addToast(preparedVid.recovery.message, 'warning');
+          }
           continue;
         }
-        try {
-          const mem = await createInMemoryFile(file);
-          added.push({
-            id: `catt_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
-            file: mem.file,
-            buffer: mem.buffer,
-            previewUrl: mem.previewUrl,
-            type: 'video',
-            name: mem.file.name,
-          });
-        } catch {
-          hadInvalid = true;
-        }
+        const dur = preparedVid.duration ?? 60;
+        added.push({
+          id: `catt_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
+          file: preparedVid.file,
+          buffer: preparedVid.buffer,
+          previewUrl: preparedVid.previewUrl,
+          type: 'video',
+          name: preparedVid.file.name,
+          duration: dur,
+          videoSettings: {
+            startTime: 0,
+            endTime: Math.min(60, dur),
+            duration: dur,
+            isMuted: false,
+            aspectRatio: 'original',
+          },
+        });
         continue;
       }
 
-      const iCheck = validateImageFile({ type: file.type, size: file.size, name: file.name });
-      if (!iCheck.valid) {
-        addToast(iCheck.error || `Invalid image "${file.name}"`, 'warning');
-        hadInvalid = true;
-        continue;
-      }
-      const decoded = await decodeAndValidateImageFile(file);
-      if (!decoded.valid || !decoded.file || !decoded.previewUrl) {
-        addToast(decoded.error || `"${file.name}" could not be read.`, 'warning');
-        hadInvalid = true;
+      const preparedImg = await safeReadAndPrepareImage(file);
+      if (!preparedImg.ok || !preparedImg.file || !preparedImg.previewUrl) {
+        rejectedRecovery = preparedImg.recovery || null;
+        if (preparedImg.recovery?.message) {
+          addToast(preparedImg.recovery.message, 'warning');
+        }
         continue;
       }
       added.push({
         id: `catt_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
-        file: decoded.file,
-        buffer: decoded.buffer,
-        previewUrl: decoded.previewUrl,
+        file: preparedImg.file,
+        buffer: preparedImg.buffer,
+        previewUrl: preparedImg.previewUrl,
         type: 'image',
-        name: decoded.file.name,
+        name: preparedImg.file.name,
       });
     }
 
     if (added.length > 0) {
-      setAttachments((prev) => [...prev, ...added]);
-    } else if (hadInvalid) {
-      setTimeout(() => fileInputRef.current?.click(), 180);
+      setAttachments((prev) => [...prev, ...added].slice(0, 4));
+      setMediaRecovery(null);
+    } else if (rejectedRecovery) {
+      setMediaRecovery(rejectedRecovery);
     }
   };
 
-  const handleCreatePost = async (e: React.FormEvent) => {
-    e.preventDefault();
+  const publishCommunityPostAttempt = async () => {
     if (!postText.trim() || !userId || !community || posting) return;
 
+    setMediaRecovery(null);
     setPosting(true);
     try {
       const res = await createCommunityPost(community.id, userId, postText.trim(), attachments);
@@ -207,11 +230,20 @@ export const CommunityDetailView: React.FC<CommunityDetailViewProps> = ({
         const updatedPosts = await fetchCommunityPosts(community.id, userId);
         setPosts(updatedPosts);
       } else {
-        addToast(res.error || 'Could not publish community post.', 'warning');
+        const errMsg = res.error || 'Could not publish community post.';
+        setMediaRecovery(categorizeMediaError(new Error(errMsg), { phase: 'upload' }));
+        addToast(errMsg, 'warning');
       }
+    } catch (err) {
+      setMediaRecovery(categorizeMediaError(err, { phase: 'upload' }));
     } finally {
       setPosting(false);
     }
+  };
+
+  const handleCreatePost = async (e: React.FormEvent) => {
+    e.preventDefault();
+    await publishCommunityPostAttempt();
   };
 
   if (loading && !community) {
@@ -393,6 +425,16 @@ export const CommunityDetailView: React.FC<CommunityDetailViewProps> = ({
                 onChange={handleSelectAttachment}
                 className="hidden"
               />
+              {mediaRecovery && (
+                <MediaRecoveryBanner
+                  recovery={mediaRecovery}
+                  onChooseAgain={() => fileInputRef.current?.click()}
+                  onRetryUpload={
+                    postText.trim().length > 0 && !posting ? publishCommunityPostAttempt : undefined
+                  }
+                  onDismiss={() => setMediaRecovery(null)}
+                />
+              )}
               <textarea
                 rows={3}
                 value={postText}
@@ -427,15 +469,16 @@ export const CommunityDetailView: React.FC<CommunityDetailViewProps> = ({
                 <button
                   type="button"
                   onClick={() => fileInputRef.current?.click()}
-                  className="px-3 py-1.5 rounded-xl bg-[var(--color-bg-main)] border border-[var(--color-border)] text-xs font-semibold text-[var(--color-text-secondary)] hover:text-[var(--color-primary)] flex items-center gap-1.5"
+                  disabled={attachments.length >= 4}
+                  className="min-h-[44px] px-3.5 py-2 rounded-xl bg-[var(--color-bg-main)] border border-[var(--color-border)] text-xs font-semibold text-[var(--color-text-secondary)] hover:text-[var(--color-primary)] disabled:opacity-50 flex items-center gap-1.5"
                 >
                   <ImageIcon className="w-4 h-4 text-emerald-500" />
-                  <span>Photo / Video</span>
+                  <span>Photo / Video ({attachments.length}/4)</span>
                 </button>
                 <button
                   type="submit"
                   disabled={posting || !postText.trim()}
-                  className="px-4 py-2 rounded-xl bg-[var(--color-primary)] text-white text-xs font-bold flex items-center gap-1.5 disabled:opacity-50"
+                  className="min-h-[44px] px-5 py-2 rounded-xl bg-[var(--color-primary)] text-white text-xs font-bold flex items-center gap-1.5 disabled:opacity-50"
                 >
                   {posting ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Send className="w-3.5 h-3.5" />}
                   <span>{posting ? 'Posting...' : 'Post'}</span>

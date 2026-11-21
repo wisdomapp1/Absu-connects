@@ -7,7 +7,14 @@ import {
   batchResolveChatAttachmentSignedUrls,
   deleteChatAttachmentsFromStorage,
 } from './storageService.ts';
-import { uploadMediaToCloudinary } from './cloudinaryService.ts';
+import {
+  uploadMediaToCloudinary,
+  deleteCloudinaryAssets,
+  buildCloudinaryVideoPosterUrl,
+  extractCloudinaryPublicId,
+  type DeleteCloudinaryAssetInput,
+} from './cloudinaryService.ts';
+import { compressImageForUpload } from './mediaCompression.ts';
 import { safeStorage } from '../utils/safeStorage.ts';
 import {
   createOrUpdateConversationNotification,
@@ -216,7 +223,7 @@ async function processMessageRowsWithAttachments(
     const msgTime = new Date(m.created_at).getTime();
     const isSeen = isOutgoing && recipientReadTime > 0 && recipientReadTime >= msgTime;
 
-    const attachments: MessageAttachment[] = (m.message_attachments || []).map((a) => {
+    const attachments: MessageAttachment[] = (m.message_attachments || []).map((a: any) => {
       const signedUrl = signedUrlMap.get(a.asset_id) || a.secure_url;
       return {
         id: a.id,
@@ -228,9 +235,12 @@ async function processMessageRowsWithAttachments(
         kind: (a.kind as 'image' | 'video' | 'audio' | 'pdf' | 'document') || 'document',
         asset_id: a.asset_id,
         secure_url: signedUrl,
-        provider: a.provider || 'supabase',
+        provider: a.provider || (String(signedUrl || '').includes('res.cloudinary.com') ? 'cloudinary' : 'supabase'),
         thumbnail_url: a.thumbnail_url,
         created_at: a.created_at,
+        cloudinary_public_id: a.cloudinary_public_id,
+        cloudinary_resource_type: a.cloudinary_resource_type,
+        duration_seconds: a.duration_seconds,
       };
     });
 
@@ -405,6 +415,7 @@ export async function fetchUserConversations(currentUserId: string): Promise<Con
         .from('messages')
         .select('conversation_id, body, created_at, sender_id')
         .in('conversation_id', validConvIds)
+        .is('deleted_at', null)
         .order('created_at', { ascending: false })
         .limit(validConvIds.length * 2);
 
@@ -518,7 +529,8 @@ export async function fetchConversationMessages(
         *,
         message_attachments(*)
       `)
-      .eq('conversation_id', conversationId);
+      .eq('conversation_id', conversationId)
+      .is('deleted_at', null);
 
     const isDeltaAfter = Boolean(afterTimestamp && !beforeTimestamp);
     if (isDeltaAfter && afterTimestamp) {
@@ -555,9 +567,41 @@ export async function fetchConversationMessages(
   }
 }
 
+async function getDmVideoDurationSeconds(file: File): Promise<number | undefined> {
+  if (typeof document === 'undefined') return undefined;
+  try {
+    return await new Promise<number>((resolve, reject) => {
+      const videoEl = document.createElement('video');
+      videoEl.preload = 'metadata';
+      const tempUrl = URL.createObjectURL(file);
+      videoEl.src = tempUrl;
+      videoEl.onloadedmetadata = () => {
+        URL.revokeObjectURL(tempUrl);
+        resolve(videoEl.duration);
+      };
+      videoEl.onerror = () => {
+        URL.revokeObjectURL(tempUrl);
+        reject(new Error('Failed to read video duration'));
+      };
+    });
+  } catch {
+    return undefined;
+  }
+}
+
+async function cleanupDmRollbackAssets(
+  supabasePaths: string[],
+  cloudinaryAssets: DeleteCloudinaryAssetInput[]
+): Promise<void> {
+  await Promise.all([
+    supabasePaths.length > 0 ? deleteChatAttachmentsFromStorage(supabasePaths) : Promise.resolve(),
+    cloudinaryAssets.length > 0 ? deleteCloudinaryAssets(cloudinaryAssets) : Promise.resolve(),
+  ]);
+}
+
 /**
- * Send a message into a conversation, optionally including file attachments
- * uploaded to the private 'chat-attachments' bucket.
+ * Send a message into a conversation, uploading DM media (images, <=40s videos, voice notes)
+ * to Cloudinary `absu-connect/messages` while routing PDFs/documents to Supabase `chat-attachments`.
  */
 export async function sendRealMessage(params: {
   conversationId: string;
@@ -565,11 +609,17 @@ export async function sendRealMessage(params: {
   text?: string;
   files?: File[];
   senderName?: string;
-}): Promise<{ success: boolean; message?: Message; error?: string }> {
-  const uploadedAssetPaths: string[] = [];
+  onUploadProgress?: (percent: number) => void;
+  signal?: AbortSignal;
+}): Promise<{ success: boolean; message?: Message; error?: string; aborted?: boolean }> {
+  const uploadedSupabasePaths: string[] = [];
+  const uploadedCloudinaryAssets: DeleteCloudinaryAssetInput[] = [];
 
   try {
-    // Unhide conversation if it was hidden for sender
+    if (params.signal?.aborted) {
+      return { success: false, aborted: true, error: 'Message upload cancelled.' };
+    }
+
     unhideConversationForUser(params.senderId, params.conversationId);
 
     const rawFiles = params.files || [];
@@ -580,15 +630,36 @@ export async function sendRealMessage(params: {
       format: string;
       kind: 'image' | 'video' | 'audio' | 'pdf' | 'document';
       secure_url?: string;
+      thumbnail_url?: string;
       provider: string;
+      cloudinary_public_id?: string;
+      cloudinary_resource_type?: 'image' | 'video' | 'raw' | 'auto';
+      duration_seconds?: number;
     }> = [];
 
-    // 1. Upload each attachment to Cloudinary (chat folder) with Supabase fallback
-    for (const f of rawFiles) {
-      const isAudio = f.type.startsWith('audio/') || Boolean(f.name.match(/\.(webm|mp3|m4a|wav|ogg|aac)$/i));
-      const isVideo = !isAudio && (f.type.startsWith('video/') || Boolean(f.name.match(/\.(mp4|webm|mov|m4v)$/i)));
-      const isImage = !isAudio && !isVideo && (f.type.startsWith('image/') || Boolean(f.name.match(/\.(jpg|jpeg|png|webp|avif|gif)$/i)));
-      const isPdf = f.type === 'application/pdf' || f.name.toLowerCase().endsWith('.pdf');
+    for (let i = 0; i < rawFiles.length; i++) {
+      const f = rawFiles[i];
+      if (params.signal?.aborted) {
+        await cleanupDmRollbackAssets(uploadedSupabasePaths, uploadedCloudinaryAssets);
+        return { success: false, aborted: true, error: 'Message upload cancelled.' };
+      }
+
+      const lowerName = f.name.toLowerCase();
+      const isVoiceName =
+        (lowerName.startsWith('voicenote_') || lowerName.startsWith('voice_note_')) &&
+        lowerName.endsWith('.webm');
+      const isAudio =
+        f.type.startsWith('audio/') ||
+        isVoiceName ||
+        Boolean(lowerName.match(/\.(mp3|m4a|wav|ogg|aac)$/i));
+      const isVideo =
+        !isAudio &&
+        (f.type.startsWith('video/') || Boolean(lowerName.match(/\.(mp4|webm|mov|m4v)$/i)));
+      const isImage =
+        !isAudio &&
+        !isVideo &&
+        (f.type.startsWith('image/') || Boolean(lowerName.match(/\.(jpg|jpeg|png|webp|avif|gif)$/i)));
+      const isPdf = f.type === 'application/pdf' || lowerName.endsWith('.pdf');
 
       let kind: 'image' | 'video' | 'audio' | 'pdf' | 'document' = 'document';
       if (isAudio) kind = 'audio';
@@ -596,38 +667,107 @@ export async function sendRealMessage(params: {
       else if (isImage) kind = 'image';
       else if (isPdf) kind = 'pdf';
 
-      // Primary: upload directly to Supabase Storage 'chat-attachments' bucket
-      const upRes = await uploadChatAttachmentToStorage(params.senderId, f);
-      if (upRes.success && upRes.attachment) {
-        uploadedAssetPaths.push(upRes.attachment.asset_id);
-        uploadedAttachments.push({
-          ...upRes.attachment,
-          kind: isAudio ? 'audio' : upRes.attachment.kind,
-        });
-      } else {
-        // Optional fallback to Cloudinary if Supabase Storage is unavailable
-        console.warn('[Chat Storage Fallback Notice]', upRes.error);
-        const cldRes = await uploadMediaToCloudinary(f, 'chat').catch(() => ({
+      if (f.size > 25 * 1024 * 1024) {
+        await cleanupDmRollbackAssets(uploadedSupabasePaths, uploadedCloudinaryAssets);
+        return {
           success: false,
-          error: upRes.error,
-        }));
-        if (cldRes.success && 'secure_url' in cldRes && cldRes.secure_url) {
+          error: `"${f.name}" (${(f.size / (1024 * 1024)).toFixed(1)} MB) exceeds the 25 MB limit.`,
+        };
+      }
+
+      if (kind === 'pdf' || kind === 'document') {
+        const upRes = await uploadChatAttachmentToStorage(params.senderId, f);
+        if (upRes.success && upRes.attachment) {
+          uploadedSupabasePaths.push(upRes.attachment.asset_id);
           uploadedAttachments.push({
-            asset_id: cldRes.public_id || cldRes.asset_id || `chat_${Date.now()}`,
-            file_name: f.name,
-            bytes: cldRes.bytes || f.size,
-            format: cldRes.format || (isAudio ? 'webm' : isVideo ? 'mp4' : 'jpg'),
+            ...upRes.attachment,
             kind,
-            secure_url: cldRes.secure_url,
-            provider: 'cloudinary',
           });
-        } else {
-          if (uploadedAssetPaths.length > 0) {
-            await deleteChatAttachmentsFromStorage(uploadedAssetPaths);
-          }
+          params.onUploadProgress?.(Math.round(((i + 1) / rawFiles.length) * 100));
+          continue;
+        }
+        await cleanupDmRollbackAssets(uploadedSupabasePaths, uploadedCloudinaryAssets);
+        return {
+          success: false,
+          error: upRes.error || `Failed to upload document "${f.name}".`,
+        };
+      }
+
+      let videoDuration: number | undefined;
+      if (isVideo) {
+        videoDuration = await getDmVideoDurationSeconds(f);
+        if (videoDuration && videoDuration > 40) {
+          await cleanupDmRollbackAssets(uploadedSupabasePaths, uploadedCloudinaryAssets);
           return {
             success: false,
-            error: upRes.error || `Failed to upload "${f.name}".`,
+            error: `Video duration (${Math.round(videoDuration)}s) exceeds the 40-second limit for direct messages.`,
+          };
+        }
+      }
+
+      let fileToUpload: File = f;
+      if (isImage) {
+        const comp = await compressImageForUpload(f, 1.5, 1600);
+        fileToUpload = comp.file;
+      }
+
+      const cldRes = await uploadMediaToCloudinary(fileToUpload, 'chat', {
+        signal: params.signal,
+        maxBytes: 25 * 1024 * 1024,
+        onPercent: (pct) => {
+          const overall = Math.round(((i + pct / 100) / rawFiles.length) * 100);
+          params.onUploadProgress?.(overall);
+        },
+      });
+
+      if (cldRes.aborted) {
+        await cleanupDmRollbackAssets(uploadedSupabasePaths, uploadedCloudinaryAssets);
+        return { success: false, aborted: true, error: 'Message upload cancelled.' };
+      }
+
+      if (cldRes.success && cldRes.secure_url) {
+        const publicId =
+          cldRes.public_id || cldRes.asset_id || `absu-connect/messages/dm_${Date.now()}`;
+        const resourceType: 'image' | 'video' =
+          isVideo || isAudio ? 'video' : 'image';
+
+        uploadedCloudinaryAssets.push({
+          public_id: publicId,
+          resource_type: resourceType,
+          entity_type: 'message',
+        });
+
+        uploadedAttachments.push({
+          asset_id: publicId,
+          file_name: f.name,
+          bytes: cldRes.bytes || fileToUpload.size,
+          format: cldRes.format || (isAudio ? 'webm' : isVideo ? 'mp4' : 'jpg'),
+          kind,
+          secure_url: cldRes.secure_url,
+          thumbnail_url: isVideo
+            ? buildCloudinaryVideoPosterUrl(cldRes.secure_url) || undefined
+            : undefined,
+          provider: 'cloudinary',
+          cloudinary_public_id: publicId,
+          cloudinary_resource_type: resourceType,
+          duration_seconds: videoDuration ?? cldRes.duration,
+        });
+      } else {
+        // Fallback to private Supabase chat-attachments if Cloudinary fails transiently
+        console.warn('[Chat Cloudinary Fallback Notice]', cldRes.error);
+        const upRes = await uploadChatAttachmentToStorage(params.senderId, f);
+        if (upRes.success && upRes.attachment) {
+          uploadedSupabasePaths.push(upRes.attachment.asset_id);
+          uploadedAttachments.push({
+            ...upRes.attachment,
+            kind,
+            duration_seconds: videoDuration,
+          });
+        } else {
+          await cleanupDmRollbackAssets(uploadedSupabasePaths, uploadedCloudinaryAssets);
+          return {
+            success: false,
+            error: cldRes.error || upRes.error || `Failed to upload "${f.name}".`,
           };
         }
       }
@@ -636,12 +776,12 @@ export async function sendRealMessage(params: {
     const nowIso = new Date().toISOString();
     let bodyText = (params.text || '').trim();
     if (!bodyText && uploadedAttachments.length > 0) {
-      bodyText = uploadedAttachments.length === 1
-        ? `📎 ${uploadedAttachments[0].file_name}`
-        : `📎 ${uploadedAttachments.length} attachments`;
+      bodyText =
+        uploadedAttachments.length === 1
+          ? `📎 ${uploadedAttachments[0].file_name}`
+          : `📎 ${uploadedAttachments.length} attachments`;
     }
 
-    // 2. Insert message row
     const msgPayload = {
       conversation_id: params.conversationId,
       sender_id: params.senderId,
@@ -657,39 +797,62 @@ export async function sendRealMessage(params: {
 
     if (msgError || !msgData) {
       console.warn('Supabase sendMessage error:', msgError?.message);
-      if (uploadedAssetPaths.length > 0) {
-        await deleteChatAttachmentsFromStorage(uploadedAssetPaths);
-      }
+      await cleanupDmRollbackAssets(uploadedSupabasePaths, uploadedCloudinaryAssets);
       return { success: false, error: msgError?.message || 'Failed to send message.' };
     }
 
-    // 3. Insert message_attachments rows if any
     const createdAttachments: MessageAttachment[] = [];
     if (uploadedAttachments.length > 0) {
-      const attachmentPayloads = uploadedAttachments.map((att) => ({
-        message_id: msgData.id,
-        uploader_id: params.senderId,
-        file_name: att.file_name,
-        bytes: att.bytes,
-        format: att.format,
-        kind: att.kind,
-        asset_id: att.asset_id,
-        secure_url: att.secure_url || null,
-        provider: att.provider || 'cloudinary',
-        created_at: nowIso,
-      }));
+      const buildAttachmentPayloads = (includeExtended: boolean) =>
+        uploadedAttachments.map((att) => {
+          const base: Record<string, any> = {
+            message_id: msgData.id,
+            uploader_id: params.senderId,
+            file_name: att.file_name,
+            bytes: att.bytes,
+            format: att.format,
+            kind: att.kind,
+            asset_id: att.asset_id,
+            secure_url: att.secure_url || null,
+            provider: att.provider || 'cloudinary',
+            thumbnail_url: att.thumbnail_url || null,
+            created_at: nowIso,
+          };
+          if (includeExtended) {
+            base.cloudinary_public_id = att.cloudinary_public_id || null;
+            base.cloudinary_resource_type = att.cloudinary_resource_type || null;
+            base.duration_seconds =
+              typeof att.duration_seconds === 'number' && Number.isFinite(att.duration_seconds)
+                ? att.duration_seconds
+                : null;
+          }
+          return base;
+        });
 
-      const { data: attRows, error: attError } = await supabase
+      let { data: attRows, error: attError } = await supabase
         .from('message_attachments')
-        .insert(attachmentPayloads)
+        .insert(buildAttachmentPayloads(true))
         .select('*');
+
+      if (
+        attError &&
+        (attError.code === '42703' ||
+          attError.code === 'PGRST204' ||
+          attError.message?.toLowerCase().includes('schema cache') ||
+          attError.message?.toLowerCase().includes('column'))
+      ) {
+        const retryRes = await supabase
+          .from('message_attachments')
+          .insert(buildAttachmentPayloads(false))
+          .select('*');
+        attRows = retryRes.data;
+        attError = retryRes.error;
+      }
 
       if (attError) {
         console.error('Supabase message_attachments insert error:', attError.message);
         await supabase.from('messages').delete().eq('id', msgData.id);
-        if (uploadedAssetPaths.length > 0) {
-          await deleteChatAttachmentsFromStorage(uploadedAssetPaths);
-        }
+        await cleanupDmRollbackAssets(uploadedSupabasePaths, uploadedCloudinaryAssets);
         return {
           success: false,
           error: `Failed to attach files (${attError.message}). Please try again.`,
@@ -697,7 +860,7 @@ export async function sendRealMessage(params: {
       }
 
       if (attRows) {
-        for (const row of attRows) {
+        for (const row of attRows as any[]) {
           createdAttachments.push({
             id: row.id,
             message_id: row.message_id,
@@ -711,25 +874,25 @@ export async function sendRealMessage(params: {
             provider: row.provider,
             thumbnail_url: row.thumbnail_url,
             created_at: row.created_at,
+            cloudinary_public_id: row.cloudinary_public_id,
+            cloudinary_resource_type: row.cloudinary_resource_type,
+            duration_seconds: row.duration_seconds,
           });
         }
       }
     }
 
-    // 4. Update conversation last_message_at
     await supabase
       .from('conversations')
       .update({ last_message_at: nowIso })
       .eq('id', params.conversationId);
 
-    // 5. Sender marks their read time
     await supabase
       .from('conversation_members')
       .update({ last_read_at: nowIso })
       .eq('conversation_id', params.conversationId)
       .eq('user_id', params.senderId);
 
-    // 6. WhatsApp-like conversation notification: update or create canonical active notification for recipients
     try {
       const { data: recipientMembers } = await supabase
         .from('conversation_members')
@@ -768,10 +931,96 @@ export async function sendRealMessage(params: {
     return { success: true, message };
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : 'Failed to send message';
-    if (uploadedAssetPaths.length > 0) {
-      await deleteChatAttachmentsFromStorage(uploadedAssetPaths);
-    }
+    await cleanupDmRollbackAssets(uploadedSupabasePaths, uploadedCloudinaryAssets);
     return { success: false, error: msg };
+  }
+}
+
+/**
+ * Delete a sender's own message and clean up associated Cloudinary or Storage attachments.
+ */
+export async function deleteRealMessage(
+  messageId: string,
+  senderId: string
+): Promise<{ success: boolean; error?: string }> {
+  try {
+    let attRows: Array<Record<string, any>> = [];
+    const extSel = await supabase
+      .from('message_attachments')
+      .select('id, asset_id, provider, secure_url, kind, cloudinary_public_id, cloudinary_resource_type')
+      .eq('message_id', messageId);
+
+    if (extSel.error) {
+      const coreSel = await supabase
+        .from('message_attachments')
+        .select('id, asset_id, provider, secure_url, kind')
+        .eq('message_id', messageId);
+      attRows = coreSel.data || [];
+    } else {
+      attRows = extSel.data || [];
+    }
+
+    const cloudinaryAssets: DeleteCloudinaryAssetInput[] = [];
+    const supabasePaths: string[] = [];
+
+    for (const a of attRows) {
+      const isCloudinary =
+        a.provider === 'cloudinary' ||
+        Boolean(a.cloudinary_public_id) ||
+        String(a.secure_url || '').includes('res.cloudinary.com');
+
+      if (isCloudinary) {
+        const publicId =
+          a.cloudinary_public_id ||
+          extractCloudinaryPublicId(a.asset_id) ||
+          extractCloudinaryPublicId(a.secure_url);
+        if (publicId) {
+          cloudinaryAssets.push({
+            public_id: publicId,
+            resource_type:
+              a.cloudinary_resource_type === 'video' || a.kind === 'video' || a.kind === 'audio'
+                ? 'video'
+                : 'image',
+            entity_type: 'message',
+            entity_id: messageId,
+          });
+        }
+      } else if (a.asset_id) {
+        supabasePaths.push(String(a.asset_id));
+      }
+    }
+
+    if (cloudinaryAssets.length > 0) {
+      await deleteCloudinaryAssets(cloudinaryAssets).catch(() => {});
+    }
+
+    // Soft-delete first for consistent inbox consistency; fallback to hard delete
+    const nowIso = new Date().toISOString();
+    const { error: softErr } = await supabase
+      .from('messages')
+      .update({ deleted_at: nowIso, body: '' })
+      .match({ id: messageId, sender_id: senderId });
+
+    if (softErr) {
+      const { error: hardErr } = await supabase
+        .from('messages')
+        .delete()
+        .match({ id: messageId, sender_id: senderId });
+      if (hardErr) {
+        return { success: false, error: hardErr.message };
+      }
+    }
+
+    if (supabasePaths.length > 0) {
+      await deleteChatAttachmentsFromStorage(supabasePaths);
+    }
+
+    return { success: true };
+  } catch (err: unknown) {
+    return {
+      success: false,
+      error: err instanceof Error ? err.message : 'Failed to delete message',
+    };
   }
 }
 
@@ -872,6 +1121,7 @@ export async function getOrCreateDirectConversation(
             .from('messages')
             .select('*, message_attachments(*)')
             .eq('conversation_id', candidateId)
+            .is('deleted_at', null)
             .order('created_at', { ascending: true });
 
           const candidateMsgs = await processMessageRowsWithAttachments(

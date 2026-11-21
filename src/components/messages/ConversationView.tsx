@@ -28,16 +28,25 @@ import {
   Square,
   Music,
   RotateCcw,
+  FileText,
 } from 'lucide-react';
 import { useCall } from '../../context/CallContext.tsx';
 import { VoiceNoteBubble } from './VoiceNoteBubble.tsx';
 import { checkMediaPermission, checkDeviceAvailability } from '../../utils/permissionUtils.ts';
+import {
+  safeReadAndPrepareImage,
+  safeReadAndPrepareVideo,
+  safeReadGenericAttachment,
+  categorizeMediaError,
+  type MediaRecoveryState,
+} from '../../lib/mediaRecovery.ts';
+import { MediaRecoveryBanner } from '../common/MediaRecoveryBanner.tsx';
 
 interface PendingAttachment {
   id: string;
   file: File;
   previewUrl: string;
-  type: 'image' | 'video' | 'audio';
+  type: 'image' | 'video' | 'audio' | 'pdf';
   name: string;
   sizeLabel: string;
   duration?: number;
@@ -65,6 +74,7 @@ export const ConversationView: React.FC = () => {
   const [activeMessageAction, setActiveMessageAction] = useState<string | null>(null);
   const [replyingToMessage, setReplyingToMessage] = useState<Message | null>(null);
   const [hiddenMessageIds, setHiddenMessageIds] = useState<Set<string>>(new Set());
+  const [mediaRecovery, setMediaRecovery] = useState<MediaRecoveryState | null>(null);
 
   // Voice note recording states
   const [isRecordingVoice, setIsRecordingVoice] = useState(false);
@@ -82,8 +92,11 @@ export const ConversationView: React.FC = () => {
     hasMore,
     isPartnerTyping,
     isOffline,
+    uploadProgress,
+    cancelUpload,
     sendMessage: sendChatMessage,
     retryMessage,
+    deleteMessage,
     sendTypingIndicator,
     loadMoreMessages,
   } = useChat(selectedConversation?.id);
@@ -242,77 +255,103 @@ export const ConversationView: React.FC = () => {
   const { participant } = selectedConversation;
   const isOnline = isUserOnline(participant.id);
 
-  // Gallery file select with validation (max 25MB, video <= 40s)
+  // Gallery file select with buffered in-memory read & validation (max 25MB, video <= 40s)
   const handleFileSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = Array.from(e.target.files || []);
+    e.target.value = '';
     if (files.length === 0) return;
 
     const maxBytes = 25 * 1024 * 1024; // 25 MB max
     const newItems: PendingAttachment[] = [];
+    let lastRecovery: MediaRecoveryState | null = null;
 
     for (const file of files) {
-      if (file.size > maxBytes) {
-        addToast(
-          `"${file.name}" (${(file.size / (1024 * 1024)).toFixed(1)} MB) exceeds 25 MB limit.`,
-          'warning'
+      const isPdf = file.type === 'application/pdf' || Boolean(file.name.match(/\.pdf$/i));
+      const isImage = !isPdf && (file.type.startsWith('image/') || Boolean(file.name.match(/\.(jpg|jpeg|png|webp|avif|gif)$/i)));
+      const isVideo = !isPdf && (file.type.startsWith('video/') || Boolean(file.name.match(/\.(mp4|mov|webm|m4v|ogg)$/i)));
+      const isAudio = !isPdf && (file.type.startsWith('audio/') || Boolean(file.name.match(/\.(mp3|m4a|wav|ogg|aac)$/i)));
+
+      if (!isImage && !isVideo && !isAudio && !isPdf) {
+        const rec = categorizeMediaError(
+          new Error(`"${file.name}" is not a supported photo, video, audio, or PDF file.`),
+          { fileName: file.name }
         );
+        lastRecovery = rec;
+        addToast(rec.message, 'warning');
         continue;
       }
 
-      const isImage = file.type.startsWith('image/') || Boolean(file.name.match(/\.(jpg|jpeg|png|webp|avif|gif)$/i));
-      const isVideo = file.type.startsWith('video/') || Boolean(file.name.match(/\.(mp4|mov|webm|m4v)$/i));
-      const isAudio = file.type.startsWith('audio/') || Boolean(file.name.match(/\.(webm|mp3|m4a|wav|ogg|aac)$/i));
-
-      if (!isImage && !isVideo && !isAudio) {
-        addToast(`"${file.name}" is not a photo, video, or audio file.`, 'warning');
+      if (isImage) {
+        if (file.size > maxBytes) {
+          const rec = categorizeMediaError(
+            new Error(`"${file.name}" (${(file.size / (1024 * 1024)).toFixed(1)} MB) exceeds 25 MB limit.`),
+            { fileName: file.name }
+          );
+          lastRecovery = rec;
+          addToast(rec.message, 'warning');
+          continue;
+        }
+        const preparedImg = await safeReadAndPrepareImage(file);
+        if (!preparedImg.ok || !preparedImg.file || !preparedImg.previewUrl) {
+          lastRecovery = preparedImg.recovery || null;
+          if (preparedImg.recovery?.message) addToast(preparedImg.recovery.message, 'warning');
+          continue;
+        }
+        newItems.push({
+          id: `dm_att_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
+          file: preparedImg.file,
+          previewUrl: preparedImg.previewUrl,
+          type: 'image',
+          name: preparedImg.file.name,
+          sizeLabel: `${(preparedImg.file.size / (1024 * 1024)).toFixed(1)} MB`,
+        });
         continue;
       }
 
       if (isVideo) {
-        try {
-          const duration = await new Promise<number>((resolve, reject) => {
-            const videoEl = document.createElement('video');
-            videoEl.preload = 'metadata';
-            const tempUrl = URL.createObjectURL(file);
-            videoEl.src = tempUrl;
-            videoEl.onloadedmetadata = () => {
-              URL.revokeObjectURL(tempUrl);
-              resolve(videoEl.duration);
-            };
-            videoEl.onerror = () => {
-              URL.revokeObjectURL(tempUrl);
-              reject(new Error('Failed to load video metadata'));
-            };
-          });
-
-          if (duration > 40) {
-            addToast(
-              `Video duration (${Math.round(duration)}s) exceeds 40-second limit for direct messages.`,
-              'warning'
-            );
-            continue;
-          }
-        } catch {
-          console.warn('[ConversationView] Could not inspect video duration, continuing');
+        const preparedVid = await safeReadAndPrepareVideo(file, {
+          maxBytes,
+          maxDurationSeconds: 40,
+        });
+        if (!preparedVid.ok || !preparedVid.file || !preparedVid.previewUrl) {
+          lastRecovery = preparedVid.recovery || null;
+          if (preparedVid.recovery?.message) addToast(preparedVid.recovery.message, 'warning');
+          continue;
         }
+        newItems.push({
+          id: `dm_att_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
+          file: preparedVid.file,
+          previewUrl: preparedVid.previewUrl,
+          type: 'video',
+          name: preparedVid.file.name,
+          sizeLabel: `${(preparedVid.file.size / (1024 * 1024)).toFixed(1)} MB`,
+          duration: preparedVid.duration,
+        });
+        continue;
       }
 
-      const objUrl = URL.createObjectURL(file);
+      const preparedGeneric = await safeReadGenericAttachment(file, { maxBytes });
+      if (!preparedGeneric.ok || !preparedGeneric.file || !preparedGeneric.previewUrl) {
+        lastRecovery = preparedGeneric.recovery || null;
+        if (preparedGeneric.recovery?.message) addToast(preparedGeneric.recovery.message, 'warning');
+        continue;
+      }
       newItems.push({
         id: `dm_att_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
-        file,
-        previewUrl: objUrl,
-        type: isAudio ? 'audio' : isVideo ? 'video' : 'image',
-        name: file.name,
-        sizeLabel: `${(file.size / (1024 * 1024)).toFixed(1)} MB`,
+        file: preparedGeneric.file,
+        previewUrl: preparedGeneric.previewUrl,
+        type: isPdf ? 'pdf' : 'audio',
+        name: preparedGeneric.file.name,
+        sizeLabel: `${(preparedGeneric.file.size / (1024 * 1024)).toFixed(1)} MB`,
       });
     }
 
     if (newItems.length > 0) {
+      setMediaRecovery(null);
       setPendingAttachments((prev) => [...prev, ...newItems]);
+    } else if (lastRecovery) {
+      setMediaRecovery(lastRecovery);
     }
-
-    e.target.value = '';
   };
 
   const removePendingAttachment = (id: string) => {
@@ -483,6 +522,16 @@ export const ConversationView: React.FC = () => {
     setActiveMessageAction(null);
   };
 
+  const handleDeleteMessageForEveryone = async (msgId: string) => {
+    setActiveMessageAction(null);
+    const ok = await deleteMessage(msgId);
+    if (ok) {
+      addToast('Message deleted for everyone', 'info');
+    } else {
+      addToast('Could not delete message from server.', 'warning');
+    }
+  };
+
   // Render WhatsApp status tick marks
   const renderMessageStatus = (msg: Message) => {
     if (!msg.isOutgoing) return null;
@@ -535,12 +584,12 @@ export const ConversationView: React.FC = () => {
 
   return (
     <div className="flex flex-col h-full min-h-0 max-w-4xl mx-auto w-full bg-[var(--color-bg-card)] sm:border sm:border-[var(--color-border)] sm:rounded-2xl shadow-sm overflow-hidden transition-colors relative">
-      {/* Hidden native image/video gallery picker */}
+      {/* Hidden native image/video/audio/PDF picker */}
       <input
         ref={fileInputRef}
         type="file"
         multiple
-        accept="image/*,video/*"
+        accept="image/*,video/*,audio/*,application/pdf"
         onChange={handleFileSelect}
         className="hidden"
         aria-hidden="true"
@@ -733,13 +782,14 @@ export const ConversationView: React.FC = () => {
                             <div className="relative rounded-xl overflow-hidden bg-black flex items-center justify-center">
                               <video
                                 src={att.secure_url}
+                                poster={att.thumbnail_url || undefined}
                                 controls
                                 playsInline
                                 preload="metadata"
                                 className="w-full max-h-64 object-contain rounded-xl"
                               />
                             </div>
-                          ) : att.kind === 'audio' || Boolean(att.file_name?.match(/\.(webm|mp3|m4a|wav|ogg|aac)$/i)) ? (
+                          ) : att.kind === 'audio' || Boolean(att.file_name?.match(/\.(mp3|m4a|wav|ogg|aac)$/i)) || Boolean(att.file_name?.match(/^voice_?note_/i)) ? (
                             <VoiceNoteBubble
                               src={att.secure_url}
                               fileName={att.file_name}
@@ -748,7 +798,26 @@ export const ConversationView: React.FC = () => {
                               isSeen={msg.isSeen}
                               onRetry={() => retryMessage(msg.id)}
                             />
-                          ) : null}
+                          ) : (
+                            <a
+                              href={att.secure_url || '#'}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className={`flex items-center gap-2.5 p-2.5 rounded-xl border transition-colors ${
+                                msg.isOutgoing
+                                  ? 'bg-white/15 border-white/25 text-white hover:bg-white/25'
+                                  : 'bg-[var(--color-bg-main)] border-[var(--color-border)] text-[var(--color-text-primary)] hover:border-[var(--color-primary)]'
+                              }`}
+                            >
+                              <FileText className="w-5 h-5 shrink-0" />
+                              <div className="min-w-0">
+                                <p className="text-xs font-bold truncate">{att.file_name}</p>
+                                <p className="text-[10px] opacity-75">
+                                  {(att.bytes / (1024 * 1024)).toFixed(2)} MB · Document
+                                </p>
+                              </div>
+                            </a>
+                          )}
                         </div>
                       ))}
                     </div>
@@ -788,7 +857,7 @@ export const ConversationView: React.FC = () => {
                 {/* Message Context Menu */}
                 {isActionMenuOpen && (
                   <div
-                    className={`absolute z-30 top-full mt-1 bg-[var(--color-bg-card)] border border-[var(--color-border)] shadow-xl rounded-2xl p-1.5 min-w-[140px] animate-in fade-in zoom-in-95 ${
+                    className={`absolute z-30 top-full mt-1 bg-[var(--color-bg-card)] border border-[var(--color-border)] shadow-xl rounded-2xl p-1.5 min-w-[165px] animate-in fade-in zoom-in-95 ${
                       msg.isOutgoing ? 'right-0' : 'left-0'
                     }`}
                   >
@@ -799,7 +868,7 @@ export const ConversationView: React.FC = () => {
                         setActiveMessageAction(null);
                         inputRef.current?.focus();
                       }}
-                      className="w-full flex items-center gap-2 px-2.5 py-1.5 text-xs text-[var(--color-text-primary)] hover:bg-[var(--color-primary-subtle)] rounded-xl transition-colors"
+                      className="w-full min-h-[38px] flex items-center gap-2 px-2.5 py-1.5 text-xs text-[var(--color-text-primary)] hover:bg-[var(--color-primary-subtle)] rounded-xl transition-colors"
                     >
                       <Reply className="w-3.5 h-3.5 text-[var(--color-primary)]" />
                       <span>Reply</span>
@@ -808,16 +877,26 @@ export const ConversationView: React.FC = () => {
                       <button
                         type="button"
                         onClick={() => handleCopyText(msg.text)}
-                        className="w-full flex items-center gap-2 px-2.5 py-1.5 text-xs text-[var(--color-text-primary)] hover:bg-[var(--color-primary-subtle)] rounded-xl transition-colors"
+                        className="w-full min-h-[38px] flex items-center gap-2 px-2.5 py-1.5 text-xs text-[var(--color-text-primary)] hover:bg-[var(--color-primary-subtle)] rounded-xl transition-colors"
                       >
                         <Copy className="w-3.5 h-3.5 text-[var(--color-text-secondary)]" />
                         <span>Copy text</span>
                       </button>
                     )}
+                    {msg.isOutgoing && !msg.id.startsWith('temp_') && (
+                      <button
+                        type="button"
+                        onClick={() => handleDeleteMessageForEveryone(msg.id)}
+                        className="w-full min-h-[38px] flex items-center gap-2 px-2.5 py-1.5 text-xs text-rose-500 hover:bg-rose-500/10 rounded-xl transition-colors"
+                      >
+                        <Trash2 className="w-3.5 h-3.5 text-rose-500" />
+                        <span>Delete for everyone</span>
+                      </button>
+                    )}
                     <button
                       type="button"
                       onClick={() => handleDeleteMessageForMe(msg.id)}
-                      className="w-full flex items-center gap-2 px-2.5 py-1.5 text-xs text-rose-500 hover:bg-rose-500/10 rounded-xl transition-colors"
+                      className="w-full min-h-[38px] flex items-center gap-2 px-2.5 py-1.5 text-xs text-rose-500 hover:bg-rose-500/10 rounded-xl transition-colors"
                     >
                       <Trash2 className="w-3.5 h-3.5 text-rose-500" />
                       <span>Delete for me</span>
@@ -901,6 +980,10 @@ export const ConversationView: React.FC = () => {
                   <div className="w-10 h-10 rounded-lg bg-black flex items-center justify-center shrink-0">
                     <Film className="w-4 h-4 text-violet-400" />
                   </div>
+                ) : item.type === 'pdf' ? (
+                  <div className="w-10 h-10 rounded-lg bg-amber-500/15 text-amber-500 flex items-center justify-center shrink-0">
+                    <FileText className="w-4 h-4" />
+                  </div>
                 ) : (
                   <div className="w-10 h-10 rounded-lg bg-violet-600/20 text-violet-400 flex items-center justify-center shrink-0">
                     <Music className="w-4 h-4" />
@@ -927,6 +1010,31 @@ export const ConversationView: React.FC = () => {
               </div>
             ))}
           </div>
+        </div>
+      )}
+
+      {/* Active DM Media Upload Progress Bar */}
+      {uploadProgress !== null && (
+        <div className="px-3.5 py-2 border-t border-[var(--color-border)] bg-[var(--color-bg-card)] flex items-center justify-between gap-3">
+          <div className="flex-1 min-w-0 space-y-1">
+            <div className="flex items-center justify-between text-[11px] font-semibold text-[var(--color-text-secondary)]">
+              <span>Uploading attachment to Cloudinary...</span>
+              <span className="font-mono text-[var(--color-primary)]">{Math.round(uploadProgress)}%</span>
+            </div>
+            <div className="w-full h-1.5 rounded-full bg-[var(--color-bg-main)] overflow-hidden">
+              <div
+                className="h-full bg-[var(--color-primary)] transition-all duration-200 rounded-full"
+                style={{ width: `${Math.min(100, Math.max(4, uploadProgress))}%` }}
+              />
+            </div>
+          </div>
+          <button
+            type="button"
+            onClick={cancelUpload}
+            className="min-h-[36px] px-3 rounded-lg text-[11px] font-bold text-rose-500 hover:bg-rose-500/10 border border-rose-500/30 shrink-0"
+          >
+            Cancel
+          </button>
         </div>
       )}
 
@@ -958,6 +1066,17 @@ export const ConversationView: React.FC = () => {
               </button>
             ))}
           </div>
+        </div>
+      )}
+
+      {/* Media Selection / Upload Recovery Banner */}
+      {mediaRecovery && (
+        <div className="px-3.5 py-2 border-t border-[var(--color-border)] bg-[var(--color-bg-card)] shrink-0">
+          <MediaRecoveryBanner
+            recovery={mediaRecovery}
+            onChooseAgain={() => fileInputRef.current?.click()}
+            onDismiss={() => setMediaRecovery(null)}
+          />
         </div>
       )}
 

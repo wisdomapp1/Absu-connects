@@ -38,6 +38,16 @@ export interface Comment {
 export type PostCategory = 'General' | 'Campus Update' | 'Academic' | 'Hostel Life' | 'Event';
 export type PostAudience = 'Public' | 'Friends Only' | 'Campus Only';
 
+export interface VideoEditSettings {
+  startTime: number;
+  endTime: number;
+  duration: number;
+  isMuted: boolean;
+  aspectRatio: '16:9' | '1:1' | '9:16' | 'original';
+  caption?: string;
+  posterDataUrl?: string;
+}
+
 export interface PostMediaItem {
   id?: string;
   secure_url: string;
@@ -49,6 +59,14 @@ export interface PostMediaItem {
   kind: 'image' | 'video';
   provider?: string;
   position?: number;
+  cloudinary_public_id?: string;
+  cloudinary_resource_type?: 'image' | 'video' | 'raw' | 'auto';
+  duration_seconds?: number;
+  thumbnail_url?: string;
+  trim_start?: number;
+  trim_end?: number;
+  is_muted?: boolean;
+  aspect_ratio?: '16:9' | '1:1' | '9:16' | 'original';
 }
 
 export interface AttachedMediaItem {
@@ -61,6 +79,7 @@ export interface AttachedMediaItem {
   sizeLabel?: string;
   duration?: number;
   isPreset?: boolean;
+  videoSettings?: VideoEditSettings;
 }
 
 export interface Post {
@@ -109,6 +128,9 @@ export interface MessageAttachment {
   provider: string;
   thumbnail_url?: string;
   created_at: string;
+  cloudinary_public_id?: string;
+  cloudinary_resource_type?: 'image' | 'video' | 'raw' | 'auto';
+  duration_seconds?: number;
 }
 
 export interface Message {
@@ -170,12 +192,13 @@ export interface NotificationItem {
   targetPostId?: string;
   targetCommentId?: string;
   targetParentCommentId?: string;
+  targetIsVideo?: boolean;
   conversationId?: string;
 }
 
 export type FeedFilter = 'for-you' | 'friends' | 'campus' | 'communities' | 'events';
 export type FriendTab = 'discover' | 'requests' | 'sent' | 'friends';
-export type MainNavTab = 'home' | 'friends' | 'messages' | 'alerts' | 'more';
+export type MainNavTab = 'home' | 'reels' | 'friends' | 'messages' | 'alerts' | 'more';
 export type ActiveView =
   | MainNavTab
   | 'profile'

@@ -2275,8 +2275,8 @@ app.post('/api/notifications/send-test', async (req, res) => {
     const title = '🎉 ABSU Connect Notification Test';
     const body = `Notifications are fully active for ${userName || 'your account'}! You will receive campus alerts, friend requests, and direct messages.`;
 
-    // Insert database notification
-    await client.from('notifications').insert({
+    // Insert database notification (with minimal column fallback if entity_type/entity_id not migrated)
+    let { error: notifErr } = await client.from('notifications').insert({
       recipient_id: userId,
       actor_id: userId,
       type: 'announcement',
@@ -2286,14 +2286,23 @@ app.post('/api/notifications/send-test', async (req, res) => {
       created_at: nowIso,
     });
 
+    if (notifErr) {
+      console.warn('[Notifications] send-test DB insert note:', notifErr.message);
+    }
+
     // Send real Web Push
     const sentCount = await sendPushToRecipient(userId, title, body, '/?view=alerts', 'test');
 
     res.json({
       success: true,
-      message: 'Test notification sent successfully!',
+      message: sentCount > 0
+        ? 'Test notification and Web Push delivered!'
+        : notifErr
+        ? 'Test push check completed (Alerts inbox sync requires active session/service role).'
+        : 'Test notification sent to your Alerts inbox!',
       pushDelivered: sentCount > 0,
       sentCount,
+      dbInserted: !notifErr,
     });
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : 'Error sending test notification';
@@ -2313,7 +2322,7 @@ app.post('/api/notifications/create-test', async (req, res) => {
     const client = getAdminSupabase(req);
     const nowIso = new Date().toISOString();
 
-    const { data: notif, error: notifErr } = await client
+    let { data: notif, error: notifErr } = await client
       .from('notifications')
       .insert({
         recipient_id: userId,
@@ -2328,6 +2337,24 @@ app.post('/api/notifications/create-test', async (req, res) => {
       })
       .select('*')
       .single();
+
+    if (notifErr && (notifErr.code === '42703' || notifErr.code === 'PGRST204' || notifErr.message?.toLowerCase().includes('column'))) {
+      const retry = await client
+        .from('notifications')
+        .insert({
+          recipient_id: userId,
+          actor_id: userId,
+          type: 'announcement',
+          title: '🎉 ABSU Connect Notification Test',
+          body: 'FCM push notifications are successfully configured for your device!',
+          read_at: null,
+          created_at: nowIso,
+        })
+        .select('*')
+        .single();
+      notif = retry.data;
+      notifErr = retry.error;
+    }
 
     if (notifErr) {
       res.status(500).json({ success: false, error: notifErr.message });
@@ -4469,6 +4496,162 @@ app.get('/api/posts/saved', async (req, res) => {
     });
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : 'Failed to load saved posts';
+    res.status(500).json({ success: false, error: msg });
+  }
+});
+
+function isServerVideoMediaItem(m: any): boolean {
+  if (!m) return false;
+  if (String(m.kind || '').toLowerCase() === 'video') return true;
+  const fmt = String(m.format || '').toLowerCase();
+  const url = String(m.secure_url || '').toLowerCase();
+  return (
+    fmt === 'mp4' ||
+    fmt === 'webm' ||
+    fmt === 'mov' ||
+    fmt === 'm4v' ||
+    fmt === 'ogg' ||
+    url.includes('/video/') ||
+    Boolean(url.match(/\.(mp4|webm|mov|ogg|m4v)(\?.*)?$/i))
+  );
+}
+
+function hasServerVideoMedia(row: any): boolean {
+  return Array.isArray(row?.post_media) && row.post_media.some(isServerVideoMediaItem);
+}
+
+app.get('/api/posts/reels', async (req, res) => {
+  try {
+    const sb = supabaseAdmin || getAdminSupabase(req);
+    const viewer = await resolveOptionalAuthUser(req);
+    const viewerId = viewer?.id || null;
+
+    const requestedLimit = Math.min(Math.max(Number(req.query.limit) || 12, 1), 50);
+    let beforeCursor = typeof req.query.before === 'string' && req.query.before.trim()
+      ? req.query.before.trim()
+      : null;
+
+    const social = await getViewerSocialContext(sb, viewerId);
+    const store = readStore();
+    const moderatedPosts = store.moderatedPosts || {};
+
+    const collectedReels: any[] = [];
+    const seenIds = new Set<string>();
+    const windowSize = 120;
+    let reachedEndOfTable = false;
+    let lastProcessedCursor: string | null = null;
+
+    for (let pageStep = 0; pageStep < 5; pageStep++) {
+      const queryResult = await queryPostsResilient(sb, (q) => {
+        let next = q.order('created_at', { ascending: false });
+        if (beforeCursor) {
+          next = next.lt('created_at', beforeCursor);
+        }
+        return next.limit(windowSize);
+      });
+
+      if (queryResult.error) {
+        res.status(500).json({ success: false, error: queryResult.error });
+        return;
+      }
+
+      const scannedRows = queryResult.rows;
+      if (scannedRows.length === 0) {
+        reachedEndOfTable = true;
+        break;
+      }
+
+      for (const row of scannedRows) {
+        lastProcessedCursor = row.created_at || lastProcessedCursor;
+        if (seenIds.has(row.id)) continue;
+        seenIds.add(row.id);
+
+        if (hasServerVideoMedia(row) && isPostVisibleToViewer(row, viewerId, social, moderatedPosts)) {
+          collectedReels.push(row);
+          if (collectedReels.length >= requestedLimit) break;
+        }
+      }
+
+      if (collectedReels.length >= requestedLimit) {
+        break;
+      }
+      if (scannedRows.length < windowSize) {
+        reachedEndOfTable = true;
+        break;
+      }
+      beforeCursor = scannedRows[scannedRows.length - 1]?.created_at || null;
+      if (!beforeCursor) {
+        reachedEndOfTable = true;
+        break;
+      }
+    }
+
+    await resolveServerPostMediaSignedUrls(sb, collectedReels);
+
+    const hasMore = !reachedEndOfTable && Boolean(lastProcessedCursor);
+    res.json({
+      success: true,
+      posts: collectedReels,
+      savedPostIds: Array.from(social.savedPostIds),
+      friendIds: Array.from(social.friendIds),
+      hasMore,
+      nextCursor: hasMore ? lastProcessedCursor : null,
+    });
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : 'Failed to load video reels';
+    res.status(500).json({ success: false, error: msg });
+  }
+});
+
+app.get('/api/posts/reels/search', async (req, res) => {
+  try {
+    const sb = supabaseAdmin || getAdminSupabase(req);
+    const viewer = await resolveOptionalAuthUser(req);
+    const viewerId = viewer?.id || null;
+    const rawQuery = typeof req.query.q === 'string' ? req.query.q.trim() : '';
+    const requestedLimit = Math.min(Math.max(Number(req.query.limit) || 24, 1), 60);
+
+    const [social, queryResult] = await Promise.all([
+      getViewerSocialContext(sb, viewerId),
+      queryPostsResilient(sb, (q) => q.order('created_at', { ascending: false }).limit(250)),
+    ]);
+
+    if (queryResult.error) {
+      res.status(500).json({ success: false, error: queryResult.error });
+      return;
+    }
+
+    const store = readStore();
+    const moderatedPosts = store.moderatedPosts || {};
+    const lowerQ = rawQuery.toLowerCase();
+    const noHashQ = lowerQ.replace(/^#+/, '');
+
+    const matchingReels = queryResult.rows.filter((row) => {
+      if (!hasServerVideoMedia(row)) return false;
+      if (!isPostVisibleToViewer(row, viewerId, social, moderatedPosts)) return false;
+      if (!lowerQ) return true;
+
+      const body = String(row.body || '').toLowerCase();
+      const authorName = String(row.author?.display_name || row.page?.name || '').toLowerCase();
+      const username = String(row.author?.username || row.page?.slug || '').toLowerCase();
+      const dept = String(row.author?.department || '').toLowerCase();
+
+      return (
+        body.includes(lowerQ) ||
+        (noHashQ && (body.includes(noHashQ) || authorName.includes(noHashQ) || username.includes(noHashQ) || dept.includes(noHashQ)))
+      );
+    }).slice(0, requestedLimit);
+
+    await resolveServerPostMediaSignedUrls(sb, matchingReels);
+
+    res.json({
+      success: true,
+      posts: matchingReels,
+      savedPostIds: Array.from(social.savedPostIds),
+      friendIds: Array.from(social.friendIds),
+    });
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : 'Failed to search reels';
     res.status(500).json({ success: false, error: msg });
   }
 });

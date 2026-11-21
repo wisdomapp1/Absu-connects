@@ -30,6 +30,12 @@ export interface Story {
   user_id: string;
   media_type: StoryMediaType;
   storage_path?: string | null;
+  media_url?: string | null;
+  provider?: string | null;
+  cloudinary_public_id?: string | null;
+  cloudinary_resource_type?: 'image' | 'video' | null;
+  duration_seconds?: number | null;
+  thumbnail_url?: string | null;
   text_content?: string | null;
   caption?: string | null;
   background_color?: string | null;
