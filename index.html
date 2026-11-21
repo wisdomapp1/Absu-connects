@@ -27,6 +27,8 @@
     <script type="module" src="/src/main.tsx"></script>
     <script>
       (function() {
+        var cap = window.Capacitor;
+        if (cap && typeof cap.isNativePlatform === 'function' && cap.isNativePlatform()) return;
         if (!('serviceWorker' in navigator)) return;
         window.addEventListener('load', function() {
           try {

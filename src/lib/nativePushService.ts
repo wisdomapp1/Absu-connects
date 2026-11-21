@@ -9,6 +9,8 @@
  * ("send-android-push").
  */
 
+import { Capacitor } from '@capacitor/core';
+import { PushNotifications } from '@capacitor/push-notifications';
 import { supabase, supabaseAnonKey } from './supabase.ts';
 import { safeStorage } from '../utils/safeStorage.ts';
 
@@ -197,9 +199,12 @@ async function upsertDevicePushToken(
  */
 export function isNativeAndroidApp(): boolean {
   if (typeof window === 'undefined') return false;
-  const cap = (window as any).Capacitor;
-  if (!cap) return false;
   try {
+    if (Capacitor.isNativePlatform() || Capacitor.getPlatform() === 'android') {
+      return true;
+    }
+    const cap = (window as any).Capacitor;
+    if (!cap) return false;
     const isNative = typeof cap.isNativePlatform === 'function' ? cap.isNativePlatform() : false;
     const platform = typeof cap.getPlatform === 'function' ? cap.getPlatform() : '';
     return isNative || platform === 'android';
@@ -211,10 +216,18 @@ export function isNativeAndroidApp(): boolean {
 /**
  * Safely access the Capacitor PushNotifications plugin if available.
  */
-function getCapacitorPushPlugin(): any | null {
+function getCapacitorPushPlugin(): typeof PushNotifications | null {
   if (typeof window === 'undefined') return null;
-  const cap = (window as any).Capacitor;
-  return cap?.Plugins?.PushNotifications || null;
+  if (!isNativeAndroidApp()) return null;
+  try {
+    if (Capacitor.isPluginAvailable('PushNotifications')) {
+      return PushNotifications;
+    }
+    const cap = (window as any).Capacitor;
+    return cap?.Plugins?.PushNotifications || PushNotifications;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -235,7 +248,6 @@ export async function setupAndroidNotificationChannel(): Promise<boolean> {
       description: 'Campus direct messages, friend requests, alerts and updates',
       importance: 5, // High: Heads-up pop-up alert
       visibility: 1, // Public: Visible on lockscreen
-      sound: 'notification.wav',
       vibration: true,
       lights: true,
       lightColor: '#7c3aed', // ABSU purple brand color
@@ -334,7 +346,9 @@ export async function initNativePush(userId: string): Promise<boolean> {
         console.log('[Native Push] Notification action performed:', action?.notification?.title);
         const targetUrl = resolvePushDataTargetUrl(action?.notification?.data);
         if (typeof window !== 'undefined' && targetUrl) {
-          window.location.href = targetUrl;
+          window.dispatchEvent(
+            new CustomEvent('absu:notification-navigate', { detail: { url: targetUrl } })
+          );
         }
       });
     }

@@ -1,4 +1,6 @@
 import React, { createContext, useContext, useState, useEffect, useCallback, useRef } from 'react';
+import { Capacitor } from '@capacitor/core';
+import { App as CapacitorApp } from '@capacitor/app';
 import type {
   User,
   Post,
@@ -832,11 +834,13 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
     window.addEventListener('popstate', handlePopState);
 
-    // Capacitor Native Android Hardware Back Button Integration
-    const cap = (window as any).Capacitor;
-    let capListenerHandle: any = null;
-    if (cap?.Plugins?.App?.addListener) {
-      capListenerHandle = cap.Plugins.App.addListener('backButton', () => {
+    // Capacitor Native Android Hardware Back Button & App URL Deep-Link Integration
+    let capBackHandle: { remove: () => Promise<void> } | null = null;
+    let capUrlHandle: { remove: () => Promise<void> } | null = null;
+    let cancelled = false;
+
+    if (Capacitor.isNativePlatform()) {
+      CapacitorApp.addListener('backButton', () => {
         // 1. Overlay check
         if (imageLightboxUrlRef.current) {
           setImageLightboxUrlState(null);
@@ -869,19 +873,43 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         // 3. Home exit confirmation
         const now = Date.now();
         if (now - lastBackPressRef.current < 2000) {
-          cap.Plugins.App.exitApp();
+          CapacitorApp.exitApp().catch(() => {});
         } else {
           lastBackPressRef.current = now;
           addToast('Press back again to exit ABSU Connect', 'info');
         }
-      });
+      })
+        .then((handle) => {
+          if (cancelled) {
+            handle.remove().catch(() => {});
+          } else {
+            capBackHandle = handle;
+          }
+        })
+        .catch(() => {});
+
+      CapacitorApp.addListener('appUrlOpen', (event) => {
+        if (event?.url) {
+          window.dispatchEvent(
+            new CustomEvent('absu:notification-navigate', { detail: { url: event.url } })
+          );
+        }
+      })
+        .then((handle) => {
+          if (cancelled) {
+            handle.remove().catch(() => {});
+          } else {
+            capUrlHandle = handle;
+          }
+        })
+        .catch(() => {});
     }
 
     return () => {
+      cancelled = true;
       window.removeEventListener('popstate', handlePopState);
-      if (capListenerHandle?.then) {
-        capListenerHandle.then((h: any) => h?.remove?.()).catch(() => {});
-      }
+      capBackHandle?.remove().catch(() => {});
+      capUrlHandle?.remove().catch(() => {});
     };
   }, [goBack]);
 
@@ -985,15 +1013,13 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     };
   }, [authUserId, auth.loading]);
 
-  // Listen for Service Worker push notification click navigation messages when app is already open
+  // Listen for Service Worker & native Capacitor push notification click navigation messages when app is already open
   useEffect(() => {
-    if (typeof navigator === 'undefined' || !('serviceWorker' in navigator)) return;
+    if (typeof window === 'undefined') return;
 
-    const handleSwMessage = (event: MessageEvent) => {
-      const msg = event.data;
-      if (!msg || msg.type !== 'ABSU_NOTIFICATION_NAVIGATE' || typeof msg.url !== 'string') return;
+    const navigateFromTargetUrl = (targetUrl: string) => {
       try {
-        const parsed = new URL(msg.url, window.location.origin);
+        const parsed = new URL(targetUrl, window.location.origin);
         const view = (parsed.searchParams.get('view') as ActiveView) || 'alerts';
         navigateToRef.current(view, {
           userId: parsed.searchParams.get('userId') || undefined,
@@ -1008,13 +1034,33 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
             Boolean(parsed.searchParams.get('commentId')),
         });
       } catch {
-        window.location.href = msg.url;
+        window.location.href = targetUrl;
       }
     };
 
-    navigator.serviceWorker.addEventListener('message', handleSwMessage);
+    const handleSwMessage = (event: MessageEvent) => {
+      const msg = event.data;
+      if (!msg || msg.type !== 'ABSU_NOTIFICATION_NAVIGATE' || typeof msg.url !== 'string') return;
+      navigateFromTargetUrl(msg.url);
+    };
+
+    const handleCustomNavigate = (event: Event) => {
+      const url = (event as CustomEvent<{ url?: string }>)?.detail?.url;
+      if (typeof url === 'string' && url.length > 0) {
+        navigateFromTargetUrl(url);
+      }
+    };
+
+    window.addEventListener('absu:notification-navigate', handleCustomNavigate);
+    const hasSw = typeof navigator !== 'undefined' && 'serviceWorker' in navigator;
+    if (hasSw) {
+      navigator.serviceWorker.addEventListener('message', handleSwMessage);
+    }
     return () => {
-      navigator.serviceWorker.removeEventListener('message', handleSwMessage);
+      window.removeEventListener('absu:notification-navigate', handleCustomNavigate);
+      if (hasSw) {
+        navigator.serviceWorker.removeEventListener('message', handleSwMessage);
+      }
     };
   }, []);
 
