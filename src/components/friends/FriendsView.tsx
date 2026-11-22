@@ -1,10 +1,10 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { useApp } from '../../context/AppContext.tsx';
 import { useAuth } from '../../context/AuthContext.tsx';
 import type { FriendTab, User } from '../../types/index.ts';
 import { Avatar } from '../common/Avatar.tsx';
 import { fetchMrAnonymousPage, toggleFollowPage, MR_ANONYMOUS_PAGE_ID } from '../../lib/pageService.ts';
-import { EXCLUDED_STUDENT_IDS } from '../../lib/profileService.ts';
+import { EXCLUDED_STUDENT_IDS, fetchDiscoverProfilesPage } from '../../lib/profileService.ts';
 import type { Page } from '../../types/pages.ts';
 import {
   Users,
@@ -19,6 +19,7 @@ import {
   ArrowLeft,
   ShieldCheck,
   Plus,
+  Loader2,
 } from 'lucide-react';
 
 export const FriendsView: React.FC = () => {
@@ -26,11 +27,17 @@ export const FriendsView: React.FC = () => {
     users,
     friends,
     discoverUsers: contextDiscoverUsers,
+    discoverHasMore,
+    loadingMoreDiscover,
+    discoverTotalCount,
+    loadMoreDiscoverUsers,
+    blockedUserIds,
     currentUser,
     friendRequests,
     friendTab,
     setFriendTab,
     sendFriendRequest,
+    cancelFriendRequest,
     acceptFriendRequest,
     declineFriendRequest,
     removeFriend,
@@ -46,6 +53,13 @@ export const FriendsView: React.FC = () => {
   const [discoverySearch, setDiscoverySearch] = useState('');
   const [showSearchInput, setShowSearchInput] = useState(false);
   const [dismissedUserIds, setDismissedUserIds] = useState<string[]>([]);
+
+  // Live server-backed search results beyond the initially loaded pages
+  const [serverSearchResults, setServerSearchResults] = useState<User[]>([]);
+  const [searchingServer, setSearchingServer] = useState(false);
+  const [searchHasMore, setSearchHasMore] = useState(false);
+  const [searchNextOffset, setSearchNextOffset] = useState<number | null>(null);
+  const loadMoreSentinelRef = useRef<HTMLDivElement>(null);
 
   // Mr Anonymous page data
   const [anonPage, setAnonPage] = useState<Page | null>(null);
@@ -88,28 +102,150 @@ export const FriendsView: React.FC = () => {
     setDismissedUserIds((prev) => [...prev, userId]);
   };
 
+  // Debounced live server search across ALL registered users
+  useEffect(() => {
+    const trimmed = discoverySearch.trim();
+    if (!trimmed) {
+      setServerSearchResults([]);
+      setSearchingServer(false);
+      setSearchHasMore(false);
+      setSearchNextOffset(null);
+      return;
+    }
+
+    let cancelled = false;
+    setSearchingServer(true);
+    const timer = setTimeout(async () => {
+      try {
+        const page = await fetchDiscoverProfilesPage({
+          currentUserId,
+          offset: 0,
+          limit: 40,
+          search: trimmed,
+          excludeIds: Array.from(blockedUserIds),
+        });
+        if (!cancelled) {
+          setServerSearchResults(page.users);
+          setSearchHasMore(page.hasMore);
+          setSearchNextOffset(page.nextOffset);
+        }
+      } finally {
+        if (!cancelled) setSearchingServer(false);
+      }
+    }, 260);
+
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [discoverySearch, currentUserId, blockedUserIds]);
+
+  const handleLoadMoreSearch = async () => {
+    const trimmed = discoverySearch.trim();
+    if (!trimmed || searchingServer || !searchHasMore || searchNextOffset === null) return;
+    setSearchingServer(true);
+    try {
+      const page = await fetchDiscoverProfilesPage({
+        currentUserId,
+        offset: searchNextOffset,
+        limit: 40,
+        search: trimmed,
+        excludeIds: Array.from(blockedUserIds),
+      });
+      setServerSearchResults((prev) => {
+        const seen = new Set(prev.map((u) => u.id));
+        const appended = page.users.filter((u) => !seen.has(u.id));
+        return [...prev, ...appended];
+      });
+      setSearchHasMore(page.hasMore);
+      setSearchNextOffset(page.nextOffset);
+    } finally {
+      setSearchingServer(false);
+    }
+  };
+
+  // Infinite scroll trigger when browsing full Discover list
+  useEffect(() => {
+    if (friendTab !== 'discover' || discoverySearch.trim() || !discoverHasMore) return;
+    const target = loadMoreSentinelRef.current;
+    if (!target) return;
+
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((e) => e.isIntersecting)) {
+          loadMoreDiscoverUsers();
+        }
+      },
+      { rootMargin: '220px' }
+    );
+
+    observer.observe(target);
+    return () => observer.disconnect();
+  }, [friendTab, discoverySearch, discoverHasMore, loadMoreDiscoverUsers]);
+
   // Categorize users with strict separation
   const myFriends = friends.length > 0 ? friends : users.filter((u) => u.relationshipState === 'friends');
   const receivedReqs = friendRequests.filter((r) => r.type === 'received');
+  const friendIdSet = new Set(myFriends.map((f) => f.id));
+  const sentIdSet = new Set(friendRequests.filter((r) => r.type === 'sent').map((r) => r.user.id));
+  const receivedReqByUserId = new Map(receivedReqs.map((r) => [r.user.id, r.id]));
 
-  // Discoverable users: pure eligible non-friends, not requested, not blocked, not self, not Mr Anonymous
-  const discoverUsers = contextDiscoverUsers.filter((u) => {
-    if (EXCLUDED_STUDENT_IDS.includes(u.id) || u.id === MR_ANONYMOUS_PAGE_ID || u.name.toLowerCase() === 'mr anonymous') {
-      return false;
-    }
-    if (dismissedUserIds.includes(u.id)) {
-      return false;
-    }
-    if (discoverySearch.trim()) {
-      const q = discoverySearch.toLowerCase();
-      return (
-        u.name.toLowerCase().includes(q) ||
-        u.department.toLowerCase().includes(q) ||
-        (u.interests && u.interests.some((i) => i.toLowerCase().includes(q)))
+  const hydrateLiveRelationship = (u: User): User => {
+    if (friendIdSet.has(u.id)) return { ...u, relationshipState: 'friends' };
+    if (sentIdSet.has(u.id)) return { ...u, relationshipState: 'request_sent' };
+    if (receivedReqByUserId.has(u.id)) return { ...u, relationshipState: 'request_received' };
+    return u;
+  };
+
+  const trimmedSearch = discoverySearch.trim();
+
+  // Discoverable users: merges server search (when searching) or paginated context discovery
+  const discoverUsers = (() => {
+    if (trimmedSearch) {
+      const q = trimmedSearch.toLowerCase();
+      const localMatches = users.filter(
+        (u) =>
+          u.id !== currentUserId &&
+          !blockedUserIds.has(u.id) &&
+          (u.name.toLowerCase().includes(q) ||
+            (u.handle && u.handle.toLowerCase().includes(q)) ||
+            u.department.toLowerCase().includes(q) ||
+            (u.campus && u.campus.toLowerCase().includes(q)) ||
+            (u.level && u.level.toLowerCase().includes(q)) ||
+            (u.interests && u.interests.some((i) => i.toLowerCase().includes(q))))
       );
+      const mergedMap = new Map<string, User>();
+      for (const u of [...serverSearchResults, ...localMatches]) {
+        if (
+          !u.id ||
+          u.id === currentUserId ||
+          blockedUserIds.has(u.id) ||
+          EXCLUDED_STUDENT_IDS.includes(u.id) ||
+          u.id === MR_ANONYMOUS_PAGE_ID ||
+          u.name.toLowerCase() === 'mr anonymous' ||
+          dismissedUserIds.includes(u.id)
+        ) {
+          continue;
+        }
+        if (!mergedMap.has(u.id)) {
+          mergedMap.set(u.id, hydrateLiveRelationship(u));
+        }
+      }
+      return Array.from(mergedMap.values());
     }
-    return true;
-  });
+
+    return contextDiscoverUsers
+      .filter((u) => {
+        if (EXCLUDED_STUDENT_IDS.includes(u.id) || u.id === MR_ANONYMOUS_PAGE_ID || u.name.toLowerCase() === 'mr anonymous') {
+          return false;
+        }
+        if (dismissedUserIds.includes(u.id)) {
+          return false;
+        }
+        return true;
+      })
+      .map(hydrateLiveRelationship);
+  })();
 
   // Exactly 3 tabs: Requests, Discover, Friends (Sent tab removed from UI per specification)
   const tabs: { id: FriendTab; label: string; count?: number; dot?: boolean }[] = [
@@ -151,11 +287,24 @@ export const FriendsView: React.FC = () => {
           <input
             type="text"
             value={discoverySearch}
-            onChange={(e) => setDiscoverySearch(e.target.value)}
-            placeholder="Search students, departments..."
+            onChange={(e) => {
+              setDiscoverySearch(e.target.value);
+              if (friendTab !== 'discover') setFriendTab('discover');
+            }}
+            placeholder="Search all ABSU students by name, @username, department..."
             autoFocus
-            className="w-full pl-10 pr-4 py-2.5 bg-[var(--color-bg-card)] border border-[var(--color-border)] rounded-2xl text-xs sm:text-sm text-[var(--color-text-primary)] placeholder:text-[var(--color-text-secondary)] focus:outline-none focus:ring-2 focus:ring-[var(--color-primary)]"
+            className="w-full pl-10 pr-10 py-2.5 bg-[var(--color-bg-card)] border border-[var(--color-border)] rounded-2xl text-xs sm:text-sm text-[var(--color-text-primary)] placeholder:text-[var(--color-text-secondary)] focus:outline-none focus:ring-2 focus:ring-[var(--color-primary)]"
           />
+          {discoverySearch && (
+            <button
+              type="button"
+              onClick={() => setDiscoverySearch('')}
+              className="absolute right-2.5 top-1/2 -translate-y-1/2 p-1.5 rounded-full text-[var(--color-text-secondary)] hover:text-[var(--color-text-primary)]"
+              aria-label="Clear student search"
+            >
+              <X className="w-4 h-4" />
+            </button>
+          )}
         </div>
       )}
 
@@ -251,14 +400,26 @@ export const FriendsView: React.FC = () => {
           )}
 
           {/* Section Heading: "People you may know" */}
-          <div className="pt-2">
+          <div className="pt-2 flex items-center justify-between gap-2">
             <h2 className="text-lg font-black text-[var(--color-text-primary)] tracking-tight">
-              People you may know
+              {trimmedSearch ? `Results for "${trimmedSearch}"` : 'People you may know'}
             </h2>
+            {!trimmedSearch && discoverTotalCount > discoverUsers.length && (
+              <span className="text-xs font-semibold text-[var(--color-text-secondary)] tabular-nums">
+                {discoverUsers.length} of {discoverTotalCount}
+              </span>
+            )}
           </div>
 
           {/* List of Students */}
-          {discoverUsers.length === 0 ? (
+          {searchingServer && discoverUsers.length === 0 ? (
+            <div className="p-8 text-center bg-[var(--color-bg-card)] border border-[var(--color-border)] rounded-2xl flex flex-col items-center justify-center gap-2">
+              <Loader2 className="w-6 h-6 animate-spin text-[var(--color-primary)]" />
+              <p className="text-xs font-semibold text-[var(--color-text-secondary)]">
+                Searching all registered students...
+              </p>
+            </div>
+          ) : discoverUsers.length === 0 ? (
             <div className="p-8 text-center bg-[var(--color-bg-card)] border border-[var(--color-border)] rounded-2xl">
               <p className="text-sm font-bold text-[var(--color-text-primary)]">
                 No matching students found
@@ -270,7 +431,10 @@ export const FriendsView: React.FC = () => {
           ) : (
             <div className="flex flex-col gap-3">
               {discoverUsers.map((discovered) => {
+                const isFriend = discovered.relationshipState === 'friends';
                 const isSent = discovered.relationshipState === 'request_sent';
+                const isReceived = discovered.relationshipState === 'request_received';
+                const incomingRequestId = receivedReqByUserId.get(discovered.id);
                 const onlineNow = isUserOnline(discovered.id);
 
                 const myDept = (currentUser.department || '').trim().toLowerCase();
@@ -341,33 +505,97 @@ export const FriendsView: React.FC = () => {
                       </div>
                     </div>
 
-                    {/* Right: Add friend and Remove buttons */}
+                    {/* Right: Relationship Action + Remove buttons */}
                     <div className="flex flex-col sm:flex-row items-center gap-1.5 shrink-0">
-                      {isSent ? (
-                        <span className="py-2 px-3.5 rounded-xl bg-[var(--color-bg-main)] border border-[var(--color-border)] text-xs font-semibold text-[var(--color-text-secondary)]">
-                          Request Sent
+                      {isFriend ? (
+                        <span className="min-h-[38px] py-2 px-3.5 rounded-xl bg-[var(--color-success)]/10 text-[var(--color-success)] text-xs font-bold flex items-center gap-1.5">
+                          <Check className="w-3.5 h-3.5" />
+                          <span>Friends</span>
                         </span>
+                      ) : isReceived && incomingRequestId ? (
+                        <button
+                          type="button"
+                          onClick={() => acceptFriendRequest(incomingRequestId)}
+                          className="w-full sm:w-auto min-h-[38px] py-2 px-4 rounded-xl bg-[var(--color-primary)] hover:bg-[var(--color-primary-hover)] text-white text-xs font-bold shadow-xs transition-transform active:scale-95 flex items-center justify-center gap-1"
+                        >
+                          <Check className="w-3.5 h-3.5" />
+                          <span>Confirm</span>
+                        </button>
+                      ) : isSent ? (
+                        <button
+                          type="button"
+                          onClick={() => cancelFriendRequest(discovered.id)}
+                          className="w-full sm:w-auto min-h-[38px] py-2 px-3.5 rounded-xl bg-[var(--color-bg-main)] border border-[var(--color-border)] hover:border-[var(--color-error)]/40 text-xs font-semibold text-[var(--color-text-secondary)] transition-colors"
+                          title="Cancel sent request"
+                        >
+                          Request Sent
+                        </button>
                       ) : (
                         <button
-                          onClick={() => sendFriendRequest(discovered.id)}
-                          className="w-full sm:w-auto py-2 px-4 rounded-xl bg-[var(--color-primary)] hover:bg-[var(--color-primary-hover)] text-white text-xs font-bold shadow-xs transition-transform active:scale-95 flex items-center justify-center gap-1"
+                          type="button"
+                          onClick={() => sendFriendRequest(discovered.id, discovered)}
+                          className="w-full sm:w-auto min-h-[38px] py-2 px-4 rounded-xl bg-[var(--color-primary)] hover:bg-[var(--color-primary-hover)] text-white text-xs font-bold shadow-xs transition-transform active:scale-95 flex items-center justify-center gap-1"
                         >
                           <UserPlus className="w-3.5 h-3.5" />
                           <span>Add friend</span>
                         </button>
                       )}
 
-                      <button
-                        onClick={() => handleDismissUser(discovered.id)}
-                        className="w-full sm:w-auto py-2 px-3 rounded-xl bg-[var(--color-bg-main)] border border-[var(--color-border)] hover:bg-[var(--color-border)]/50 text-[var(--color-text-secondary)] text-xs font-semibold transition-colors"
-                        title="Remove suggestion"
-                      >
-                        Remove
-                      </button>
+                      {!isFriend && (
+                        <button
+                          type="button"
+                          onClick={() => handleDismissUser(discovered.id)}
+                          className="w-full sm:w-auto min-h-[38px] py-2 px-3 rounded-xl bg-[var(--color-bg-main)] border border-[var(--color-border)] hover:bg-[var(--color-border)]/50 text-[var(--color-text-secondary)] text-xs font-semibold transition-colors"
+                          title="Remove suggestion"
+                        >
+                          Remove
+                        </button>
+                      )}
                     </div>
                   </div>
                 );
               })}
+
+              {/* Infinite scroll sentinel & manual fallback button */}
+              {!trimmedSearch && discoverHasMore && (
+                <div ref={loadMoreSentinelRef} className="pt-2 flex justify-center">
+                  <button
+                    type="button"
+                    disabled={loadingMoreDiscover}
+                    onClick={loadMoreDiscoverUsers}
+                    className="min-h-[44px] px-5 py-2.5 rounded-2xl bg-[var(--color-bg-card)] border border-[var(--color-border)] hover:border-[var(--color-primary)] text-xs font-bold text-[var(--color-text-primary)] flex items-center gap-2 transition-colors disabled:opacity-60"
+                  >
+                    {loadingMoreDiscover ? (
+                      <>
+                        <Loader2 className="w-4 h-4 animate-spin text-[var(--color-primary)]" />
+                        <span>Loading more students...</span>
+                      </>
+                    ) : (
+                      <span>Load More Students</span>
+                    )}
+                  </button>
+                </div>
+              )}
+
+              {trimmedSearch && searchHasMore && (
+                <div className="pt-2 flex justify-center">
+                  <button
+                    type="button"
+                    disabled={searchingServer}
+                    onClick={handleLoadMoreSearch}
+                    className="min-h-[44px] px-5 py-2.5 rounded-2xl bg-[var(--color-bg-card)] border border-[var(--color-border)] hover:border-[var(--color-primary)] text-xs font-bold text-[var(--color-text-primary)] flex items-center gap-2 transition-colors disabled:opacity-60"
+                  >
+                    {searchingServer ? (
+                      <>
+                        <Loader2 className="w-4 h-4 animate-spin text-[var(--color-primary)]" />
+                        <span>Searching...</span>
+                      </>
+                    ) : (
+                      <span>Load More Search Results</span>
+                    )}
+                  </button>
+                </div>
+              )}
             </div>
           )}
         </div>

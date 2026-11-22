@@ -33276,24 +33276,89 @@ async function fetchProfileById(userId, authEmail) {
 }
 var EXCLUDED_STUDENT_IDS = ["b4f38505-fce6-44be-8727-8ebf04eb2ceb", "0c3240e3-ae39-461d-bd7a-4963859b9bc7"];
 /**
-* Fetch profiles for student discovery and people list
+* Paginated student discovery (calls /api/users/discover first to include ALL eligible users beyond 50,
+* enforce blocks/restrictions, and support live search; falls back to paginated Supabase query).
 */
-async function fetchAllProfiles(currentUserId, limit = 50, excludeIds) {
+async function fetchDiscoverProfilesPage(options) {
+	const offset = Math.max(0, options.offset ?? 0);
+	const limit = Math.min(Math.max(options.limit ?? 30, 1), 60);
+	const search = (options.search || "").trim();
 	try {
-		let query = supabase.from("profiles").select("*").order("created_at", { ascending: false });
-		if (currentUserId) query = query.neq("id", currentUserId);
-		const toExclude = Array.from(/* @__PURE__ */ new Set([...excludeIds || [], ...EXCLUDED_STUDENT_IDS])).filter(Boolean);
-		if (toExclude.length > 0) query = query.not("id", "in", `(${toExclude.join(",")})`);
-		query = query.limit(limit);
-		const { data, error } = await query;
-		if (error) {
-			console.warn("Supabase fetchAllProfiles error:", error.message);
-			return [];
+		const params = new URLSearchParams({
+			limit: String(limit),
+			offset: String(offset)
+		});
+		if (search) params.set("q", search);
+		const headers = {};
+		try {
+			const { data: sessionData } = await supabase.auth.getSession();
+			const token = sessionData?.session?.access_token;
+			if (token) headers.Authorization = `Bearer ${token}`;
+		} catch {}
+		const res = await fetch(`/api/users/discover?${params.toString()}`, { headers });
+		const contentType = res.headers.get("content-type") || "";
+		if (res.ok && contentType.includes("application/json")) {
+			const data = await res.json();
+			if (data?.success && Array.isArray(data.profiles)) {
+				const mapped = data.profiles.map((row) => mapProfileRowToUser(row, null, row.relationship_state || "none"));
+				return {
+					users: mapped,
+					totalCount: Number(data.totalCount) || mapped.length,
+					hasMore: Boolean(data.hasMore),
+					nextOffset: typeof data.nextOffset === "number" ? data.nextOffset : null
+				};
+			}
 		}
-		return (data || []).filter((row) => row.display_name?.toLowerCase() !== "mr anonymous").map((row) => mapProfileRowToUser(row, null, "none"));
+	} catch {}
+	try {
+		const excludeSet = /* @__PURE__ */ new Set([
+			...options.excludeIds || [],
+			...EXCLUDED_STUDENT_IDS,
+			...options.currentUserId ? [options.currentUserId] : []
+		]);
+		const scanWindow = Math.max(limit * 2, 60);
+		const collected = [];
+		let rawCursor = offset;
+		let exhausted = false;
+		for (let step = 0; step < 3 && collected.length < limit; step++) {
+			let query = supabase.from("profiles").select("*").order("created_at", { ascending: false }).order("id", { ascending: true }).range(rawCursor, rawCursor + scanWindow - 1);
+			if (search) {
+				const term = `%${search}%`;
+				query = query.or(`display_name.ilike.${term},username.ilike.${term},department.ilike.${term},campus.ilike.${term},level.ilike.${term}`);
+			}
+			const { data, error } = await query;
+			if (error) {
+				console.warn("Supabase fetchDiscoverProfilesPage fallback error:", error.message);
+				break;
+			}
+			const rows = data || [];
+			rawCursor += rows.length;
+			for (const row of rows) {
+				if (!row?.id || excludeSet.has(row.id)) continue;
+				if (row.display_name?.trim().toLowerCase() === "mr anonymous") continue;
+				collected.push(mapProfileRowToUser(row, null, "none"));
+				if (collected.length >= limit) break;
+			}
+			if (rows.length < scanWindow) {
+				exhausted = true;
+				break;
+			}
+		}
+		const hasMore = !exhausted && collected.length >= limit;
+		return {
+			users: collected,
+			totalCount: collected.length,
+			hasMore,
+			nextOffset: hasMore ? rawCursor : null
+		};
 	} catch (err) {
-		console.warn("Unexpected error in fetchAllProfiles:", err);
-		return [];
+		console.warn("Unexpected error in fetchDiscoverProfilesPage:", err);
+		return {
+			users: [],
+			totalCount: 0,
+			hasMore: false,
+			nextOffset: null
+		};
 	}
 }
 /**
@@ -34497,19 +34562,23 @@ async function sendDiagnosticFcmTest(userId) {
 		message: "User ID is required for push diagnostics."
 	};
 	try {
-		let initNote = "";
+		let webSyncNote = "";
 		if (isNativeAndroidApp()) await initNativePush(userId).catch(() => {});
 		else {
 			const webInit = await initWebFirebasePush(userId);
-			if (!webInit.success && webInit.reason) initNote = ` [Web Token Sync: ${webInit.reason}]`;
+			if (!webInit.success && webInit.reason && webInit.reason !== "firebase-web-not-configured") webSyncNote = ` [Web Token Sync: ${webInit.reason}]`;
 		}
+		const { data: sessionData } = await supabase.auth.getSession();
+		const accessToken = sessionData?.session?.access_token;
 		const testEntityId = "00000000-0000-4000-8000-" + Math.random().toString(16).slice(2, 14).padEnd(12, "0");
 		let notifCreated = false;
 		let createErrorDetail = "";
 		try {
+			const headers = { "Content-Type": "application/json" };
+			if (accessToken) headers.Authorization = `Bearer ${accessToken}`;
 			const createRes = await fetch("/api/notifications/create-test", {
 				method: "POST",
-				headers: { "Content-Type": "application/json" },
+				headers,
 				body: JSON.stringify({
 					userId,
 					entityId: testEntityId
@@ -34520,7 +34589,8 @@ async function sendDiagnosticFcmTest(userId) {
 			else if (createData?.error) createErrorDetail = createData.error;
 		} catch {}
 		if (!notifCreated) {
-			const { error: clientInsErr } = await supabase.from("notifications").insert({
+			const nowIso = (/* @__PURE__ */ new Date()).toISOString();
+			let { error: clientInsErr } = await supabase.from("notifications").insert({
 				recipient_id: userId,
 				actor_id: userId,
 				type: "announcement",
@@ -34529,9 +34599,18 @@ async function sendDiagnosticFcmTest(userId) {
 				entity_type: "test",
 				entity_id: testEntityId,
 				read_at: null,
-				created_at: (/* @__PURE__ */ new Date()).toISOString()
+				created_at: nowIso
 			});
-			if (clientInsErr) initNote += ` [Test notification insert note: ${createErrorDetail || clientInsErr.message}]`;
+			if (clientInsErr && (clientInsErr.code === "42703" || clientInsErr.code === "PGRST204" || clientInsErr.message?.toLowerCase().includes("column") || clientInsErr.message?.toLowerCase().includes("schema cache"))) clientInsErr = (await supabase.from("notifications").insert({
+				recipient_id: userId,
+				actor_id: userId,
+				type: "announcement",
+				title: "🎉 ABSU Connect Notification Test",
+				body: "FCM push notifications are successfully configured for your device!",
+				read_at: null,
+				created_at: nowIso
+			})).error;
+			if (clientInsErr) webSyncNote += ` [Test alert record note: ${createErrorDetail || clientInsErr.message}]`;
 			else notifCreated = true;
 		}
 		const fcmRes = await dispatchAndroidPush({
@@ -34546,23 +34625,23 @@ async function sendDiagnosticFcmTest(userId) {
 			fcmResult: fcmRes
 		};
 		const diag = await getPushDiagnosticInfo(userId);
-		if (!diag.isNativeApp && !diag.firebaseWebConfigured) return {
+		if (!diag.isNativeApp && !diag.firebaseWebConfigured && diag.androidTokensCount === 0) return {
 			success: false,
 			sent: 0,
-			message: "Edge Function is live, but Web FCM environment variables (VITE_FIREBASE_*) are missing in this web build." + initNote,
+			message: "Edge Function is live, and no Android FCM token or Web Firebase config is active on this browser." + webSyncNote,
 			fcmResult: fcmRes
 		};
 		const edgeDetail = fcmRes.raw && typeof fcmRes.raw === "object" ? JSON.stringify(fcmRes.raw) : fcmRes.error || `HTTP ${fcmRes.status ?? "error"}`;
 		if (fcmRes.success) return {
 			success: true,
 			sent: 0,
-			message: `Edge Function returned 0 sent (${edgeDetail}).${initNote} Registered tokens in DB -> Android: ${diag.androidTokensCount}, Web: ${diag.webTokensCount}. Make sure send-android-push queries platform IN ('android', 'web').`,
+			message: `Edge Function returned 0 sent (${edgeDetail}).${webSyncNote} Registered tokens -> Android: ${diag.androidTokensCount}, Web: ${diag.webTokensCount}.`,
 			fcmResult: fcmRes
 		};
 		return {
 			success: false,
 			sent: fcmRes.sent ?? 0,
-			message: `Edge Function failed (${edgeDetail}).${initNote}`,
+			message: `Edge Function check (${edgeDetail}).${webSyncNote}`,
 			fcmResult: fcmRes
 		};
 	} catch (err) {
@@ -35145,7 +35224,7 @@ var useAuth = () => {
 };
 //#endregion
 //#region node_modules/@capacitor/app/dist/esm/index.js
-var App$1 = registerPlugin("App", { web: () => __vitePreload(() => import("./web-CxZHORSp.js").then((m) => new m.AppWeb()), []) });
+var App$1 = registerPlugin("App", { web: () => __vitePreload(() => import("./web-D2p2ANA6.js").then((m) => new m.AppWeb()), []) });
 //#endregion
 //#region src/utils/logic.ts
 /**
@@ -37960,28 +38039,71 @@ async function compressImageForUpload(file, maxSizeMB = 2, maxWidthOrHeight = 19
 */
 async function inspectVideoFile(file) {
 	return new Promise((resolve, reject) => {
+		if (typeof document === "undefined") {
+			resolve({
+				duration: 0,
+				width: 0,
+				height: 0
+			});
+			return;
+		}
 		const video = document.createElement("video");
 		video.preload = "metadata";
+		video.muted = true;
+		video.playsInline = true;
 		const objectUrl = URL.createObjectURL(file);
-		video.onloadedmetadata = () => {
+		let settled = false;
+		const cleanup = () => {
+			video.onloadedmetadata = null;
+			video.onerror = null;
+			video.src = "";
 			URL.revokeObjectURL(objectUrl);
+		};
+		const timer = setTimeout(() => {
+			if (settled) return;
+			settled = true;
+			cleanup();
+			reject(/* @__PURE__ */ new Error("Timed out reading video metadata."));
+		}, 8e3);
+		video.onloadedmetadata = () => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timer);
+			const duration = Number.isFinite(video.duration) ? video.duration : 0;
+			const width = video.videoWidth || 0;
+			const height = video.videoHeight || 0;
+			cleanup();
 			resolve({
-				duration: video.duration || 0,
-				width: video.videoWidth || 0,
-				height: video.videoHeight || 0
+				duration,
+				width,
+				height
 			});
 		};
 		video.onerror = () => {
-			URL.revokeObjectURL(objectUrl);
+			if (settled) return;
+			settled = true;
+			clearTimeout(timer);
+			cleanup();
 			reject(/* @__PURE__ */ new Error("Failed to read video metadata. The format may not be supported by this browser."));
 		};
 		video.src = objectUrl;
 	});
 }
 /**
-* Validate video file constraints: duration <= 60 seconds, size <= 50MB
+* Validate video file constraints: non-empty, valid video extension/MIME, size <= 50MB, and duration <= 60s when readable
 */
 async function validatePostVideoFile(file) {
+	if (!file || file.size <= 0) return {
+		valid: false,
+		error: "Selected video file is empty (0 bytes)."
+	};
+	const lowerName = (file.name || "").toLowerCase();
+	const isVideoMime = Boolean(file.type && file.type.startsWith("video/"));
+	const isVideoExt = /\.(mp4|webm|mov|m4v|ogg|3gp|mkv)$/i.test(lowerName);
+	if (!isVideoMime && !isVideoExt) return {
+		valid: false,
+		error: "Please select a valid video file (MP4, WebM, or MOV)."
+	};
 	if (file.size > 52428800) return {
 		valid: false,
 		error: `Video size (${(file.size / 1048576).toFixed(1)} MB) exceeds the 50 MB limit.`
@@ -37997,11 +38119,8 @@ async function validatePostVideoFile(file) {
 			valid: true,
 			metadata: meta
 		};
-	} catch (err) {
-		return {
-			valid: false,
-			error: err instanceof Error ? err.message : "Invalid video file."
-		};
+	} catch {
+		return { valid: true };
 	}
 }
 //#endregion
@@ -39132,11 +39251,25 @@ async function resolvePostMediaUrlsOnRows(postRows) {
 		}
 	}
 }
+var savedPostsTableUnavailable = false;
+function isMissingSavedPostsTableError(err) {
+	if (!err) return false;
+	const code = (err.code || "").toUpperCase();
+	const msg = (err.message || "").toLowerCase();
+	return err.status === 404 || code === "PGRST205" || code === "42P01" || msg.includes("saved_posts") && (msg.includes("could not find") || msg.includes("does not exist") || msg.includes("schema cache"));
+}
 async function fetchSavedPostIds(userId) {
 	const savedSet = /* @__PURE__ */ new Set();
-	if (!userId) return savedSet;
+	if (!userId || savedPostsTableUnavailable) return savedSet;
 	try {
-		const { data, error } = await supabase.from("saved_posts").select("post_id").eq("user_id", userId);
+		const { data, error, status } = await supabase.from("saved_posts").select("post_id").eq("user_id", userId);
+		if (error && isMissingSavedPostsTableError({
+			...error,
+			status
+		})) {
+			savedPostsTableUnavailable = true;
+			return savedSet;
+		}
 		if (!error && data) {
 			for (const row of data) if (row.post_id) savedSet.add(row.post_id);
 		}
@@ -39149,20 +39282,31 @@ async function toggleSavePostInDb(postId, userId, currentlySaved) {
 		isSaved: currentlySaved,
 		error: "Invalid post or user."
 	};
+	if (savedPostsTableUnavailable) return {
+		success: false,
+		isSaved: currentlySaved,
+		error: "Saved posts table is not yet provisioned in Supabase."
+	};
 	try {
 		if (currentlySaved) {
-			const { error } = await supabase.from("saved_posts").delete().eq("post_id", postId).eq("user_id", userId);
-			if (error) return {
-				success: false,
-				isSaved: currentlySaved,
-				error: error.message
-			};
+			const { error, status } = await supabase.from("saved_posts").delete().eq("post_id", postId).eq("user_id", userId);
+			if (error) {
+				if (isMissingSavedPostsTableError({
+					...error,
+					status
+				})) savedPostsTableUnavailable = true;
+				return {
+					success: false,
+					isSaved: currentlySaved,
+					error: error.message
+				};
+			}
 			return {
 				success: true,
 				isSaved: false
 			};
 		} else {
-			const { error } = await supabase.from("saved_posts").upsert({
+			const { error, status } = await supabase.from("saved_posts").upsert({
 				post_id: postId,
 				user_id: userId,
 				created_at: (/* @__PURE__ */ new Date()).toISOString()
@@ -39170,11 +39314,17 @@ async function toggleSavePostInDb(postId, userId, currentlySaved) {
 				onConflict: "user_id,post_id",
 				ignoreDuplicates: true
 			});
-			if (error) return {
-				success: false,
-				isSaved: currentlySaved,
-				error: error.message
-			};
+			if (error) {
+				if (isMissingSavedPostsTableError({
+					...error,
+					status
+				})) savedPostsTableUnavailable = true;
+				return {
+					success: false,
+					isSaved: currentlySaved,
+					error: error.message
+				};
+			}
 			return {
 				success: true,
 				isSaved: true
@@ -39328,7 +39478,15 @@ async function fetchSavedPosts(userId) {
 				return rows.map((row) => mapSupabasePostToFrontend(row, userId, savedSet, friendSet));
 			}
 		}
-		const { data: savedRows, error: savedErr } = await supabase.from("saved_posts").select("post_id, created_at").eq("user_id", userId).order("created_at", { ascending: false });
+		if (savedPostsTableUnavailable) return [];
+		const { data: savedRows, error: savedErr, status } = await supabase.from("saved_posts").select("post_id, created_at").eq("user_id", userId).order("created_at", { ascending: false });
+		if (savedErr && isMissingSavedPostsTableError({
+			...savedErr,
+			status
+		})) {
+			savedPostsTableUnavailable = true;
+			return [];
+		}
 		if (savedErr || !savedRows || savedRows.length === 0) return [];
 		const postIds = savedRows.map((r) => r.post_id).filter(Boolean);
 		const [{ rows: postRows, error }, safetyCtx] = await Promise.all([querySupabasePostsResilient((q) => q.in("id", postIds)), getDirectSafetyContext(userId)]);
@@ -39986,10 +40144,10 @@ var REELS_CORE_SELECT = `
 `;
 function isVideoMediaItem(item) {
 	if (!item) return false;
-	if (item.kind === "video") return true;
+	if (String(item.kind || "").toLowerCase() === "video") return true;
 	const url = (item.secure_url || "").toLowerCase();
 	const fmt = (item.format || "").toLowerCase();
-	return fmt === "mp4" || fmt === "webm" || fmt === "mov" || fmt === "m4v" || url.includes("/video/") || Boolean(url.match(/\.(mp4|webm|mov|ogg|m4v)(\?.*)?$/i));
+	return fmt === "mp4" || fmt === "webm" || fmt === "mov" || fmt === "m4v" || fmt === "ogg" || url.includes("/video/") || Boolean(url.match(/\.(mp4|webm|mov|ogg|m4v)(\?.*)?$/i));
 }
 function getPrimaryVideoMediaItem(post) {
 	if (!post) return null;
@@ -40016,6 +40174,16 @@ function normalizePostForReels(post) {
 		mediaType: "video"
 	};
 }
+function mergeAndDedupeReels(primary, secondary) {
+	const seen = /* @__PURE__ */ new Set();
+	const out = [];
+	for (const list of [primary, secondary]) for (const item of list) {
+		if (!item?.id || seen.has(item.id) || !isVideoPost(item)) continue;
+		seen.add(item.id);
+		out.push(normalizePostForReels(item));
+	}
+	return out;
+}
 function isRowEligibleForReels(row, currentUserId, moderatedSet, blockedIds, friendIds) {
 	if (!row || !row.id) return false;
 	if (row.visibility === "hidden") return false;
@@ -40025,11 +40193,11 @@ function isRowEligibleForReels(row, currentUserId, moderatedSet, blockedIds, fri
 	return Array.isArray(row.post_media) && row.post_media.some((m) => isVideoMediaItem(m));
 }
 async function queryReelsRowsResilient(applyFilters) {
-	const richRes = await applyFilters(supabase.from("posts").select(REELS_RICH_SELECT), true);
+	const richRes = await applyFilters(supabase.from("posts").select(REELS_RICH_SELECT));
 	if (!richRes.error) return { rows: richRes.data || [] };
-	const coreRes = await applyFilters(supabase.from("posts").select(REELS_CORE_SELECT), true);
+	const coreRes = await applyFilters(supabase.from("posts").select(REELS_CORE_SELECT));
 	if (!coreRes.error) return { rows: await hydratePostRowsFromSupabase(coreRes.data || []) };
-	const minimalRes = await applyFilters(supabase.from("posts").select("*, post_media!inner(*)"), true);
+	const minimalRes = await applyFilters(supabase.from("posts").select("*, post_media!inner(*)"));
 	if (!minimalRes.error) return { rows: await hydratePostRowsFromSupabase(minimalRes.data || []) };
 	return {
 		rows: [],
@@ -40038,41 +40206,70 @@ async function queryReelsRowsResilient(applyFilters) {
 }
 /**
 * Fetch paginated video-only social posts for the dedicated Reels screen.
-* Strictly reads from public social `posts` + `post_media` (NEVER `messages` or `message_attachments`).
+* 1. Uses `/api/posts/reels` server route first so all published feed/community/legacy videos appear.
+* 2. Falls back to resilient direct Supabase queries (without dropping NULL visibility rows).
+* Strictly reads public social `posts` + `post_media` (NEVER `messages` or `message_attachments`).
 */
 async function fetchReelsFeedPage(options) {
-	const limit = Math.min(Math.max(options.limit ?? 8, 2), 30);
+	const limit = Math.min(Math.max(options.limit ?? 10, 2), 30);
 	const cursor = options.cursor || null;
 	try {
+		try {
+			const headers = await getOptionalAuthHeaders();
+			const params = new URLSearchParams({ limit: String(limit) });
+			if (cursor) params.set("before", cursor);
+			const apiRes = await fetch(`/api/posts/reels?${params.toString()}`, { headers }).catch(() => null);
+			const json = apiRes?.ok ? await parseApiJson$3(apiRes) : null;
+			if (json?.success && Array.isArray(json.posts)) {
+				const rows = json.posts;
+				const savedSet = new Set(json.savedPostIds || []);
+				const friendSet = new Set(json.friendIds || []);
+				return {
+					reels: rows.map((row) => normalizePostForReels(mapSupabasePostToFrontend(row, options.currentUserId, savedSet, friendSet))).filter((p) => isVideoPost(p)),
+					hasMore: Boolean(json.hasMore),
+					nextCursor: typeof json.nextCursor === "string" ? json.nextCursor : null
+				};
+			}
+		} catch {}
 		const [postsRes, savedSet, moderatedSet, safetyCtx] = await Promise.all([
 			queryReelsRowsResilient((q) => {
-				let next = q.eq("post_media.kind", "video").neq("visibility", "hidden").order("created_at", { ascending: false });
+				let next = q.eq("post_media.kind", "video").order("created_at", { ascending: false });
 				if (cursor) next = next.lt("created_at", cursor);
-				return next.limit(limit);
+				return next.limit(limit * 2);
 			}),
 			fetchSavedPostIds(options.currentUserId),
 			fetchModeratedPostIds(),
 			getDirectSafetyContext(options.currentUserId)
 		]);
-		if (postsRes.error || postsRes.rows.length === 0) return {
+		let sourceRows = postsRes.rows;
+		if (sourceRows.length === 0) {
+			const { data: mediaRows } = await supabase.from("post_media").select("post_id, kind, format, secure_url, created_at").order("created_at", { ascending: false }).limit(120);
+			const candidatePostIds = Array.from(new Set((mediaRows || []).filter((m) => isVideoMediaItem(m)).map((m) => m.post_id).filter(Boolean))).slice(0, 40);
+			if (candidatePostIds.length > 0) sourceRows = (await querySupabasePostsResilient((q) => {
+				let next = q.in("id", candidatePostIds).order("created_at", { ascending: false });
+				if (cursor) next = next.lt("created_at", cursor);
+				return next;
+			})).rows;
+		}
+		if (sourceRows.length === 0) return {
 			reels: [],
 			hasMore: false,
 			nextCursor: null
 		};
-		await resolvePostMediaUrlsOnRows(postsRes.rows);
+		await resolvePostMediaUrlsOnRows(sourceRows);
 		const seenIds = /* @__PURE__ */ new Set();
 		const eligibleRows = [];
-		for (const row of postsRes.rows) {
+		for (const row of sourceRows) {
 			if (seenIds.has(row.id)) continue;
 			seenIds.add(row.id);
 			if (isRowEligibleForReels(row, options.currentUserId, moderatedSet, safetyCtx.blockedIds, safetyCtx.friendIds)) eligibleRows.push(row);
 		}
-		const reels = eligibleRows.map((row) => normalizePostForReels(mapSupabasePostToFrontend(row, options.currentUserId, savedSet, safetyCtx.friendIds))).filter((p) => isVideoPost(p));
-		const hasMore = postsRes.rows.length >= limit;
+		const reels = eligibleRows.slice(0, limit).map((row) => normalizePostForReels(mapSupabasePostToFrontend(row, options.currentUserId, savedSet, safetyCtx.friendIds))).filter((p) => isVideoPost(p));
+		const hasMore = eligibleRows.length > limit || sourceRows.length >= limit * 2;
 		return {
 			reels,
 			hasMore,
-			nextCursor: hasMore ? postsRes.rows[postsRes.rows.length - 1]?.created_at || null : null
+			nextCursor: hasMore ? sourceRows[sourceRows.length - 1]?.created_at || null : null
 		};
 	} catch (err) {
 		console.warn("[Reels] Error fetching Reels page:", err);
@@ -40117,6 +40314,21 @@ async function searchReelsVideos(rawQuery, currentUserId, limit = 24) {
 		limit
 	})).reels;
 	try {
+		try {
+			const headers = await getOptionalAuthHeaders();
+			const params = new URLSearchParams({
+				q: cleaned,
+				limit: String(limit)
+			});
+			const apiRes = await fetch(`/api/posts/reels/search?${params.toString()}`, { headers }).catch(() => null);
+			const json = apiRes?.ok ? await parseApiJson$3(apiRes) : null;
+			if (json?.success && Array.isArray(json.posts)) {
+				const rows = json.posts;
+				const savedSet = new Set(json.savedPostIds || []);
+				const friendSet = new Set(json.friendIds || []);
+				return rows.map((row) => normalizePostForReels(mapSupabasePostToFrontend(row, currentUserId, savedSet, friendSet))).filter((p) => isVideoPost(p));
+			}
+		} catch {}
 		const noHash = cleaned.replace(/^#+/, "").trim();
 		const captionPattern = `%${cleaned}%`;
 		const tagPattern = noHash ? `%#${noHash}%` : captionPattern;
@@ -40126,7 +40338,7 @@ async function searchReelsVideos(rawQuery, currentUserId, limit = 24) {
 		if (tagPattern !== captionPattern) orClauses.push(`body.ilike.${tagPattern}`);
 		if (matchingAuthorIds.length > 0) orClauses.push(`author_id.in.(${matchingAuthorIds.join(",")})`);
 		const [postsRes, savedSet, moderatedSet, safetyCtx] = await Promise.all([
-			queryReelsRowsResilient((q) => q.eq("post_media.kind", "video").neq("visibility", "hidden").or(orClauses.join(",")).order("created_at", { ascending: false }).limit(limit)),
+			queryReelsRowsResilient((q) => q.eq("post_media.kind", "video").or(orClauses.join(",")).order("created_at", { ascending: false }).limit(limit * 2)),
 			fetchSavedPostIds(currentUserId),
 			fetchModeratedPostIds(),
 			getDirectSafetyContext(currentUserId)
@@ -40140,7 +40352,10 @@ async function searchReelsVideos(rawQuery, currentUserId, limit = 24) {
 			seen.add(row.id);
 			if (isRowEligibleForReels(row, currentUserId, moderatedSet, safetyCtx.blockedIds, safetyCtx.friendIds)) {
 				const mapped = normalizePostForReels(mapSupabasePostToFrontend(row, currentUserId, savedSet, safetyCtx.friendIds));
-				if (isVideoPost(mapped)) results.push(mapped);
+				if (isVideoPost(mapped)) {
+					results.push(mapped);
+					if (results.length >= limit) break;
+				}
 			}
 		}
 		return results;
@@ -45584,9 +45799,13 @@ async function sendPrivacySafePush(params) {
 async function sendTestNotification(userId, userName) {
 	try {
 		playNotificationChime();
+		const { data: sessionData } = await supabase.auth.getSession();
+		const token = sessionData?.session?.access_token;
+		const headers = { "Content-Type": "application/json" };
+		if (token) headers.Authorization = `Bearer ${token}`;
 		const res = await fetch("/api/notifications/send-test", {
 			method: "POST",
-			headers: { "Content-Type": "application/json" },
+			headers,
 			body: JSON.stringify({
 				userId,
 				userName
@@ -45598,14 +45817,17 @@ async function sendTestNotification(userId, userName) {
 			if (data?.success) return {
 				success: true,
 				message: data?.message || "Test notification delivered!",
-				pushDelivered: Boolean(data?.pushDelivered)
+				pushDelivered: Boolean(data?.pushDelivered),
+				ranFcmFallback: false
 			};
 		}
 		const fcmDiag = await sendDiagnosticFcmTest(userId);
 		return {
 			success: fcmDiag.success,
 			message: fcmDiag.message,
-			pushDelivered: (fcmDiag.sent ?? 0) > 0
+			pushDelivered: (fcmDiag.sent ?? 0) > 0,
+			ranFcmFallback: true,
+			sent: fcmDiag.sent ?? 0
 		};
 	} catch (err) {
 		return {
@@ -46167,6 +46389,12 @@ var AppProvider = ({ children }) => {
 	const [users, setUsers] = (0, import_react.useState)([]);
 	const [friends, setFriends] = (0, import_react.useState)([]);
 	const [loadingUsers, setLoadingUsers] = (0, import_react.useState)(true);
+	const [discoverHasMore, setDiscoverHasMore] = (0, import_react.useState)(false);
+	const [loadingMoreDiscover, setLoadingMoreDiscover] = (0, import_react.useState)(false);
+	const [discoverTotalCount, setDiscoverTotalCount] = (0, import_react.useState)(0);
+	const discoverNextOffsetRef = (0, import_react.useRef)(0);
+	const discoverExcludeIdsRef = (0, import_react.useRef)([]);
+	const [sessionSentIds, setSessionSentIds] = (0, import_react.useState)(/* @__PURE__ */ new Set());
 	const [selectedUserId, setSelectedUserId] = (0, import_react.useState)(initialRoute.userId);
 	const [selectedCommunityId, setSelectedCommunityId] = (0, import_react.useState)(initialRoute.communityId);
 	const [selectedEventId, setSelectedEventId] = (0, import_react.useState)(initialRoute.eventId);
@@ -46261,9 +46489,10 @@ var AppProvider = ({ children }) => {
 	const discoverUsers = import_react.useMemo(() => {
 		const filtered = users.filter((u) => {
 			if (!u.id || authUserId && u.id === authUserId) return false;
-			if (u.relationshipState !== "none") return false;
 			if (blockedUserIds.has(u.id)) return false;
-			return true;
+			if (u.relationshipState === "none") return true;
+			if (u.relationshipState === "request_sent" && sessionSentIds.has(u.id)) return true;
+			return false;
 		});
 		const myDept = (currentUser.department || "").trim().toLowerCase();
 		const myFaculty = (currentUser.faculty || "").trim().toLowerCase();
@@ -46290,6 +46519,7 @@ var AppProvider = ({ children }) => {
 		users,
 		authUserId,
 		blockedUserIds,
+		sessionSentIds,
 		currentUser.department,
 		currentUser.faculty,
 		currentUser.level,
@@ -46380,7 +46610,14 @@ var AppProvider = ({ children }) => {
 				...Array.from(receivedIdSet),
 				...Array.from(blockedSet)
 			]));
-			const decoratedDiscoverStudents = (await fetchAllProfiles(authUserId, 50, excludeIds)).map((s) => ({
+			discoverExcludeIdsRef.current = excludeIds;
+			const discoverPage = await fetchDiscoverProfilesPage({
+				currentUserId: authUserId,
+				offset: 0,
+				limit: 30,
+				excludeIds
+			});
+			const decoratedDiscoverStudents = discoverPage.users.map((s) => ({
 				...s,
 				relationshipState: "none"
 			}));
@@ -46390,12 +46627,46 @@ var AppProvider = ({ children }) => {
 			}));
 			setFriends(decoratedFriends);
 			setUsers([...decoratedFriends, ...decoratedDiscoverStudents]);
+			setDiscoverHasMore(discoverPage.hasMore);
+			setDiscoverTotalCount(discoverPage.totalCount);
+			discoverNextOffsetRef.current = discoverPage.nextOffset;
 			setFriendRequests([...friendshipData.incomingRequests, ...friendshipData.outgoingRequests]);
 			hasLoadedUsersRef.current = true;
 		} finally {
 			setLoadingUsers(false);
 		}
 	}, [authUserId]);
+	const loadMoreDiscoverUsers = (0, import_react.useCallback)(async () => {
+		if (!authUserId) return;
+		const nextOffset = discoverNextOffsetRef.current;
+		if (loadingMoreDiscover || !discoverHasMore || nextOffset === null) return;
+		setLoadingMoreDiscover(true);
+		try {
+			const page = await fetchDiscoverProfilesPage({
+				currentUserId: authUserId,
+				offset: nextOffset,
+				limit: 30,
+				excludeIds: discoverExcludeIdsRef.current
+			});
+			setUsers((prev) => {
+				const seen = new Set(prev.map((u) => u.id));
+				const appended = page.users.filter((u) => !seen.has(u.id)).map((u) => ({
+					...u,
+					relationshipState: "none"
+				}));
+				return [...prev, ...appended];
+			});
+			setDiscoverHasMore(page.hasMore);
+			if (page.totalCount > 0) setDiscoverTotalCount(page.totalCount);
+			discoverNextOffsetRef.current = page.nextOffset;
+		} finally {
+			setLoadingMoreDiscover(false);
+		}
+	}, [
+		authUserId,
+		loadingMoreDiscover,
+		discoverHasMore
+	]);
 	const loadConversations = (0, import_react.useCallback)(async () => {
 		if (!authUserId) return;
 		if (!hasLoadedConversationsRef.current) setLoadingConversations(true);
@@ -47074,6 +47345,7 @@ var AppProvider = ({ children }) => {
 		const res = await deleteRealPost(postId, auth.user.id);
 		if (res.success) {
 			setPosts((prev) => prev.filter((p) => p.id !== postId));
+			if (typeof window !== "undefined") window.dispatchEvent(new CustomEvent("absu:post-deleted", { detail: { postId } }));
 			addToast("Post removed", "info");
 		} else addToast(res.error || "Failed to delete post from database.", "warning");
 	};
@@ -47119,7 +47391,7 @@ var AppProvider = ({ children }) => {
 			} else addToast(res.error || "Failed to update profile.", "warning");
 		}
 	};
-	const sendFriendRequest = async (userId) => {
+	const sendFriendRequest = async (userId, userPreview) => {
 		if (!auth.user) {
 			addToast("Sign in to send friend requests.", "warning");
 			return;
@@ -47127,7 +47399,7 @@ var AppProvider = ({ children }) => {
 		if (inFlightFriendRequests.has(userId)) return;
 		setInFlightFriendRequests((prev) => new Set(prev).add(userId));
 		try {
-			const targetUser = users.find((u) => u.id === userId);
+			const targetUser = users.find((u) => u.id === userId) || userPreview;
 			const res = await sendRealFriendRequest(auth.user.id, userId);
 			if (res.success) {
 				createRealNotification({
@@ -47143,10 +47415,18 @@ var AppProvider = ({ children }) => {
 					senderName: currentUser.name,
 					url: "/?view=friends"
 				}).catch(() => {});
-				setUsers((prev) => prev.map((u) => u.id === userId ? {
-					...u,
-					relationshipState: "request_sent"
-				} : u));
+				setSessionSentIds((prev) => new Set(prev).add(userId));
+				setUsers((prev) => {
+					if (prev.some((u) => u.id === userId)) return prev.map((u) => u.id === userId ? {
+						...u,
+						relationshipState: "request_sent"
+					} : u);
+					if (targetUser) return [...prev, {
+						...targetUser,
+						relationshipState: "request_sent"
+					}];
+					return prev;
+				});
 				if (targetUser) {
 					const newReq = {
 						id: res.friendshipId || "req_" + Date.now(),
@@ -47244,6 +47524,11 @@ var AppProvider = ({ children }) => {
 	const cancelFriendRequest = async (userId) => {
 		const req = friendRequests.find((r) => r.user.id === userId && r.type === "sent");
 		if (req) await declineOrCancelFriendRequest(req.id);
+		setSessionSentIds((prev) => {
+			const next = new Set(prev);
+			next.delete(userId);
+			return next;
+		});
 		setUsers((prev) => prev.map((u) => u.id === userId ? {
 			...u,
 			relationshipState: "none"
@@ -47467,6 +47752,10 @@ var AppProvider = ({ children }) => {
 			users,
 			friends,
 			discoverUsers,
+			discoverHasMore,
+			loadingMoreDiscover,
+			discoverTotalCount,
+			loadMoreDiscoverUsers,
 			loadingUsers,
 			friendRequests,
 			friendTab,
@@ -48072,30 +48361,6 @@ var CircleX = createLucideIcon("circle-x", [
 	["path", {
 		d: "m9 9 6 6",
 		key: "z0biqf"
-	}]
-]);
-/**
-* @license lucide-react v0.546.0 - ISC
-*
-* This source code is licensed under the ISC license.
-* See the LICENSE file in the root directory of this source tree.
-*/
-var Clapperboard = createLucideIcon("clapperboard", [
-	["path", {
-		d: "M20.2 6 3 11l-.9-2.4c-.3-1.1.3-2.2 1.3-2.5l13.5-4c1.1-.3 2.2.3 2.5 1.3Z",
-		key: "1tn4o7"
-	}],
-	["path", {
-		d: "m6.2 5.3 3.1 3.9",
-		key: "iuk76l"
-	}],
-	["path", {
-		d: "m12.4 3.4 3.1 4",
-		key: "6hsd6n"
-	}],
-	["path", {
-		d: "M3 11h18v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z",
-		key: "ltgou9"
 	}]
 ]);
 /**
@@ -51133,7 +51398,7 @@ var Avatar = ({ src, name, size = "md", className = "", showOnline = false }) =>
 //#endregion
 //#region src/components/layout/Header.tsx
 var Header = () => {
-	const { currentUser, resolvedTheme, toggleTheme, setSearchOpen, setCreatePostModalOpen, navigateTo, addToast } = useApp();
+	const { currentUser, activeView, unreadNotificationsCount, setSearchOpen, setCreatePostModalOpen, navigateTo, addToast } = useApp();
 	const [profileMenuOpen, setProfileMenuOpen] = (0, import_react.useState)(false);
 	const menuRef = (0, import_react.useRef)(null);
 	(0, import_react.useEffect)(() => {
@@ -51190,12 +51455,15 @@ var Header = () => {
 							children: "Post"
 						})]
 					}),
-					/* @__PURE__ */ (0, import_jsx_runtime.jsx)("button", {
-						onClick: toggleTheme,
-						className: "w-11 h-11 rounded-full flex items-center justify-center text-[var(--color-text-secondary)] hover:text-[var(--color-text-primary)] hover:bg-[var(--color-primary-subtle)]/60 transition-colors",
-						"aria-label": `Switch to ${resolvedTheme === "dark" ? "light" : "dark"} mode`,
-						title: `Switch to ${resolvedTheme === "dark" ? "light" : "dark"} mode`,
-						children: resolvedTheme === "dark" ? /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Sun, { className: "w-5 h-5 text-amber-400" }) : /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Moon, { className: "w-5 h-5 text-violet-700" })
+					/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("button", {
+						onClick: () => navigateTo("alerts"),
+						className: `relative w-11 h-11 rounded-full flex items-center justify-center transition-colors ${activeView === "alerts" ? "bg-[var(--color-primary-subtle)] text-[var(--color-primary)]" : "text-[var(--color-text-secondary)] hover:text-[var(--color-text-primary)] hover:bg-[var(--color-primary-subtle)]/60"}`,
+						"aria-label": unreadNotificationsCount > 0 ? `Alerts (${unreadNotificationsCount} unread)` : "Alerts",
+						title: "Alerts",
+						children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Bell, { className: "w-5 h-5" }), unreadNotificationsCount > 0 && /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
+							className: "absolute top-1.5 right-1.5 bg-[var(--color-badge)] text-white text-[10px] font-bold rounded-full min-w-[17px] h-[17px] flex items-center justify-center px-1 shadow-sm border border-[var(--color-bg-card)] tabular-nums",
+							children: unreadNotificationsCount > 99 ? "99+" : unreadNotificationsCount
+						})]
 					}),
 					/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
 						className: "relative",
@@ -51266,25 +51534,52 @@ var Header = () => {
 	});
 };
 //#endregion
+//#region src/components/common/ReelsIcon.tsx
+/**
+* Modern Reels navigation & feed icon (rounded video frame with angled film-strip header and play glyph)
+*/
+var ReelsIcon = ({ className = "w-5 h-5" }) => /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("svg", {
+	viewBox: "0 0 24 24",
+	fill: "none",
+	stroke: "currentColor",
+	strokeWidth: 2,
+	strokeLinecap: "round",
+	strokeLinejoin: "round",
+	className,
+	"aria-hidden": "true",
+	children: [
+		/* @__PURE__ */ (0, import_jsx_runtime.jsx)("rect", {
+			x: "3",
+			y: "3",
+			width: "18",
+			height: "18",
+			rx: "5"
+		}),
+		/* @__PURE__ */ (0, import_jsx_runtime.jsx)("path", { d: "M3 8.5h18" }),
+		/* @__PURE__ */ (0, import_jsx_runtime.jsx)("path", { d: "M8.5 3l2 5.5" }),
+		/* @__PURE__ */ (0, import_jsx_runtime.jsx)("path", { d: "M14.5 3l2 5.5" }),
+		/* @__PURE__ */ (0, import_jsx_runtime.jsx)("polygon", {
+			points: "10.25 12 15.5 14.75 10.25 17.5",
+			fill: "currentColor",
+			stroke: "none"
+		})
+	]
+});
+//#endregion
 //#region src/components/layout/BottomNav.tsx
 var BottomNav = () => {
-	const { activeTab, activeView, setActiveTab, unreadMessagesCount, unreadNotificationsCount } = useApp();
+	const { activeTab, activeView, setActiveTab, unreadMessagesCount } = useApp();
 	const isReelsMode = activeView === "reels";
 	return /* @__PURE__ */ (0, import_jsx_runtime.jsx)("nav", {
 		className: `md:hidden fixed bottom-0 left-0 right-0 z-40 backdrop-blur-md border-t pb-[env(safe-area-inset-bottom)] transition-colors shadow-lg ${isReelsMode ? "bg-black/95 border-white/15" : "bg-[var(--color-bg-card)]/95 border-[var(--color-border)]"}`,
 		"aria-label": "Mobile Navigation",
 		children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
-			className: "grid grid-cols-6 h-16 max-w-lg mx-auto px-0.5",
+			className: "grid grid-cols-5 h-16 max-w-lg mx-auto px-1",
 			children: [
 				{
 					id: "home",
 					label: "Home",
 					icon: House
-				},
-				{
-					id: "reels",
-					label: "Reels",
-					icon: Clapperboard
 				},
 				{
 					id: "friends",
@@ -51298,10 +51593,9 @@ var BottomNav = () => {
 					badgeCount: unreadMessagesCount
 				},
 				{
-					id: "alerts",
-					label: "Alerts",
-					icon: Bell,
-					badgeCount: unreadNotificationsCount
+					id: "reels",
+					label: "Reels",
+					icon: ReelsIcon
 				},
 				{
 					id: "more",
@@ -51334,17 +51628,12 @@ var BottomNav = () => {
 //#endregion
 //#region src/components/layout/DesktopSidebar.tsx
 var DesktopSidebar = () => {
-	const { activeTab, setActiveTab, currentUser, unreadMessagesCount, unreadNotificationsCount, setCreatePostModalOpen, navigateTo } = useApp();
+	const { activeTab, setActiveTab, currentUser, unreadMessagesCount, setCreatePostModalOpen, navigateTo } = useApp();
 	const navItems = [
 		{
 			id: "home",
 			label: "Home Feed",
 			icon: House
-		},
-		{
-			id: "reels",
-			label: "Reels",
-			icon: Clapperboard
 		},
 		{
 			id: "friends",
@@ -51358,10 +51647,9 @@ var DesktopSidebar = () => {
 			badgeCount: unreadMessagesCount
 		},
 		{
-			id: "alerts",
-			label: "Alerts",
-			icon: Bell,
-			badgeCount: unreadNotificationsCount
+			id: "reels",
+			label: "Reels",
+			icon: ReelsIcon
 		},
 		{
 			id: "more",
@@ -51787,17 +52075,7 @@ async function safeReadAndPrepareVideo(file, options) {
 		};
 		videoEl.src = mem.previewUrl;
 	});
-	if (!metaResult.ok) {
-		URL.revokeObjectURL(mem.previewUrl);
-		return {
-			ok: false,
-			recovery: categorizeMediaError(new Error(metaResult.error || "Video metadata error"), {
-				fileName: file.name,
-				phase: "metadata"
-			})
-		};
-	}
-	if (metaResult.duration > maxDurationSeconds) {
+	if (metaResult.ok && metaResult.duration > maxDurationSeconds) {
 		URL.revokeObjectURL(mem.previewUrl);
 		return {
 			ok: false,
@@ -51809,9 +52087,9 @@ async function safeReadAndPrepareVideo(file, options) {
 		file: mem.file,
 		buffer: mem.buffer,
 		previewUrl: mem.previewUrl,
-		duration: metaResult.duration,
-		width: metaResult.width,
-		height: metaResult.height
+		duration: metaResult.ok && metaResult.duration > 0 ? metaResult.duration : void 0,
+		width: metaResult.ok && metaResult.width > 0 ? metaResult.width : void 0,
+		height: metaResult.ok && metaResult.height > 0 ? metaResult.height : void 0
 	};
 }
 /**
@@ -52641,11 +52919,14 @@ var findNewestCommentByActor$1 = (list, actorId) => {
 	walk(list);
 	return flat.length > 0 ? flat[flat.length - 1] : null;
 };
-var FeedVideoPlayer = ({ src, item }) => {
-	const videoRef = (0, import_react.useRef)(null);
-	const [isPlaying, setIsPlaying] = (0, import_react.useState)(false);
-	const [showControls, setShowControls] = (0, import_react.useState)(false);
-	const [hasError, setHasError] = (0, import_react.useState)(false);
+function formatDurationBadge(seconds) {
+	if (!seconds || !Number.isFinite(seconds) || seconds <= 0) return null;
+	const total = Math.round(seconds);
+	return `${Math.floor(total / 60)}:${(total % 60).toString().padStart(2, "0")}`;
+}
+var FeedReelPreviewCard = ({ src, item, onOpenReel }) => {
+	const [posterFailed, setPosterFailed] = (0, import_react.useState)(false);
+	const [videoPreviewFailed, setVideoPreviewFailed] = (0, import_react.useState)(false);
 	const [retryKey, setRetryKey] = (0, import_react.useState)(0);
 	const deliverySrc = buildCloudinaryVideoDeliveryUrl(src, {
 		trimStart: item?.trim_start,
@@ -52654,62 +52935,79 @@ var FeedVideoPlayer = ({ src, item }) => {
 		aspectRatio: item?.aspect_ratio
 	});
 	const posterSrc = item?.thumbnail_url || buildCloudinaryVideoPosterUrl(src, { timeOffset: item?.trim_start ?? 0 }) || void 0;
-	const isTrimmedClientFallback = !src.includes("/video/upload/") && typeof item?.trim_start === "number" && typeof item?.trim_end === "number" && item.trim_end > item.trim_start;
-	const aspectClass = item?.aspect_ratio === "1:1" ? "aspect-square max-h-[500px]" : item?.aspect_ratio === "9:16" ? "aspect-[9/16] max-h-[520px] mx-auto" : item?.aspect_ratio === "16:9" ? "aspect-video max-h-[500px]" : "max-h-[500px]";
-	const togglePlay = () => {
-		if (!videoRef.current || hasError) return;
-		if (videoRef.current.paused) {
-			if (isTrimmedClientFallback && typeof item?.trim_start === "number" && videoRef.current.currentTime < item.trim_start) videoRef.current.currentTime = item.trim_start;
-			videoRef.current.play().catch(() => {});
-			setIsPlaying(true);
-			setShowControls(true);
-		} else {
-			videoRef.current.pause();
-			setIsPlaying(false);
-		}
-	};
-	if (hasError) return /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-		className: "rounded-2xl bg-neutral-950 p-6 flex flex-col items-center justify-center gap-2.5 text-center min-h-[200px]",
+	const durationLabel = formatDurationBadge(item?.duration_seconds);
+	const aspectClass = item?.aspect_ratio === "1:1" ? "aspect-square max-h-[460px]" : item?.aspect_ratio === "16:9" ? "aspect-video max-h-[440px]" : item?.aspect_ratio === "9:16" ? "aspect-[4/5] max-h-[480px]" : "aspect-[4/5] sm:aspect-video max-h-[460px]";
+	if (videoPreviewFailed && (!posterSrc || posterFailed)) return /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+		className: "rounded-2xl bg-neutral-950 p-6 flex flex-col items-center justify-center gap-2.5 text-center min-h-[220px]",
 		children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", {
 			className: "text-xs font-semibold text-white",
-			children: "Video could not be loaded"
-		}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("button", {
-			type: "button",
-			onClick: () => {
-				setHasError(false);
-				setRetryKey((k) => k + 1);
-			},
-			className: "min-h-[44px] px-3.5 py-1.5 rounded-xl bg-white/15 hover:bg-white/25 text-white text-xs font-semibold flex items-center gap-1.5",
-			children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(RefreshCw, { className: "w-3.5 h-3.5" }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "Retry Video" })]
+			children: "Video preview unavailable"
+		}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+			className: "flex items-center gap-2",
+			children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("button", {
+				type: "button",
+				onClick: () => {
+					setPosterFailed(false);
+					setVideoPreviewFailed(false);
+					setRetryKey((k) => k + 1);
+				},
+				className: "min-h-[44px] px-3.5 py-1.5 rounded-xl bg-white/15 hover:bg-white/25 text-white text-xs font-semibold flex items-center gap-1.5",
+				children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(RefreshCw, { className: "w-3.5 h-3.5" }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "Retry" })]
+			}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("button", {
+				type: "button",
+				onClick: onOpenReel,
+				className: "min-h-[44px] px-4 py-1.5 rounded-xl bg-[var(--color-primary)] hover:bg-[var(--color-primary-hover)] text-white text-xs font-bold flex items-center gap-1.5",
+				children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Play, { className: "w-3.5 h-3.5 fill-current" }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "Watch Reel" })]
+			})]
 		})]
 	});
-	return /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-		className: `relative group rounded-2xl overflow-hidden bg-neutral-950 flex items-center justify-center w-full ${aspectClass}`,
-		children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("video", {
-			ref: videoRef,
-			src: deliverySrc,
-			poster: posterSrc,
-			muted: Boolean(item?.is_muted),
-			playsInline: true,
-			preload: "metadata",
-			controls: showControls,
-			onLoadedMetadata: (e) => {
-				if (isTrimmedClientFallback && typeof item?.trim_start === "number") e.currentTarget.currentTime = item.trim_start;
-			},
-			onTimeUpdate: (e) => {
-				if (isTrimmedClientFallback && typeof item?.trim_end === "number" && e.currentTarget.currentTime >= item.trim_end) e.currentTarget.currentTime = item.trim_start || 0;
-			},
-			onPlay: () => setIsPlaying(true),
-			onPause: () => setIsPlaying(false),
-			onError: () => setHasError(true),
-			className: `w-full h-full ${item?.aspect_ratio && item.aspect_ratio !== "original" ? "object-cover" : "object-contain"} max-h-[500px] rounded-2xl`
-		}, retryKey), !isPlaying && /* @__PURE__ */ (0, import_jsx_runtime.jsx)("button", {
-			type: "button",
-			onClick: togglePlay,
-			className: "absolute inset-0 m-auto w-14 h-14 rounded-full bg-black/60 hover:bg-black/80 text-white flex items-center justify-center backdrop-blur-xs transition-all active:scale-95 z-10 shadow-lg ring-2 ring-white/20",
-			"aria-label": "Play campus video",
-			children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Play, { className: "w-7 h-7 ml-1 fill-white" })
-		})]
+	return /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("button", {
+		type: "button",
+		onClick: onOpenReel,
+		className: `relative group block w-full rounded-2xl overflow-hidden bg-neutral-950 focus:outline-none ${aspectClass}`,
+		"aria-label": "Open video in Reels",
+		children: [
+			posterSrc && !posterFailed ? /* @__PURE__ */ (0, import_jsx_runtime.jsx)("img", {
+				src: posterSrc,
+				alt: "Campus reel thumbnail",
+				referrerPolicy: "no-referrer",
+				loading: "lazy",
+				onError: () => setPosterFailed(true),
+				className: "w-full h-full object-cover transition-transform duration-300 group-hover:scale-[1.02]"
+			}, `poster_${retryKey}`) : /* @__PURE__ */ (0, import_jsx_runtime.jsx)("video", {
+				src: deliverySrc,
+				muted: true,
+				playsInline: true,
+				preload: "metadata",
+				onLoadedMetadata: (e) => {
+					try {
+						const targetTime = typeof item?.trim_start === "number" && item.trim_start > 0 ? item.trim_start : .1;
+						e.currentTarget.currentTime = targetTime;
+					} catch {}
+				},
+				onError: () => setVideoPreviewFailed(true),
+				className: "w-full h-full object-cover pointer-events-none"
+			}, `frame_${retryKey}`),
+			/* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", { className: "pointer-events-none absolute inset-0 bg-gradient-to-t from-black/55 via-black/15 to-black/25 group-hover:via-black/25 transition-colors" }),
+			/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+				className: "pointer-events-none absolute top-3 left-3 flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-black/55 backdrop-blur-xs text-white text-[11px] font-bold border border-white/15",
+				children: [
+					/* @__PURE__ */ (0, import_jsx_runtime.jsx)(ReelsIcon, { className: "w-3.5 h-3.5" }),
+					/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "Reel" }),
+					durationLabel && /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", {
+						className: "text-white/80 tabular-nums",
+						children: ["· ", durationLabel]
+					})
+				]
+			}),
+			/* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
+				className: "pointer-events-none absolute inset-0 flex items-center justify-center",
+				children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
+					className: "w-15 h-15 rounded-full bg-black/60 group-hover:bg-[var(--color-primary)]/90 text-white flex items-center justify-center backdrop-blur-xs transition-all duration-200 group-hover:scale-105 group-active:scale-95 shadow-xl ring-2 ring-white/30",
+					children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Play, { className: "w-7 h-7 ml-1 fill-white" })
+				})
+			})
+		]
 	});
 };
 var PostCard = ({ post, defaultExpandComments = false, highlightCommentId = null, highlightParentCommentId = null, highlightActorId = null, navToken = 0 }) => {
@@ -53264,24 +53562,44 @@ var PostCard = ({ post, defaultExpandComments = false, highlightCommentId = null
 								className: "px-3 py-1 rounded-lg bg-white/15 hover:bg-white/25 text-white text-[11px] font-semibold flex items-center gap-1 disabled:opacity-50",
 								children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(RefreshCw, { className: `w-3 h-3 ${isRetrying ? "animate-spin" : ""}` }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: isRetrying ? "Retrying..." : "Retry" })]
 							})]
-						}) : isVideo ? /* @__PURE__ */ (0, import_jsx_runtime.jsx)("video", {
-							src: buildCloudinaryVideoDeliveryUrl(effectiveUrl, {
-								trimStart: item.trim_start,
-								trimEnd: item.trim_end,
-								isMuted: item.is_muted,
-								aspectRatio: item.aspect_ratio
-							}),
-							poster: item.thumbnail_url || buildCloudinaryVideoPosterUrl(effectiveUrl, { timeOffset: item.trim_start ?? 0 }) || void 0,
-							muted: Boolean(item.is_muted),
-							controls: true,
-							playsInline: true,
-							preload: "metadata",
-							onError: () => setBrokenMediaKeys((prev) => ({
-								...prev,
-								[mediaKey]: true
-							})),
-							className: "w-full h-full object-cover"
-						}, retryCount) : /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("button", {
+						}) : isVideo ? /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("button", {
+							type: "button",
+							onClick: () => navigateTo("reels", { postId: post.id }),
+							className: "w-full h-full relative group block focus:outline-none",
+							"aria-label": "Watch video in Reels",
+							children: [item.thumbnail_url || buildCloudinaryVideoPosterUrl(effectiveUrl, { timeOffset: item.trim_start ?? 0 }) ? /* @__PURE__ */ (0, import_jsx_runtime.jsx)("img", {
+								src: item.thumbnail_url || buildCloudinaryVideoPosterUrl(effectiveUrl, { timeOffset: item.trim_start ?? 0 }) || void 0,
+								alt: `Reel attachment ${idx + 1}`,
+								referrerPolicy: "no-referrer",
+								loading: "lazy",
+								onError: () => setBrokenMediaKeys((prev) => ({
+									...prev,
+									[mediaKey]: true
+								})),
+								className: "w-full h-full object-cover"
+							}, retryCount) : /* @__PURE__ */ (0, import_jsx_runtime.jsx)("video", {
+								src: buildCloudinaryVideoDeliveryUrl(effectiveUrl, {
+									trimStart: item.trim_start,
+									trimEnd: item.trim_end,
+									isMuted: item.is_muted,
+									aspectRatio: item.aspect_ratio
+								}),
+								muted: true,
+								playsInline: true,
+								preload: "metadata",
+								onError: () => setBrokenMediaKeys((prev) => ({
+									...prev,
+									[mediaKey]: true
+								})),
+								className: "w-full h-full object-cover pointer-events-none"
+							}, retryCount), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
+								className: "pointer-events-none absolute inset-0 bg-black/25 group-hover:bg-black/35 flex items-center justify-center transition-colors",
+								children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
+									className: "w-12 h-12 rounded-full bg-black/60 text-white flex items-center justify-center ring-2 ring-white/30",
+									children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Play, { className: "w-5 h-5 ml-0.5 fill-white" })
+								})
+							})]
+						}) : /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("button", {
 							type: "button",
 							onClick: () => setImageLightboxUrl(effectiveUrl),
 							className: "w-full h-full block relative group cursor-zoom-in",
@@ -53312,9 +53630,10 @@ var PostCard = ({ post, defaultExpandComments = false, highlightCommentId = null
 				const isSingleVideo = post.mediaType === "video" || singleItem?.kind === "video" || singleMedia.includes("/video/upload/") || Boolean(singleMedia.match(/\.(mp4|webm|mov|ogg|m4v)(\?.*)?$/i));
 				return /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
 					className: "mt-3 rounded-2xl overflow-hidden border border-[var(--color-border)] bg-black/90",
-					children: isSingleVideo && !isBroken ? /* @__PURE__ */ (0, import_jsx_runtime.jsx)(FeedVideoPlayer, {
+					children: isSingleVideo && !isBroken ? /* @__PURE__ */ (0, import_jsx_runtime.jsx)(FeedReelPreviewCard, {
 						src: singleMedia,
-						item: singleItem
+						item: singleItem,
+						onOpenReel: () => navigateTo("reels", { postId: post.id })
 					}) : isBroken ? /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
 						className: "p-6 text-center flex flex-col items-center justify-center gap-2.5 min-h-[180px]",
 						children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", {
@@ -53568,6 +53887,40 @@ var StoriesBar = ({ currentUserId, currentUserProfile, storyGroups, loading, onS
 };
 //#endregion
 //#region src/lib/storyService.ts
+function encodeBase64Url(input) {
+	const bytes = new TextEncoder().encode(input);
+	let binary = "";
+	for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+	return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+}
+function decodeBase64Url(b64url) {
+	const padded = b64url.replace(/-/g, "+").replace(/_/g, "/") + "===".slice((b64url.length + 3) % 4);
+	const binary = atob(padded);
+	const bytes = new Uint8Array(binary.length);
+	for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+	return new TextDecoder().decode(bytes);
+}
+function encodeOwnerScopedStoryRef(userId, mediaUrl) {
+	if (!mediaUrl) return null;
+	const trimmed = String(mediaUrl).trim();
+	if (!trimmed) return null;
+	if (!trimmed.startsWith("http://") && !trimmed.startsWith("https://")) return trimmed;
+	const extMatch = trimmed.split("?")[0].match(/\.([a-z0-9]{2,5})$/i);
+	const ext = extMatch ? extMatch[1].toLowerCase() : "bin";
+	return `${userId}/cld__${encodeBase64Url(trimmed)}.${ext}`;
+}
+function decodeOwnerScopedStoryRef(ref) {
+	if (!ref) return "";
+	const trimmed = String(ref).trim();
+	const cldMatch = trimmed.match(/^[^/]+\/cld__([A-Za-z0-9_-]+)(?:\.[a-z0-9]+)?$/i);
+	if (cldMatch?.[1]) try {
+		const decoded = decodeBase64Url(cldMatch[1]);
+		if (decoded.startsWith("http://") || decoded.startsWith("https://")) return decoded;
+	} catch {}
+	const directPrefixed = trimmed.match(/^[^/]+\/(https?:\/\/.+)$/i);
+	if (directPrefixed?.[1]) return directPrefixed[1];
+	return trimmed;
+}
 /**
 * Deterministic Story Group Sorting:
 * 1. Current user's own story group first
@@ -53598,6 +53951,13 @@ function sortStoryGroups(groups, currentUserId) {
 */
 async function fetchActiveStories(currentUserId) {
 	try {
+		try {
+			const headers = await getOptionalAuthHeaders();
+			const qs = currentUserId ? `?userId=${encodeURIComponent(currentUserId)}` : "";
+			const apiRes = await fetch(`/api/stories${qs}`, { headers }).catch(() => null);
+			const json = apiRes?.ok ? await parseApiJson$3(apiRes) : null;
+			if (json?.success && Array.isArray(json.groups)) return sortStoryGroups(json.groups, currentUserId);
+		} catch {}
 		const nowIso = (/* @__PURE__ */ new Date()).toISOString();
 		let storiesData = null;
 		let storiesErr = null;
@@ -53620,19 +53980,8 @@ async function fetchActiveStories(currentUserId) {
         created_at,
         expires_at
       `).gt("expires_at", nowIso).is("deleted_at", null).order("created_at", { ascending: true });
-		if (extRes.error && (extRes.error.code === "42703" || extRes.error.code === "PGRST204" || extRes.error.message?.toLowerCase().includes("column"))) {
-			const coreRes = await supabase.from("stories").select(`
-          id,
-          user_id,
-          media_type,
-          storage_path,
-          text_content,
-          caption,
-          background_color,
-          font_style,
-          created_at,
-          expires_at
-        `).gt("expires_at", nowIso).order("created_at", { ascending: true });
+		if (extRes.error && (extRes.error.code === "42703" || extRes.error.code === "PGRST204" || extRes.error.message?.toLowerCase().includes("schema cache") || extRes.error.message?.toLowerCase().includes("column"))) {
+			const coreRes = await supabase.from("stories").select("id, user_id, media_type, storage_path, text_content, caption, created_at, expires_at").gt("expires_at", nowIso).order("created_at", { ascending: true });
 			storiesData = coreRes.data;
 			storiesErr = coreRes.error;
 		} else {
@@ -53640,7 +53989,7 @@ async function fetchActiveStories(currentUserId) {
 			storiesErr = extRes.error;
 		}
 		if (storiesErr || !storiesData || storiesData.length === 0) {
-			if (storiesErr) console.warn("[Stories] Supabase fetch error:", storiesErr.message);
+			if (storiesErr) console.warn("[Stories] Supabase fetch note:", storiesErr.message);
 			return [];
 		}
 		const storyIds = storiesData.map((s) => s.id);
@@ -53657,7 +54006,7 @@ async function fetchActiveStories(currentUserId) {
 		const reactedStorySet = /* @__PURE__ */ new Set();
 		if (reactionsRes.data) for (const r of reactionsRes.data) reactedStorySet.add(r.story_id);
 		const resolvedStories = await Promise.all(storiesData.map(async (row) => {
-			const rawMediaRef = row.media_url || row.storage_path || "";
+			const rawMediaRef = row.media_type === "text" ? "" : decodeOwnerScopedStoryRef(row.media_url || row.storage_path || "");
 			const isDirectUrl = row.provider === "cloudinary" || rawMediaRef.startsWith("https://") || rawMediaRef.startsWith("http://") || rawMediaRef.startsWith("data:");
 			let signedUrl = rawMediaRef;
 			if (rawMediaRef && row.media_type !== "text" && !isDirectUrl) signedUrl = await resolveStoryMediaSignedUrl(rawMediaRef);
@@ -53667,8 +54016,8 @@ async function fetchActiveStories(currentUserId) {
 				id: row.id,
 				user_id: row.user_id,
 				media_type: row.media_type,
-				storage_path: signedUrl,
-				media_url: row.media_url || signedUrl,
+				storage_path: row.media_type === "text" ? null : signedUrl,
+				media_url: row.media_type === "text" ? null : decodeOwnerScopedStoryRef(row.media_url) || signedUrl,
 				provider: row.provider || (signedUrl.includes("res.cloudinary.com") ? "cloudinary" : "supabase"),
 				cloudinary_public_id: row.cloudinary_public_id || null,
 				cloudinary_resource_type: row.cloudinary_resource_type || null,
@@ -53794,10 +54143,49 @@ async function createStory(params) {
 		}
 		onProgress?.("Saving story...");
 		onPercent?.(95);
+		const expiresAt = new Date(Date.now() + 864e5).toISOString();
+		try {
+			const authHeaders = await getOptionalAuthHeaders();
+			const apiRes = await fetch("/api/stories", {
+				method: "POST",
+				headers: {
+					"Content-Type": "application/json",
+					...authHeaders
+				},
+				body: JSON.stringify({
+					userId: effectiveUserId,
+					mediaType,
+					storagePath: resolvedMediaUrl,
+					mediaUrl: resolvedMediaUrl,
+					provider: resolvedMediaUrl ? "cloudinary" : null,
+					cloudinaryPublicId: uploadedPublicId,
+					cloudinaryResourceType: resolvedMediaUrl ? uploadedResourceType : null,
+					durationSeconds,
+					thumbnailUrl,
+					textContent: mediaType === "text" ? textContent?.trim() : null,
+					caption: caption?.trim() || null,
+					backgroundColor: backgroundColor || null,
+					fontStyle: fontStyle || null,
+					expiresAt
+				})
+			}).catch(() => null);
+			const apiJson = apiRes ? await parseApiJson$3(apiRes) : null;
+			if (apiRes && apiRes.ok && apiJson?.success && apiJson.story) {
+				onPercent?.(100);
+				return {
+					success: true,
+					story: {
+						...apiJson.story,
+						has_viewed: true
+					}
+				};
+			}
+		} catch {}
+		const ownerScopedStoragePath = mediaType === "text" ? null : encodeOwnerScopedStoryRef(effectiveUserId, resolvedMediaUrl);
 		const extendedPayload = {
 			user_id: effectiveUserId,
 			media_type: mediaType,
-			storage_path: resolvedMediaUrl,
+			storage_path: ownerScopedStoragePath,
 			media_url: resolvedMediaUrl,
 			provider: resolvedMediaUrl ? "cloudinary" : null,
 			cloudinary_public_id: uploadedPublicId,
@@ -53808,22 +54196,34 @@ async function createStory(params) {
 			text_content: mediaType === "text" ? textContent?.trim() : null,
 			caption: caption?.trim() || null,
 			background_color: backgroundColor || null,
-			font_style: fontStyle || null
+			font_style: fontStyle || null,
+			expires_at: expiresAt
 		};
 		let { data: sbData, error: insertError } = await supabase.from("stories").insert(extendedPayload).select().single();
 		if (insertError && (insertError.code === "42703" || insertError.code === "PGRST204" || insertError.message?.toLowerCase().includes("schema cache") || insertError.message?.toLowerCase().includes("column"))) {
 			const corePayload = {
 				user_id: effectiveUserId,
 				media_type: mediaType,
-				storage_path: resolvedMediaUrl,
+				storage_path: ownerScopedStoragePath,
 				text_content: mediaType === "text" ? textContent?.trim() : null,
 				caption: caption?.trim() || null,
-				background_color: backgroundColor || null,
-				font_style: fontStyle || null
+				expires_at: expiresAt
 			};
 			const fallbackRes = await supabase.from("stories").insert(corePayload).select().single();
 			sbData = fallbackRes.data;
 			insertError = fallbackRes.error;
+		}
+		if (insertError && mediaType === "text" && insertError.message?.toLowerCase().includes("stories_storage_owner_path")) {
+			const textRetryRes = await supabase.from("stories").insert({
+				user_id: effectiveUserId,
+				media_type: mediaType,
+				storage_path: `${effectiveUserId}/text_${Date.now()}.txt`,
+				text_content: textContent?.trim() || null,
+				caption: caption?.trim() || null,
+				expires_at: expiresAt
+			}).select().single();
+			sbData = textRetryRes.data;
+			insertError = textRetryRes.error;
 		}
 		if (insertError || !sbData) {
 			console.error("[Stories] Supabase stories insert error:", insertError?.message);
@@ -53834,17 +54234,18 @@ async function createStory(params) {
 			};
 		}
 		onPercent?.(100);
+		const decodedStoryMediaUrl = mediaType === "text" ? null : resolvedMediaUrl || decodeOwnerScopedStoryRef(sbData.media_url || sbData.storage_path || "");
 		return {
 			success: true,
 			story: {
 				id: sbData.id,
 				user_id: sbData.user_id,
 				media_type: sbData.media_type,
-				storage_path: resolvedMediaUrl || sbData.storage_path || null,
-				media_url: sbData.media_url || resolvedMediaUrl || sbData.storage_path || null,
-				provider: sbData.provider || (resolvedMediaUrl ? "cloudinary" : null),
+				storage_path: decodedStoryMediaUrl,
+				media_url: decodedStoryMediaUrl,
+				provider: sbData.provider || (decodedStoryMediaUrl ? "cloudinary" : null),
 				cloudinary_public_id: sbData.cloudinary_public_id || uploadedPublicId,
-				cloudinary_resource_type: sbData.cloudinary_resource_type || (resolvedMediaUrl ? uploadedResourceType : null),
+				cloudinary_resource_type: sbData.cloudinary_resource_type || (decodedStoryMediaUrl ? uploadedResourceType : null),
 				duration_seconds: sbData.duration_seconds ?? durationSeconds,
 				thumbnail_url: sbData.thumbnail_url ?? thumbnailUrl,
 				text_content: sbData.text_content,
@@ -53870,6 +54271,16 @@ async function createStory(params) {
 async function recordStoryView(storyId, viewerId) {
 	if (!storyId || !viewerId) return;
 	try {
+		const authHeaders = await getOptionalAuthHeaders();
+		const apiRes = await fetch(`/api/stories/${encodeURIComponent(storyId)}/view`, {
+			method: "POST",
+			headers: {
+				"Content-Type": "application/json",
+				...authHeaders
+			},
+			body: JSON.stringify({ viewerId })
+		}).catch(() => null);
+		if ((apiRes?.ok ? await parseApiJson$3(apiRes) : null)?.success) return;
 		const { error } = await supabase.from("story_views").upsert({
 			story_id: storyId,
 			viewer_id: viewerId
@@ -53884,10 +54295,27 @@ async function recordStoryView(storyId, viewerId) {
 	} catch {}
 }
 /**
-* Toggle reaction (like) on a story directly in Supabase `story_reactions`.
+* Toggle reaction (like) on a story via Express API first with Supabase fallback.
 */
 async function toggleStoryReaction(storyId, userId, currentlyLiked) {
 	try {
+		const authHeaders = await getOptionalAuthHeaders();
+		const apiRes = await fetch(`/api/stories/${encodeURIComponent(storyId)}/reaction`, {
+			method: "POST",
+			headers: {
+				"Content-Type": "application/json",
+				...authHeaders
+			},
+			body: JSON.stringify({
+				userId,
+				currentlyLiked
+			})
+		}).catch(() => null);
+		const json = apiRes?.ok ? await parseApiJson$3(apiRes) : null;
+		if (json?.success) return {
+			success: true,
+			liked: Boolean(json.liked)
+		};
 		if (currentlyLiked) {
 			const { error } = await supabase.from("story_reactions").delete().eq("story_id", storyId).eq("user_id", userId);
 			if (error) return {
@@ -53998,6 +54426,13 @@ async function replyToStory(storyId, body, storyOwner) {
 */
 async function fetchStoryInsights(storyId) {
 	try {
+		const authHeaders = await getOptionalAuthHeaders();
+		const apiRes = await fetch(`/api/stories/${encodeURIComponent(storyId)}/insights`, { headers: authHeaders }).catch(() => null);
+		const json = apiRes?.ok ? await parseApiJson$3(apiRes) : null;
+		if (json?.success) return {
+			views: Array.isArray(json.views) ? json.views : [],
+			reactionsCount: Number(json.reactionsCount) || 0
+		};
 		const [viewsRes, reactionsRes] = await Promise.all([supabase.from("story_views").select(`
           id,
           story_id,
@@ -54049,8 +54484,9 @@ async function deleteStory(storyId, storagePath) {
 		const extSel = await supabase.from("stories").select("id, storage_path, media_url, provider, media_type, cloudinary_public_id, cloudinary_resource_type").eq("id", storyId).maybeSingle();
 		if (extSel.error) storyRow = (await supabase.from("stories").select("id, storage_path, media_type").eq("id", storyId).maybeSingle()).data;
 		else storyRow = extSel.data;
-		const mediaRef = storyRow?.media_url || storyRow?.storage_path || storagePath || "";
-		const isCloudinary = storyRow?.provider === "cloudinary" || Boolean(storyRow?.cloudinary_public_id) || String(mediaRef).includes("res.cloudinary.com");
+		const rawStoragePath = storyRow?.storage_path || storagePath || "";
+		const mediaRef = decodeOwnerScopedStoryRef(storyRow?.media_url || rawStoragePath || "");
+		const isCloudinary = storyRow?.provider === "cloudinary" || Boolean(storyRow?.cloudinary_public_id) || String(mediaRef).includes("res.cloudinary.com") || String(rawStoragePath).includes("/cld__");
 		let cloudCleanupSucceeded = true;
 		if (isCloudinary) {
 			const publicId = storyRow?.cloudinary_public_id || extractCloudinaryPublicId(mediaRef);
@@ -54068,12 +54504,18 @@ async function deleteStory(storyId, storagePath) {
 			}).eq("id", storyId);
 			if (!softErr) return { success: true };
 		}
+		const authHeaders = await getOptionalAuthHeaders();
+		const apiDelRes = await fetch(`/api/stories/${encodeURIComponent(storyId)}`, {
+			method: "DELETE",
+			headers: authHeaders
+		}).catch(() => null);
+		if ((apiDelRes?.ok ? await parseApiJson$3(apiDelRes) : null)?.success) return { success: true };
 		const { error } = await supabase.from("stories").delete().eq("id", storyId);
 		if (error) return {
 			success: false,
 			error: error.message
 		};
-		if (!isCloudinary && mediaRef && !mediaRef.startsWith("http")) await deleteStoryMediaFromStorage(mediaRef);
+		if (!isCloudinary && mediaRef && !mediaRef.startsWith("http") && !String(rawStoragePath).match(/\/text_\d+\.txt$/)) await deleteStoryMediaFromStorage(mediaRef);
 		return { success: true };
 	} catch (err) {
 		return {
@@ -54162,6 +54604,13 @@ var CreateStoryModal = ({ isOpen, onClose, userId, onStoryCreated, onShowToast }
 		}
 		setObjectUrl(null);
 	};
+	(0, import_react.useEffect)(() => {
+		if (isOpen) {
+			setRecovery(null);
+			setUploadPercent(null);
+			setProgressMsg("");
+		}
+	}, [isOpen]);
 	(0, import_react.useEffect)(() => {
 		return () => {
 			abortControllerRef.current?.abort();
@@ -54385,7 +54834,7 @@ var CreateStoryModal = ({ isOpen, onClose, userId, onStoryCreated, onShowToast }
 						/* @__PURE__ */ (0, import_jsx_runtime.jsx)("input", {
 							ref: fileInputRef,
 							type: "file",
-							accept: activeTab === "video" ? "video/mp4,video/webm,video/quicktime,video/x-m4v" : "image/*",
+							accept: activeTab === "video" ? "video/*,video/mp4,video/webm,video/quicktime,video/x-m4v" : "image/*",
 							onChange: handleFileSelect,
 							className: "hidden"
 						}),
@@ -55946,7 +56395,7 @@ var ReelsSearchModal = ({ isOpen, initialQuery = "", seedReels, onClose, onSelec
 				}) : results.length === 0 ? /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
 					className: "py-16 text-center flex flex-col items-center justify-center gap-2.5",
 					children: [
-						/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Clapperboard, { className: "w-10 h-10 text-white/40" }),
+						/* @__PURE__ */ (0, import_jsx_runtime.jsx)(ReelsIcon, { className: "w-10 h-10 text-white/40" }),
 						/* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", {
 							className: "text-sm font-bold text-white",
 							children: "No matching video reels found"
@@ -56561,7 +57010,7 @@ var ReelsUploadModal = ({ isOpen, onClose, onPublished }) => {
 					className: "px-4 py-3.5 border-b border-[var(--color-border)] flex items-center justify-between shrink-0",
 					children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
 						className: "flex items-center gap-2",
-						children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Clapperboard, { className: "w-5 h-5 text-[var(--color-primary)]" }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("h2", {
+						children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(ReelsIcon, { className: "w-5 h-5 text-[var(--color-primary)]" }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("h2", {
 							className: "text-base font-extrabold text-[var(--color-text-primary)]",
 							children: "Create Reel"
 						})]
@@ -56864,7 +57313,7 @@ var ReelSlide = ({ post, isActive, shouldPreload, globalMuted, onToggleGlobalMut
 			hasError ? /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
 				className: "flex flex-col items-center justify-center gap-3 text-center px-6",
 				children: [
-					/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Clapperboard, { className: "w-10 h-10 text-white/40" }),
+					/* @__PURE__ */ (0, import_jsx_runtime.jsx)(ReelsIcon, { className: "w-10 h-10 text-white/40" }),
 					/* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", {
 						className: "text-sm font-bold text-white",
 						children: "Video could not be loaded"
@@ -56912,7 +57361,7 @@ var ReelSlide = ({ post, isActive, shouldPreload, globalMuted, onToggleGlobalMut
 				type: "button",
 				onClick: handleTogglePlayPause,
 				"aria-label": isPlaying ? "Pause reel" : "Play reel",
-				className: "absolute inset-0 m-auto w-16 h-16 rounded-full bg-black/50 backdrop-blur-xs text-white flex items-center justify-center pointer-events-none transition-opacity",
+				className: `absolute inset-0 m-auto w-16 h-16 rounded-full bg-black/55 backdrop-blur-xs text-white flex items-center justify-center transition-opacity ${!isPlaying && !isBuffering ? "cursor-pointer ring-2 ring-white/25" : "pointer-events-none"}`,
 				children: isBuffering ? /* @__PURE__ */ (0, import_jsx_runtime.jsx)(LoaderCircle, { className: "w-8 h-8 animate-spin" }) : tapFeedback === "pause" || !isPlaying ? /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Play, { className: "w-8 h-8 fill-white ml-1" }) : /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Pause, { className: "w-8 h-8 fill-white" })
 			}),
 			/* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", { className: "pointer-events-none absolute inset-x-0 bottom-0 h-56 bg-gradient-to-t from-black/85 via-black/45 to-transparent" }),
@@ -57039,9 +57488,11 @@ var ReelSlide = ({ post, isActive, shouldPreload, globalMuted, onToggleGlobalMut
 	});
 };
 var ReelsView = () => {
-	const { currentUser, selectedPostId, selectedPostNavContext, toggleLike, toggleSave, addToast } = useApp();
+	const { currentUser, posts, selectedPostId, selectedPostNavContext, toggleLike, toggleSave, goBack, addToast } = useApp();
 	const containerRef = (0, import_react.useRef)(null);
 	const slideRefs = (0, import_react.useRef)(/* @__PURE__ */ new Map());
+	const postsRef = (0, import_react.useRef)(posts);
+	postsRef.current = posts;
 	const [reels, setReels] = (0, import_react.useState)([]);
 	const [loading, setLoading] = (0, import_react.useState)(true);
 	const [loadingMore, setLoadingMore] = (0, import_react.useState)(false);
@@ -57054,20 +57505,28 @@ var ReelsView = () => {
 	const [searchModalOpen, setSearchModalOpen] = (0, import_react.useState)(false);
 	const [searchSeedQuery, setSearchSeedQuery] = (0, import_react.useState)("");
 	const [uploadModalOpen, setUploadModalOpen] = (0, import_react.useState)(false);
+	const getContextFeedVideos = (0, import_react.useCallback)(() => {
+		return postsRef.current.filter((p) => isVideoPost(p)).map(normalizePostForReels);
+	}, []);
 	const loadInitialReels = (0, import_react.useCallback)(async (focusPostId) => {
 		setLoading(true);
 		try {
 			const page = await fetchReelsFeedPage({
 				currentUserId: currentUser.id || void 0,
-				limit: 10
+				limit: 12
 			});
-			let list = page.reels;
+			const feedVideos = getContextFeedVideos();
+			let list = mergeAndDedupeReels(page.reels, feedVideos);
 			if (focusPostId) {
 				const existingIdx = list.findIndex((p) => p.id === focusPostId);
 				if (existingIdx > 0) list = [list[existingIdx], ...list.filter((p) => p.id !== focusPostId)];
 				else if (existingIdx === -1) {
-					const single = await fetchSingleReelById(focusPostId, currentUser.id || void 0);
-					if (single) list = [single, ...list];
+					const fromContext = feedVideos.find((p) => p.id === focusPostId);
+					if (fromContext) list = [fromContext, ...list];
+					else {
+						const single = await fetchSingleReelById(focusPostId, currentUser.id || void 0);
+						if (single) list = [single, ...list];
+					}
 				}
 			}
 			setReels(list);
@@ -57087,14 +57546,41 @@ var ReelsView = () => {
 		} finally {
 			setLoading(false);
 		}
-	}, [currentUser.id, selectedPostNavContext]);
+	}, [
+		currentUser.id,
+		selectedPostNavContext,
+		getContextFeedVideos
+	]);
 	(0, import_react.useEffect)(() => {
+		setHasSwipedAway(false);
 		loadInitialReels(selectedPostId);
 	}, [
 		currentUser.id,
 		selectedPostId,
 		selectedPostNavContext?.navToken
 	]);
+	(0, import_react.useEffect)(() => {
+		const contextVideos = posts.filter((p) => isVideoPost(p)).map(normalizePostForReels);
+		if (contextVideos.length === 0) return;
+		setReels((prev) => {
+			if (prev.length === 0) {
+				if (selectedPostId) {
+					const focused = contextVideos.find((p) => p.id === selectedPostId);
+					return focused ? [focused, ...contextVideos.filter((p) => p.id !== selectedPostId)] : contextVideos;
+				}
+				return contextVideos;
+			}
+			const existingIds = new Set(prev.map((p) => p.id));
+			const missing = contextVideos.filter((p) => !existingIds.has(p.id));
+			if (missing.length === 0) return prev;
+			const merged = [...prev, ...missing];
+			if (selectedPostId) {
+				const target = merged.find((p) => p.id === selectedPostId);
+				if (target && merged[0]?.id !== selectedPostId) return [target, ...merged.filter((p) => p.id !== selectedPostId)];
+			}
+			return merged;
+		});
+	}, [posts, selectedPostId]);
 	(0, import_react.useEffect)(() => {
 		const handlePostCreated = (evt) => {
 			const created = evt.detail?.post;
@@ -57112,6 +57598,11 @@ var ReelsView = () => {
 				});
 			});
 		};
+		const handlePostDeleted = (evt) => {
+			const deletedId = evt.detail?.postId;
+			if (!deletedId) return;
+			setReels((prev) => prev.filter((p) => p.id !== deletedId));
+		};
 		const handleRefresh = () => {
 			loadInitialReels(null);
 		};
@@ -57124,10 +57615,12 @@ var ReelsView = () => {
 			});
 		};
 		window.addEventListener("absu:post-created", handlePostCreated);
+		window.addEventListener("absu:post-deleted", handlePostDeleted);
 		window.addEventListener("absu:refresh-reels", handleRefresh);
 		window.addEventListener("absu:reels-reset-top", handleResetTop);
 		return () => {
 			window.removeEventListener("absu:post-created", handlePostCreated);
+			window.removeEventListener("absu:post-deleted", handlePostDeleted);
 			window.removeEventListener("absu:refresh-reels", handleRefresh);
 			window.removeEventListener("absu:reels-reset-top", handleResetTop);
 		};
@@ -57289,9 +57782,18 @@ var ReelsView = () => {
 				className: "relative w-full h-full md:max-w-[430px] md:h-[calc(100dvh-6rem)] md:rounded-3xl md:overflow-hidden md:border md:border-[var(--color-border)] md:shadow-2xl bg-black",
 				children: [activeIndex === 0 && !hasSwipedAway && /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
 					className: "absolute top-0 left-0 right-0 z-30 pt-[max(0.75rem,env(safe-area-inset-top))] px-4 pb-8 bg-gradient-to-b from-black/75 via-black/35 to-transparent flex items-center justify-between pointer-events-none",
-					children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("h1", {
-						className: "text-xl font-extrabold tracking-tight text-white drop-shadow-sm pointer-events-auto",
-						children: "Reels"
+					children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+						className: "flex items-center gap-2 pointer-events-auto",
+						children: [selectedPostId && /* @__PURE__ */ (0, import_jsx_runtime.jsx)("button", {
+							type: "button",
+							onClick: goBack,
+							className: "min-w-[44px] min-h-[44px] -ml-2 rounded-full bg-black/35 hover:bg-black/55 backdrop-blur-xs text-white flex items-center justify-center transition-colors",
+							"aria-label": "Back to feed",
+							children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)(ArrowLeft, { className: "w-5 h-5" })
+						}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("h1", {
+							className: "text-xl font-extrabold tracking-tight text-white drop-shadow-sm",
+							children: "Reels"
+						})]
 					}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
 						className: "flex items-center gap-1.5 pointer-events-auto",
 						children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("button", {
@@ -57322,7 +57824,7 @@ var ReelsView = () => {
 					children: [
 						/* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
 							className: "w-16 h-16 rounded-3xl bg-white/10 flex items-center justify-center",
-							children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Clapperboard, { className: "w-8 h-8 text-[var(--color-primary)]" })
+							children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)(ReelsIcon, { className: "w-8 h-8 text-[var(--color-primary)]" })
 						}),
 						/* @__PURE__ */ (0, import_jsx_runtime.jsx)("h2", {
 							className: "text-base font-extrabold",
@@ -57419,7 +57921,8 @@ var ReelsView = () => {
 			}),
 			/* @__PURE__ */ (0, import_jsx_runtime.jsx)(ReelsUploadModal, {
 				isOpen: uploadModalOpen,
-				onClose: () => setUploadModalOpen(false)
+				onClose: () => setUploadModalOpen(false),
+				onPublished: () => loadInitialReels(null)
 			})
 		]
 	});
@@ -57552,12 +58055,17 @@ var PostDetailView = () => {
 //#endregion
 //#region src/components/friends/FriendsView.tsx
 var FriendsView = () => {
-	const { users, friends, discoverUsers: contextDiscoverUsers, currentUser, friendRequests, friendTab, setFriendTab, sendFriendRequest, acceptFriendRequest, declineFriendRequest, removeFriend, startConversationWithUser, navigateTo, goBack, isUserOnline, addToast } = useApp();
+	const { users, friends, discoverUsers: contextDiscoverUsers, discoverHasMore, loadingMoreDiscover, discoverTotalCount, loadMoreDiscoverUsers, blockedUserIds, currentUser, friendRequests, friendTab, setFriendTab, sendFriendRequest, cancelFriendRequest, acceptFriendRequest, declineFriendRequest, removeFriend, startConversationWithUser, navigateTo, goBack, isUserOnline, addToast } = useApp();
 	const { user } = useAuth();
 	const currentUserId = user?.id;
 	const [discoverySearch, setDiscoverySearch] = (0, import_react.useState)("");
 	const [showSearchInput, setShowSearchInput] = (0, import_react.useState)(false);
 	const [dismissedUserIds, setDismissedUserIds] = (0, import_react.useState)([]);
+	const [serverSearchResults, setServerSearchResults] = (0, import_react.useState)([]);
+	const [searchingServer, setSearchingServer] = (0, import_react.useState)(false);
+	const [searchHasMore, setSearchHasMore] = (0, import_react.useState)(false);
+	const [searchNextOffset, setSearchNextOffset] = (0, import_react.useState)(null);
+	const loadMoreSentinelRef = (0, import_react.useRef)(null);
 	const [anonPage, setAnonPage] = (0, import_react.useState)(null);
 	const [followingAnon, setFollowingAnon] = (0, import_react.useState)(false);
 	const [followLoading, setFollowLoading] = (0, import_react.useState)(false);
@@ -57586,17 +58094,120 @@ var FriendsView = () => {
 	const handleDismissUser = (userId) => {
 		setDismissedUserIds((prev) => [...prev, userId]);
 	};
+	(0, import_react.useEffect)(() => {
+		const trimmed = discoverySearch.trim();
+		if (!trimmed) {
+			setServerSearchResults([]);
+			setSearchingServer(false);
+			setSearchHasMore(false);
+			setSearchNextOffset(null);
+			return;
+		}
+		let cancelled = false;
+		setSearchingServer(true);
+		const timer = setTimeout(async () => {
+			try {
+				const page = await fetchDiscoverProfilesPage({
+					currentUserId,
+					offset: 0,
+					limit: 40,
+					search: trimmed,
+					excludeIds: Array.from(blockedUserIds)
+				});
+				if (!cancelled) {
+					setServerSearchResults(page.users);
+					setSearchHasMore(page.hasMore);
+					setSearchNextOffset(page.nextOffset);
+				}
+			} finally {
+				if (!cancelled) setSearchingServer(false);
+			}
+		}, 260);
+		return () => {
+			cancelled = true;
+			clearTimeout(timer);
+		};
+	}, [
+		discoverySearch,
+		currentUserId,
+		blockedUserIds
+	]);
+	const handleLoadMoreSearch = async () => {
+		const trimmed = discoverySearch.trim();
+		if (!trimmed || searchingServer || !searchHasMore || searchNextOffset === null) return;
+		setSearchingServer(true);
+		try {
+			const page = await fetchDiscoverProfilesPage({
+				currentUserId,
+				offset: searchNextOffset,
+				limit: 40,
+				search: trimmed,
+				excludeIds: Array.from(blockedUserIds)
+			});
+			setServerSearchResults((prev) => {
+				const seen = new Set(prev.map((u) => u.id));
+				const appended = page.users.filter((u) => !seen.has(u.id));
+				return [...prev, ...appended];
+			});
+			setSearchHasMore(page.hasMore);
+			setSearchNextOffset(page.nextOffset);
+		} finally {
+			setSearchingServer(false);
+		}
+	};
+	(0, import_react.useEffect)(() => {
+		if (friendTab !== "discover" || discoverySearch.trim() || !discoverHasMore) return;
+		const target = loadMoreSentinelRef.current;
+		if (!target) return;
+		const observer = new IntersectionObserver((entries) => {
+			if (entries.some((e) => e.isIntersecting)) loadMoreDiscoverUsers();
+		}, { rootMargin: "220px" });
+		observer.observe(target);
+		return () => observer.disconnect();
+	}, [
+		friendTab,
+		discoverySearch,
+		discoverHasMore,
+		loadMoreDiscoverUsers
+	]);
 	const myFriends = friends.length > 0 ? friends : users.filter((u) => u.relationshipState === "friends");
 	const receivedReqs = friendRequests.filter((r) => r.type === "received");
-	const discoverUsers = contextDiscoverUsers.filter((u) => {
-		if (EXCLUDED_STUDENT_IDS.includes(u.id) || u.id === "0c3240e3-ae39-461d-bd7a-4963859b9bc7" || u.name.toLowerCase() === "mr anonymous") return false;
-		if (dismissedUserIds.includes(u.id)) return false;
-		if (discoverySearch.trim()) {
-			const q = discoverySearch.toLowerCase();
-			return u.name.toLowerCase().includes(q) || u.department.toLowerCase().includes(q) || u.interests && u.interests.some((i) => i.toLowerCase().includes(q));
+	const friendIdSet = new Set(myFriends.map((f) => f.id));
+	const sentIdSet = new Set(friendRequests.filter((r) => r.type === "sent").map((r) => r.user.id));
+	const receivedReqByUserId = new Map(receivedReqs.map((r) => [r.user.id, r.id]));
+	const hydrateLiveRelationship = (u) => {
+		if (friendIdSet.has(u.id)) return {
+			...u,
+			relationshipState: "friends"
+		};
+		if (sentIdSet.has(u.id)) return {
+			...u,
+			relationshipState: "request_sent"
+		};
+		if (receivedReqByUserId.has(u.id)) return {
+			...u,
+			relationshipState: "request_received"
+		};
+		return u;
+	};
+	const trimmedSearch = discoverySearch.trim();
+	const discoverUsers = (() => {
+		if (trimmedSearch) {
+			const q = trimmedSearch.toLowerCase();
+			const localMatches = users.filter((u) => u.id !== currentUserId && !blockedUserIds.has(u.id) && (u.name.toLowerCase().includes(q) || u.handle && u.handle.toLowerCase().includes(q) || u.department.toLowerCase().includes(q) || u.campus && u.campus.toLowerCase().includes(q) || u.level && u.level.toLowerCase().includes(q) || u.interests && u.interests.some((i) => i.toLowerCase().includes(q))));
+			const mergedMap = /* @__PURE__ */ new Map();
+			for (const u of [...serverSearchResults, ...localMatches]) {
+				if (!u.id || u.id === currentUserId || blockedUserIds.has(u.id) || EXCLUDED_STUDENT_IDS.includes(u.id) || u.id === "0c3240e3-ae39-461d-bd7a-4963859b9bc7" || u.name.toLowerCase() === "mr anonymous" || dismissedUserIds.includes(u.id)) continue;
+				if (!mergedMap.has(u.id)) mergedMap.set(u.id, hydrateLiveRelationship(u));
+			}
+			return Array.from(mergedMap.values());
 		}
-		return true;
-	});
+		return contextDiscoverUsers.filter((u) => {
+			if (EXCLUDED_STUDENT_IDS.includes(u.id) || u.id === "0c3240e3-ae39-461d-bd7a-4963859b9bc7" || u.name.toLowerCase() === "mr anonymous") return false;
+			if (dismissedUserIds.includes(u.id)) return false;
+			return true;
+		}).map(hydrateLiveRelationship);
+	})();
 	const tabs = [
 		{
 			id: "requests",
@@ -57639,14 +58250,27 @@ var FriendsView = () => {
 			}),
 			showSearchInput && /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
 				className: "relative animate-in fade-in duration-150",
-				children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Search, { className: "w-4 h-4 text-[var(--color-text-secondary)] absolute left-3.5 top-1/2 -translate-y-1/2" }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("input", {
-					type: "text",
-					value: discoverySearch,
-					onChange: (e) => setDiscoverySearch(e.target.value),
-					placeholder: "Search students, departments...",
-					autoFocus: true,
-					className: "w-full pl-10 pr-4 py-2.5 bg-[var(--color-bg-card)] border border-[var(--color-border)] rounded-2xl text-xs sm:text-sm text-[var(--color-text-primary)] placeholder:text-[var(--color-text-secondary)] focus:outline-none focus:ring-2 focus:ring-[var(--color-primary)]"
-				})]
+				children: [
+					/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Search, { className: "w-4 h-4 text-[var(--color-text-secondary)] absolute left-3.5 top-1/2 -translate-y-1/2" }),
+					/* @__PURE__ */ (0, import_jsx_runtime.jsx)("input", {
+						type: "text",
+						value: discoverySearch,
+						onChange: (e) => {
+							setDiscoverySearch(e.target.value);
+							if (friendTab !== "discover") setFriendTab("discover");
+						},
+						placeholder: "Search all ABSU students by name, @username, department...",
+						autoFocus: true,
+						className: "w-full pl-10 pr-10 py-2.5 bg-[var(--color-bg-card)] border border-[var(--color-border)] rounded-2xl text-xs sm:text-sm text-[var(--color-text-primary)] placeholder:text-[var(--color-text-secondary)] focus:outline-none focus:ring-2 focus:ring-[var(--color-primary)]"
+					}),
+					discoverySearch && /* @__PURE__ */ (0, import_jsx_runtime.jsx)("button", {
+						type: "button",
+						onClick: () => setDiscoverySearch(""),
+						className: "absolute right-2.5 top-1/2 -translate-y-1/2 p-1.5 rounded-full text-[var(--color-text-secondary)] hover:text-[var(--color-text-primary)]",
+						"aria-label": "Clear student search",
+						children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)(X, { className: "w-4 h-4" })
+					})
+				]
 			}),
 			/* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
 				className: "flex items-center gap-2 overflow-x-auto hide-scrollbar py-1",
@@ -57708,14 +58332,27 @@ var FriendsView = () => {
 							children: followingAnon ? /* @__PURE__ */ (0, import_jsx_runtime.jsxs)(import_jsx_runtime.Fragment, { children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Check, { className: "w-3.5 h-3.5 text-emerald-500" }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "Following" })] }) : /* @__PURE__ */ (0, import_jsx_runtime.jsxs)(import_jsx_runtime.Fragment, { children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Plus, { className: "w-3.5 h-3.5" }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "Follow" })] })
 						})]
 					}),
-					/* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
-						className: "pt-2",
-						children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)("h2", {
+					/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+						className: "pt-2 flex items-center justify-between gap-2",
+						children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("h2", {
 							className: "text-lg font-black text-[var(--color-text-primary)] tracking-tight",
-							children: "People you may know"
-						})
+							children: trimmedSearch ? `Results for "${trimmedSearch}"` : "People you may know"
+						}), !trimmedSearch && discoverTotalCount > discoverUsers.length && /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", {
+							className: "text-xs font-semibold text-[var(--color-text-secondary)] tabular-nums",
+							children: [
+								discoverUsers.length,
+								" of ",
+								discoverTotalCount
+							]
+						})]
 					}),
-					discoverUsers.length === 0 ? /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+					searchingServer && discoverUsers.length === 0 ? /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+						className: "p-8 text-center bg-[var(--color-bg-card)] border border-[var(--color-border)] rounded-2xl flex flex-col items-center justify-center gap-2",
+						children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(LoaderCircle, { className: "w-6 h-6 animate-spin text-[var(--color-primary)]" }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", {
+							className: "text-xs font-semibold text-[var(--color-text-secondary)]",
+							children: "Searching all registered students..."
+						})]
+					}) : discoverUsers.length === 0 ? /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
 						className: "p-8 text-center bg-[var(--color-bg-card)] border border-[var(--color-border)] rounded-2xl",
 						children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", {
 							className: "text-sm font-bold text-[var(--color-text-primary)]",
@@ -57724,87 +58361,126 @@ var FriendsView = () => {
 							className: "text-xs text-[var(--color-text-secondary)] mt-1",
 							children: "You have connected with all recommended peers or no new students match your search."
 						})]
-					}) : /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
+					}) : /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
 						className: "flex flex-col gap-3",
-						children: discoverUsers.map((discovered) => {
-							const isSent = discovered.relationshipState === "request_sent";
-							const onlineNow = isUserOnline(discovered.id);
-							const myDept = (currentUser.department || "").trim().toLowerCase();
-							const myFaculty = (currentUser.faculty || "").trim().toLowerCase();
-							const myLevel = (currentUser.level || "").trim().toLowerCase();
-							const dDept = (discovered.department || "").trim().toLowerCase();
-							const dFaculty = (discovered.faculty || "").trim().toLowerCase();
-							const dLevel = (discovered.level || "").trim().toLowerCase();
-							const sharedInterest = (discovered.interests || []).find((i) => (currentUser.interests || []).some((m) => m.trim().toLowerCase() === i.trim().toLowerCase()));
-							let matchLabel = null;
-							if (myDept && myDept !== "student" && myDept !== "undergraduate" && dDept === myDept) matchLabel = "Same Department";
-							else if (myFaculty && myFaculty !== "abia state university" && dFaculty === myFaculty) matchLabel = "Same Faculty";
-							else if (myLevel && dLevel === myLevel) matchLabel = "Same Level";
-							else if (sharedInterest) matchLabel = `Shared: ${sharedInterest}`;
-							return /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-								className: "p-3.5 bg-[var(--color-bg-card)] border border-[var(--color-border)] rounded-2xl shadow-xs flex items-center justify-between gap-3 transition-colors hover:border-[var(--color-primary)]/40",
-								children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-									onClick: () => navigateTo("user-profile", { userId: discovered.id }),
-									className: "flex items-center gap-3.5 min-w-0 cursor-pointer flex-1 group",
-									children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
-										className: "relative shrink-0",
-										children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Avatar, {
-											src: discovered.avatar,
-											name: discovered.name,
-											size: "lg",
-											showOnline: onlineNow
-										})
-									}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-										className: "min-w-0 flex-1",
-										children: [
-											/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-												className: "flex items-center gap-2 flex-wrap",
-												children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", {
-													className: "font-extrabold text-sm sm:text-base text-[var(--color-text-primary)] group-hover:text-[var(--color-primary)] transition-colors truncate",
-													children: discovered.name
-												}), onlineNow && /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", {
-													className: "inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-emerald-500/15 text-emerald-600 dark:text-emerald-400 text-[10px] font-bold shrink-0",
-													children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { className: "w-1.5 h-1.5 rounded-full bg-emerald-500" }), "Online now"]
-												})]
-											}),
-											/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("p", {
-												className: "text-xs text-[var(--color-text-secondary)] truncate",
-												children: [
-													discovered.department,
-													" · ",
-													discovered.level
-												]
-											}),
-											/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-												className: "flex items-center gap-2 flex-wrap mt-0.5",
-												children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
-													className: "text-[11px] font-medium text-[var(--color-primary)] truncate",
-													children: discovered.campus
-												}), matchLabel && /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", {
-													className: "inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-[var(--color-primary-subtle)] text-[var(--color-primary)] text-[10px] font-bold",
-													children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Sparkles, { className: "w-2.5 h-2.5" }), matchLabel]
-												})]
+						children: [
+							discoverUsers.map((discovered) => {
+								const isFriend = discovered.relationshipState === "friends";
+								const isSent = discovered.relationshipState === "request_sent";
+								const isReceived = discovered.relationshipState === "request_received";
+								const incomingRequestId = receivedReqByUserId.get(discovered.id);
+								const onlineNow = isUserOnline(discovered.id);
+								const myDept = (currentUser.department || "").trim().toLowerCase();
+								const myFaculty = (currentUser.faculty || "").trim().toLowerCase();
+								const myLevel = (currentUser.level || "").trim().toLowerCase();
+								const dDept = (discovered.department || "").trim().toLowerCase();
+								const dFaculty = (discovered.faculty || "").trim().toLowerCase();
+								const dLevel = (discovered.level || "").trim().toLowerCase();
+								const sharedInterest = (discovered.interests || []).find((i) => (currentUser.interests || []).some((m) => m.trim().toLowerCase() === i.trim().toLowerCase()));
+								let matchLabel = null;
+								if (myDept && myDept !== "student" && myDept !== "undergraduate" && dDept === myDept) matchLabel = "Same Department";
+								else if (myFaculty && myFaculty !== "abia state university" && dFaculty === myFaculty) matchLabel = "Same Faculty";
+								else if (myLevel && dLevel === myLevel) matchLabel = "Same Level";
+								else if (sharedInterest) matchLabel = `Shared: ${sharedInterest}`;
+								return /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+									className: "p-3.5 bg-[var(--color-bg-card)] border border-[var(--color-border)] rounded-2xl shadow-xs flex items-center justify-between gap-3 transition-colors hover:border-[var(--color-primary)]/40",
+									children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+										onClick: () => navigateTo("user-profile", { userId: discovered.id }),
+										className: "flex items-center gap-3.5 min-w-0 cursor-pointer flex-1 group",
+										children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
+											className: "relative shrink-0",
+											children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Avatar, {
+												src: discovered.avatar,
+												name: discovered.name,
+												size: "lg",
+												showOnline: onlineNow
 											})
-										]
+										}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+											className: "min-w-0 flex-1",
+											children: [
+												/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+													className: "flex items-center gap-2 flex-wrap",
+													children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", {
+														className: "font-extrabold text-sm sm:text-base text-[var(--color-text-primary)] group-hover:text-[var(--color-primary)] transition-colors truncate",
+														children: discovered.name
+													}), onlineNow && /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", {
+														className: "inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-emerald-500/15 text-emerald-600 dark:text-emerald-400 text-[10px] font-bold shrink-0",
+														children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { className: "w-1.5 h-1.5 rounded-full bg-emerald-500" }), "Online now"]
+													})]
+												}),
+												/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("p", {
+													className: "text-xs text-[var(--color-text-secondary)] truncate",
+													children: [
+														discovered.department,
+														" · ",
+														discovered.level
+													]
+												}),
+												/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+													className: "flex items-center gap-2 flex-wrap mt-0.5",
+													children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
+														className: "text-[11px] font-medium text-[var(--color-primary)] truncate",
+														children: discovered.campus
+													}), matchLabel && /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", {
+														className: "inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-[var(--color-primary-subtle)] text-[var(--color-primary)] text-[10px] font-bold",
+														children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Sparkles, { className: "w-2.5 h-2.5" }), matchLabel]
+													})]
+												})
+											]
+										})]
+									}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+										className: "flex flex-col sm:flex-row items-center gap-1.5 shrink-0",
+										children: [isFriend ? /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", {
+											className: "min-h-[38px] py-2 px-3.5 rounded-xl bg-[var(--color-success)]/10 text-[var(--color-success)] text-xs font-bold flex items-center gap-1.5",
+											children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Check, { className: "w-3.5 h-3.5" }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "Friends" })]
+										}) : isReceived && incomingRequestId ? /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("button", {
+											type: "button",
+											onClick: () => acceptFriendRequest(incomingRequestId),
+											className: "w-full sm:w-auto min-h-[38px] py-2 px-4 rounded-xl bg-[var(--color-primary)] hover:bg-[var(--color-primary-hover)] text-white text-xs font-bold shadow-xs transition-transform active:scale-95 flex items-center justify-center gap-1",
+											children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Check, { className: "w-3.5 h-3.5" }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "Confirm" })]
+										}) : isSent ? /* @__PURE__ */ (0, import_jsx_runtime.jsx)("button", {
+											type: "button",
+											onClick: () => cancelFriendRequest(discovered.id),
+											className: "w-full sm:w-auto min-h-[38px] py-2 px-3.5 rounded-xl bg-[var(--color-bg-main)] border border-[var(--color-border)] hover:border-[var(--color-error)]/40 text-xs font-semibold text-[var(--color-text-secondary)] transition-colors",
+											title: "Cancel sent request",
+											children: "Request Sent"
+										}) : /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("button", {
+											type: "button",
+											onClick: () => sendFriendRequest(discovered.id, discovered),
+											className: "w-full sm:w-auto min-h-[38px] py-2 px-4 rounded-xl bg-[var(--color-primary)] hover:bg-[var(--color-primary-hover)] text-white text-xs font-bold shadow-xs transition-transform active:scale-95 flex items-center justify-center gap-1",
+											children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(UserPlus, { className: "w-3.5 h-3.5" }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "Add friend" })]
+										}), !isFriend && /* @__PURE__ */ (0, import_jsx_runtime.jsx)("button", {
+											type: "button",
+											onClick: () => handleDismissUser(discovered.id),
+											className: "w-full sm:w-auto min-h-[38px] py-2 px-3 rounded-xl bg-[var(--color-bg-main)] border border-[var(--color-border)] hover:bg-[var(--color-border)]/50 text-[var(--color-text-secondary)] text-xs font-semibold transition-colors",
+											title: "Remove suggestion",
+											children: "Remove"
+										})]
 									})]
-								}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
-									className: "flex flex-col sm:flex-row items-center gap-1.5 shrink-0",
-									children: [isSent ? /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
-										className: "py-2 px-3.5 rounded-xl bg-[var(--color-bg-main)] border border-[var(--color-border)] text-xs font-semibold text-[var(--color-text-secondary)]",
-										children: "Request Sent"
-									}) : /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("button", {
-										onClick: () => sendFriendRequest(discovered.id),
-										className: "w-full sm:w-auto py-2 px-4 rounded-xl bg-[var(--color-primary)] hover:bg-[var(--color-primary-hover)] text-white text-xs font-bold shadow-xs transition-transform active:scale-95 flex items-center justify-center gap-1",
-										children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(UserPlus, { className: "w-3.5 h-3.5" }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "Add friend" })]
-									}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("button", {
-										onClick: () => handleDismissUser(discovered.id),
-										className: "w-full sm:w-auto py-2 px-3 rounded-xl bg-[var(--color-bg-main)] border border-[var(--color-border)] hover:bg-[var(--color-border)]/50 text-[var(--color-text-secondary)] text-xs font-semibold transition-colors",
-										title: "Remove suggestion",
-										children: "Remove"
-									})]
-								})]
-							}, discovered.id);
-						})
+								}, discovered.id);
+							}),
+							!trimmedSearch && discoverHasMore && /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
+								ref: loadMoreSentinelRef,
+								className: "pt-2 flex justify-center",
+								children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)("button", {
+									type: "button",
+									disabled: loadingMoreDiscover,
+									onClick: loadMoreDiscoverUsers,
+									className: "min-h-[44px] px-5 py-2.5 rounded-2xl bg-[var(--color-bg-card)] border border-[var(--color-border)] hover:border-[var(--color-primary)] text-xs font-bold text-[var(--color-text-primary)] flex items-center gap-2 transition-colors disabled:opacity-60",
+									children: loadingMoreDiscover ? /* @__PURE__ */ (0, import_jsx_runtime.jsxs)(import_jsx_runtime.Fragment, { children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(LoaderCircle, { className: "w-4 h-4 animate-spin text-[var(--color-primary)]" }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "Loading more students..." })] }) : /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "Load More Students" })
+								})
+							}),
+							trimmedSearch && searchHasMore && /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
+								className: "pt-2 flex justify-center",
+								children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)("button", {
+									type: "button",
+									disabled: searchingServer,
+									onClick: handleLoadMoreSearch,
+									className: "min-h-[44px] px-5 py-2.5 rounded-2xl bg-[var(--color-bg-card)] border border-[var(--color-border)] hover:border-[var(--color-primary)] text-xs font-bold text-[var(--color-text-primary)] flex items-center gap-2 transition-colors disabled:opacity-60",
+									children: searchingServer ? /* @__PURE__ */ (0, import_jsx_runtime.jsxs)(import_jsx_runtime.Fragment, { children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(LoaderCircle, { className: "w-4 h-4 animate-spin text-[var(--color-primary)]" }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "Searching..." })] }) : /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "Load More Search Results" })
+								})
+							})
+						]
 					})
 				]
 			}),
@@ -64334,7 +65010,7 @@ var ProfileView = ({ isAnotherUser = false }) => {
 							type: "button",
 							onClick: () => setSavedFilter("reels"),
 							className: `min-h-[38px] px-3.5 rounded-xl text-xs font-bold transition-colors flex items-center gap-1.5 ${savedFilter === "reels" ? "bg-[var(--color-primary)] text-white" : "text-[var(--color-text-secondary)] hover:text-[var(--color-text-primary)]"}`,
-							children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Clapperboard, { className: "w-3.5 h-3.5" }), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", { children: [
+							children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(ReelsIcon, { className: "w-3.5 h-3.5" }), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", { children: [
 								"Saved Reels (",
 								mySavedReels.length,
 								")"
@@ -64349,7 +65025,7 @@ var ProfileView = ({ isAnotherUser = false }) => {
 					children: [
 						/* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
 							className: "w-11 h-11 rounded-2xl bg-[var(--color-bg-main)] border border-[var(--color-border)] flex items-center justify-center text-[var(--color-text-secondary)]",
-							children: savedFilter === "reels" ? /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Clapperboard, { className: "w-5 h-5" }) : /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Bookmark, { className: "w-5 h-5" })
+							children: savedFilter === "reels" ? /* @__PURE__ */ (0, import_jsx_runtime.jsx)(ReelsIcon, { className: "w-5 h-5" }) : /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Bookmark, { className: "w-5 h-5" })
 						}),
 						/* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", {
 							className: "text-sm font-bold text-[var(--color-text-primary)]",
@@ -64363,7 +65039,7 @@ var ProfileView = ({ isAnotherUser = false }) => {
 							type: "button",
 							onClick: () => navigateTo("reels"),
 							className: "mt-1 min-h-[40px] px-4 rounded-xl bg-[var(--color-primary)] text-white text-xs font-bold flex items-center gap-1.5",
-							children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Clapperboard, { className: "w-3.5 h-3.5" }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "Explore Reels" })]
+							children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(ReelsIcon, { className: "w-3.5 h-3.5" }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "Explore Reels" })]
 						})
 					]
 				}) : displayedSavedPosts.map((post) => {
@@ -64374,12 +65050,12 @@ var ProfileView = ({ isAnotherUser = false }) => {
 							className: "flex items-center justify-between px-3 py-2 rounded-xl bg-[var(--color-bg-card)] border border-[var(--color-border)]",
 							children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", {
 								className: "text-[11px] font-bold text-[var(--color-text-secondary)] flex items-center gap-1.5",
-								children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Clapperboard, { className: "w-3.5 h-3.5 text-[var(--color-primary)]" }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "Saved Video Reel" })]
+								children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(ReelsIcon, { className: "w-3.5 h-3.5 text-[var(--color-primary)]" }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "Saved Video Reel" })]
 							}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("button", {
 								type: "button",
 								onClick: () => navigateTo("reels", { postId: post.id }),
 								className: "min-h-[36px] px-3 py-1 rounded-lg bg-[var(--color-primary)] hover:bg-[var(--color-primary-hover)] text-white text-xs font-bold flex items-center gap-1.5",
-								children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Clapperboard, { className: "w-3.5 h-3.5" }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "Watch in Reels" })]
+								children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(ReelsIcon, { className: "w-3.5 h-3.5" }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "Watch in Reels" })]
 							})]
 						}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)(PostCard, { post })]
 					}, post.id);
@@ -65432,13 +66108,18 @@ var SettingsView = () => {
 								if (!user) return;
 								setTestPushLoading(true);
 								try {
-									const [webRes, fcmRes] = await Promise.all([sendTestNotification(user.id, currentUser.name), sendDiagnosticFcmTest(user.id)]);
+									const webRes = await sendTestNotification(user.id, currentUser.name);
+									const fcmRes = webRes.ranFcmFallback ? {
+										success: webRes.success,
+										message: webRes.message,
+										sent: webRes.sent ?? 0
+									} : await sendDiagnosticFcmTest(user.id);
 									setFcmStatusNote(fcmRes.message);
 									await loadPushDiagnostics();
 									refreshNotifications();
 									if (fcmRes.success && (fcmRes.sent ?? 0) > 0) addToast(`🎉 ${fcmRes.message}`, "success");
 									else if (webRes.pushDelivered) addToast("🎉 Web Push delivered! See FCM Status above for Edge Function details.", "success");
-									else addToast(fcmRes.message || "Alert added to inbox; push not delivered (see FCM Status).", "warning");
+									else addToast(fcmRes.message || "Alert added to inbox; check FCM Status for device delivery details.", "info");
 								} finally {
 									setTestPushLoading(false);
 								}
@@ -65819,7 +66500,7 @@ var SavedPostsView = () => {
 						type: "button",
 						onClick: () => setFilterTab("reels"),
 						className: `min-h-[44px] px-4 text-xs font-bold border-b-2 transition-colors flex items-center gap-1.5 ${filterTab === "reels" ? "border-[var(--color-primary)] text-[var(--color-primary)]" : "border-transparent text-[var(--color-text-secondary)] hover:text-[var(--color-text-primary)]"}`,
-						children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Clapperboard, { className: "w-3.5 h-3.5" }), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", { children: [
+						children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(ReelsIcon, { className: "w-3.5 h-3.5" }), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", { children: [
 							"Saved Reels (",
 							savedReels.length,
 							")"
@@ -65835,7 +66516,7 @@ var SavedPostsView = () => {
 				children: [
 					/* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
 						className: "w-12 h-12 rounded-2xl bg-[var(--color-bg-main)] border border-[var(--color-border)] flex items-center justify-center text-[var(--color-text-secondary)]",
-						children: filterTab === "reels" ? /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Clapperboard, { className: "w-6 h-6" }) : /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Bookmark, { className: "w-6 h-6" })
+						children: filterTab === "reels" ? /* @__PURE__ */ (0, import_jsx_runtime.jsx)(ReelsIcon, { className: "w-6 h-6" }) : /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Bookmark, { className: "w-6 h-6" })
 					}),
 					/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("h3", {
 						className: "text-sm font-bold text-[var(--color-text-primary)]",
@@ -65848,7 +66529,7 @@ var SavedPostsView = () => {
 						type: "button",
 						onClick: () => navigateTo(filterTab === "reels" ? "reels" : "home"),
 						className: "mt-2 min-h-[44px] px-4 py-2 rounded-xl bg-[var(--color-primary)] text-white text-xs font-bold hover:bg-[var(--color-primary-hover)] transition-all flex items-center gap-1.5",
-						children: filterTab === "reels" ? /* @__PURE__ */ (0, import_jsx_runtime.jsxs)(import_jsx_runtime.Fragment, { children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Clapperboard, { className: "w-3.5 h-3.5" }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "Explore Reels" })] }) : /* @__PURE__ */ (0, import_jsx_runtime.jsxs)(import_jsx_runtime.Fragment, { children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Sparkles, { className: "w-3.5 h-3.5" }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "Explore Campus Feed" })] })
+						children: filterTab === "reels" ? /* @__PURE__ */ (0, import_jsx_runtime.jsxs)(import_jsx_runtime.Fragment, { children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(ReelsIcon, { className: "w-3.5 h-3.5" }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "Explore Reels" })] }) : /* @__PURE__ */ (0, import_jsx_runtime.jsxs)(import_jsx_runtime.Fragment, { children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Sparkles, { className: "w-3.5 h-3.5" }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "Explore Campus Feed" })] })
 					})
 				]
 			}) : /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
@@ -65861,12 +66542,12 @@ var SavedPostsView = () => {
 							className: "flex items-center justify-between px-3 py-2 rounded-xl bg-[var(--color-bg-card)] border border-[var(--color-border)]",
 							children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", {
 								className: "text-[11px] font-bold text-[var(--color-text-secondary)] flex items-center gap-1.5",
-								children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Clapperboard, { className: "w-3.5 h-3.5 text-[var(--color-primary)]" }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "Saved Video Reel" })]
+								children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(ReelsIcon, { className: "w-3.5 h-3.5 text-[var(--color-primary)]" }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "Saved Video Reel" })]
 							}), /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("button", {
 								type: "button",
 								onClick: () => navigateTo("reels", { postId: post.id }),
 								className: "min-h-[36px] px-3 py-1 rounded-lg bg-[var(--color-primary)] hover:bg-[var(--color-primary-hover)] text-white text-xs font-bold flex items-center gap-1.5 transition-all active:scale-95",
-								children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(Clapperboard, { className: "w-3.5 h-3.5" }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "Watch in Reels" })]
+								children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)(ReelsIcon, { className: "w-3.5 h-3.5" }), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: "Watch in Reels" })]
 							})]
 						}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)(PostCard, { post })]
 					}, post.id);
@@ -71976,7 +72657,12 @@ var AppContent = () => {
 	import_react.useLayoutEffect(() => {
 		const el = mainScrollRef.current;
 		if (!el) return;
-		el.scrollTop = scrollPositionsRef.current.get(viewScrollKey) ?? 0;
+		const savedTop = scrollPositionsRef.current.get(viewScrollKey) ?? 0;
+		el.scrollTop = savedTop;
+		const rafId = requestAnimationFrame(() => {
+			if (mainScrollRef.current && viewScrollKeyRef.current === viewScrollKey) mainScrollRef.current.scrollTop = savedTop;
+		});
+		return () => cancelAnimationFrame(rafId);
 	}, [viewScrollKey]);
 	const handleMainScroll = import_react.useCallback(() => {
 		const el = mainScrollRef.current;

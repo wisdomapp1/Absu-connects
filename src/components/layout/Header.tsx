@@ -3,13 +3,13 @@ import { useApp } from '../../context/AppContext.tsx';
 import { useAuth } from '../../context/AuthContext.tsx';
 import { Avatar } from '../common/Avatar.tsx';
 import { BrandLogo } from '../common/BrandLogo.tsx';
-import { Search, Plus, Sun, Moon, User as UserIcon, Settings, LogOut, Sparkles } from 'lucide-react';
+import { Search, Plus, Bell, User as UserIcon, Settings, LogOut, Sparkles } from 'lucide-react';
 
 export const Header: React.FC = () => {
   const {
     currentUser,
-    resolvedTheme,
-    toggleTheme,
+    activeView,
+    unreadNotificationsCount,
     setSearchOpen,
     setCreatePostModalOpen,
     navigateTo,
@@ -60,7 +60,7 @@ export const Header: React.FC = () => {
           </div>
         </button>
 
-        {/* Right Action Controls: Search, Create Post, Theme Toggle, Profile Menu */}
+        {/* Right Action Controls: Search, Create Post, Alerts Bell, Profile Menu */}
         <div className="flex items-center gap-0.5 sm:gap-2 shrink-0">
           {/* Quick Search trigger */}
           <button
@@ -83,17 +83,26 @@ export const Header: React.FC = () => {
             <span className="hidden sm:inline font-semibold">Post</span>
           </button>
 
-          {/* Theme Quick Toggle */}
+          {/* Alerts / Notifications Bell Button */}
           <button
-            onClick={toggleTheme}
-            className="w-11 h-11 rounded-full flex items-center justify-center text-[var(--color-text-secondary)] hover:text-[var(--color-text-primary)] hover:bg-[var(--color-primary-subtle)]/60 transition-colors"
-            aria-label={`Switch to ${resolvedTheme === 'dark' ? 'light' : 'dark'} mode`}
-            title={`Switch to ${resolvedTheme === 'dark' ? 'light' : 'dark'} mode`}
+            onClick={() => navigateTo('alerts')}
+            className={`relative w-11 h-11 rounded-full flex items-center justify-center transition-colors ${
+              activeView === 'alerts'
+                ? 'bg-[var(--color-primary-subtle)] text-[var(--color-primary)]'
+                : 'text-[var(--color-text-secondary)] hover:text-[var(--color-text-primary)] hover:bg-[var(--color-primary-subtle)]/60'
+            }`}
+            aria-label={
+              unreadNotificationsCount > 0
+                ? `Alerts (${unreadNotificationsCount} unread)`
+                : 'Alerts'
+            }
+            title="Alerts"
           >
-            {resolvedTheme === 'dark' ? (
-              <Sun className="w-5 h-5 text-amber-400" />
-            ) : (
-              <Moon className="w-5 h-5 text-violet-700" />
+            <Bell className="w-5 h-5" />
+            {unreadNotificationsCount > 0 && (
+              <span className="absolute top-1.5 right-1.5 bg-[var(--color-badge)] text-white text-[10px] font-bold rounded-full min-w-[17px] h-[17px] flex items-center justify-center px-1 shadow-sm border border-[var(--color-bg-card)] tabular-nums">
+                {unreadNotificationsCount > 99 ? '99+' : unreadNotificationsCount}
+              </span>
             )}
           </button>
 

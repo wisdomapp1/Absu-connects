@@ -390,18 +390,7 @@ export async function safeReadAndPrepareVideo(
     videoEl.src = mem.previewUrl;
   });
 
-  if (!metaResult.ok) {
-    URL.revokeObjectURL(mem.previewUrl);
-    return {
-      ok: false,
-      recovery: categorizeMediaError(new Error(metaResult.error || 'Video metadata error'), {
-        fileName: file.name,
-        phase: 'metadata',
-      }),
-    };
-  }
-
-  if (metaResult.duration > maxDurationSeconds) {
+  if (metaResult.ok && metaResult.duration > maxDurationSeconds) {
     URL.revokeObjectURL(mem.previewUrl);
     return {
       ok: false,
@@ -419,9 +408,9 @@ export async function safeReadAndPrepareVideo(
     file: mem.file,
     buffer: mem.buffer,
     previewUrl: mem.previewUrl,
-    duration: metaResult.duration,
-    width: metaResult.width,
-    height: metaResult.height,
+    duration: metaResult.ok && metaResult.duration > 0 ? metaResult.duration : undefined,
+    width: metaResult.ok && metaResult.width > 0 ? metaResult.width : undefined,
+    height: metaResult.ok && metaResult.height > 0 ? metaResult.height : undefined,
   };
 }
 

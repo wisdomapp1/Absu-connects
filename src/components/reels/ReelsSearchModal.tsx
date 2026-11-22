@@ -8,7 +8,8 @@ import {
 } from '../../lib/reelsService.ts';
 import { buildCloudinaryVideoPosterUrl } from '../../lib/cloudinaryService.ts';
 import { Avatar } from '../common/Avatar.tsx';
-import { ArrowLeft, Clapperboard, Heart, Play, Search, X } from 'lucide-react';
+import { ReelsIcon } from '../common/ReelsIcon.tsx';
+import { ArrowLeft, Heart, Play, Search, X } from 'lucide-react';
 
 interface ReelsSearchModalProps {
   isOpen: boolean;
@@ -153,7 +154,7 @@ export const ReelsSearchModal: React.FC<ReelsSearchModalProps> = ({
           </div>
         ) : results.length === 0 ? (
           <div className="py-16 text-center flex flex-col items-center justify-center gap-2.5">
-            <Clapperboard className="w-10 h-10 text-white/40" />
+            <ReelsIcon className="w-10 h-10 text-white/40" />
             <p className="text-sm font-bold text-white">No matching video reels found</p>
             <p className="text-xs text-white/60 max-w-xs">
               Try a different keyword, creator username, or #hashtag. Only published video posts appear in Reels search.

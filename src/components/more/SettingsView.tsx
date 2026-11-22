@@ -660,10 +660,15 @@ export const SettingsView: React.FC = () => {
               if (!user) return;
               setTestPushLoading(true);
               try {
-                const [webRes, fcmRes] = await Promise.all([
-                  sendTestNotification(user.id, currentUser.name),
-                  sendDiagnosticFcmTest(user.id),
-                ]);
+                const webRes = await sendTestNotification(user.id, currentUser.name);
+                const fcmRes = webRes.ranFcmFallback
+                  ? {
+                      success: webRes.success,
+                      message: webRes.message,
+                      sent: webRes.sent ?? 0,
+                    }
+                  : await sendDiagnosticFcmTest(user.id);
+
                 setFcmStatusNote(fcmRes.message);
                 await loadPushDiagnostics();
                 refreshNotifications();
@@ -673,7 +678,7 @@ export const SettingsView: React.FC = () => {
                 } else if (webRes.pushDelivered) {
                   addToast('🎉 Web Push delivered! See FCM Status above for Edge Function details.', 'success');
                 } else {
-                  addToast(fcmRes.message || 'Alert added to inbox; push not delivered (see FCM Status).', 'warning');
+                  addToast(fcmRes.message || 'Alert added to inbox; check FCM Status for device delivery details.', 'info');
                 }
               } finally {
                 setTestPushLoading(false);

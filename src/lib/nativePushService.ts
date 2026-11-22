@@ -734,26 +734,33 @@ export async function sendDiagnosticFcmTest(userId: string): Promise<{
   }
 
   try {
-    let initNote = '';
+    let webSyncNote = '';
     if (isNativeAndroidApp()) {
       await initNativePush(userId).catch(() => {});
     } else {
       const webInit = await initWebFirebasePush(userId);
-      if (!webInit.success && webInit.reason) {
-        initNote = ` [Web Token Sync: ${webInit.reason}]`;
+      if (!webInit.success && webInit.reason && webInit.reason !== 'firebase-web-not-configured') {
+        webSyncNote = ` [Web Token Sync: ${webInit.reason}]`;
       }
     }
+
+    const { data: sessionData } = await supabase.auth.getSession();
+    const accessToken = sessionData?.session?.access_token;
 
     const testEntityId =
       '00000000-0000-4000-8000-' + Math.random().toString(16).slice(2, 14).padEnd(12, '0');
 
-    // 1. Create test notification via server endpoint if available, otherwise fall back to Supabase client insert (for Vercel static / Capacitor APK)
+    // 1. Create test notification via server endpoint if available, otherwise fall back to Supabase client insert
     let notifCreated = false;
     let createErrorDetail = '';
     try {
+      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+      if (accessToken) {
+        headers.Authorization = `Bearer ${accessToken}`;
+      }
       const createRes = await fetch('/api/notifications/create-test', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers,
         body: JSON.stringify({
           userId,
           entityId: testEntityId,
@@ -771,7 +778,8 @@ export async function sendDiagnosticFcmTest(userId: string): Promise<{
     } catch {}
 
     if (!notifCreated) {
-      const { error: clientInsErr } = await supabase.from('notifications').insert({
+      const nowIso = new Date().toISOString();
+      let { error: clientInsErr } = await supabase.from('notifications').insert({
         recipient_id: userId,
         actor_id: userId,
         type: 'announcement',
@@ -780,10 +788,30 @@ export async function sendDiagnosticFcmTest(userId: string): Promise<{
         entity_type: 'test',
         entity_id: testEntityId,
         read_at: null,
-        created_at: new Date().toISOString(),
+        created_at: nowIso,
       });
+
+      if (
+        clientInsErr &&
+        (clientInsErr.code === '42703' ||
+          clientInsErr.code === 'PGRST204' ||
+          clientInsErr.message?.toLowerCase().includes('column') ||
+          clientInsErr.message?.toLowerCase().includes('schema cache'))
+      ) {
+        const retryRes = await supabase.from('notifications').insert({
+          recipient_id: userId,
+          actor_id: userId,
+          type: 'announcement',
+          title: '🎉 ABSU Connect Notification Test',
+          body: 'FCM push notifications are successfully configured for your device!',
+          read_at: null,
+          created_at: nowIso,
+        });
+        clientInsErr = retryRes.error;
+      }
+
       if (clientInsErr) {
-        initNote += ` [Test notification insert note: ${createErrorDetail || clientInsErr.message}]`;
+        webSyncNote += ` [Test alert record note: ${createErrorDetail || clientInsErr.message}]`;
       } else {
         notifCreated = true;
       }
@@ -806,13 +834,13 @@ export async function sendDiagnosticFcmTest(userId: string): Promise<{
     }
 
     const diag = await getPushDiagnosticInfo(userId);
-    if (!diag.isNativeApp && !diag.firebaseWebConfigured) {
+    if (!diag.isNativeApp && !diag.firebaseWebConfigured && diag.androidTokensCount === 0) {
       return {
         success: false,
         sent: 0,
         message:
-          'Edge Function is live, but Web FCM environment variables (VITE_FIREBASE_*) are missing in this web build.' +
-          initNote,
+          'Edge Function is live, and no Android FCM token or Web Firebase config is active on this browser.' +
+          webSyncNote,
         fcmResult: fcmRes,
       };
     }
@@ -826,7 +854,7 @@ export async function sendDiagnosticFcmTest(userId: string): Promise<{
       return {
         success: true,
         sent: 0,
-        message: `Edge Function returned 0 sent (${edgeDetail}).${initNote} Registered tokens in DB -> Android: ${diag.androidTokensCount}, Web: ${diag.webTokensCount}. Make sure send-android-push queries platform IN ('android', 'web').`,
+        message: `Edge Function returned 0 sent (${edgeDetail}).${webSyncNote} Registered tokens -> Android: ${diag.androidTokensCount}, Web: ${diag.webTokensCount}.`,
         fcmResult: fcmRes,
       };
     }
@@ -834,7 +862,7 @@ export async function sendDiagnosticFcmTest(userId: string): Promise<{
     return {
       success: false,
       sent: fcmRes.sent ?? 0,
-      message: `Edge Function failed (${edgeDetail}).${initNote}`,
+      message: `Edge Function check (${edgeDetail}).${webSyncNote}`,
       fcmResult: fcmRes,
     };
   } catch (err: unknown) {

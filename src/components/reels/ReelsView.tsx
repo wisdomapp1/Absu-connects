@@ -6,6 +6,7 @@ import {
   fetchSingleReelById,
   getPrimaryVideoMediaItem,
   isVideoPost,
+  mergeAndDedupeReels,
   normalizePostForReels,
 } from '../../lib/reelsService.ts';
 import {
@@ -17,13 +18,14 @@ import { Avatar } from '../common/Avatar.tsx';
 import { ReelsCommentsModal } from './ReelsCommentsModal.tsx';
 import { ReelsSearchModal } from './ReelsSearchModal.tsx';
 import { ReelsUploadModal } from './ReelsUploadModal.tsx';
+import { ReelsIcon } from '../common/ReelsIcon.tsx';
 import {
+  ArrowLeft,
   Bookmark,
   Camera,
   Check,
   ChevronDown,
   ChevronUp,
-  Clapperboard,
   Heart,
   Loader2,
   MessageCircle,
@@ -224,7 +226,7 @@ const ReelSlide: React.FC<ReelSlideProps> = ({
       {/* Video Player Surface */}
       {hasError ? (
         <div className="flex flex-col items-center justify-center gap-3 text-center px-6">
-          <Clapperboard className="w-10 h-10 text-white/40" />
+          <ReelsIcon className="w-10 h-10 text-white/40" />
           <p className="text-sm font-bold text-white">Video could not be loaded</p>
           <p className="text-xs text-white/60 max-w-xs">
             Check your network connection or reload this reel.
@@ -279,7 +281,9 @@ const ReelSlide: React.FC<ReelSlideProps> = ({
           type="button"
           onClick={handleTogglePlayPause}
           aria-label={isPlaying ? 'Pause reel' : 'Play reel'}
-          className="absolute inset-0 m-auto w-16 h-16 rounded-full bg-black/50 backdrop-blur-xs text-white flex items-center justify-center pointer-events-none transition-opacity"
+          className={`absolute inset-0 m-auto w-16 h-16 rounded-full bg-black/55 backdrop-blur-xs text-white flex items-center justify-center transition-opacity ${
+            !isPlaying && !isBuffering ? 'cursor-pointer ring-2 ring-white/25' : 'pointer-events-none'
+          }`}
         >
           {isBuffering ? (
             <Loader2 className="w-8 h-8 animate-spin" />
@@ -453,15 +457,19 @@ const ReelSlide: React.FC<ReelSlideProps> = ({
 export const ReelsView: React.FC = () => {
   const {
     currentUser,
+    posts,
     selectedPostId,
     selectedPostNavContext,
     toggleLike,
     toggleSave,
+    goBack,
     addToast,
   } = useApp();
 
   const containerRef = useRef<HTMLDivElement>(null);
   const slideRefs = useRef<Map<number, HTMLDivElement>>(new Map());
+  const postsRef = useRef<Post[]>(posts);
+  postsRef.current = posts;
 
   const [reels, setReels] = useState<Post[]>([]);
   const [loading, setLoading] = useState(true);
@@ -479,15 +487,20 @@ export const ReelsView: React.FC = () => {
   const [searchSeedQuery, setSearchSeedQuery] = useState('');
   const [uploadModalOpen, setUploadModalOpen] = useState(false);
 
+  const getContextFeedVideos = useCallback(() => {
+    return postsRef.current.filter((p) => isVideoPost(p)).map(normalizePostForReels);
+  }, []);
+
   const loadInitialReels = useCallback(
     async (focusPostId?: string | null) => {
       setLoading(true);
       try {
         const page = await fetchReelsFeedPage({
           currentUserId: currentUser.id || undefined,
-          limit: 10,
+          limit: 12,
         });
-        let list = page.reels;
+        const feedVideos = getContextFeedVideos();
+        let list = mergeAndDedupeReels(page.reels, feedVideos);
 
         if (focusPostId) {
           const existingIdx = list.findIndex((p) => p.id === focusPostId);
@@ -495,9 +508,14 @@ export const ReelsView: React.FC = () => {
             const target = list[existingIdx];
             list = [target, ...list.filter((p) => p.id !== focusPostId)];
           } else if (existingIdx === -1) {
-            const single = await fetchSingleReelById(focusPostId, currentUser.id || undefined);
-            if (single) {
-              list = [single, ...list];
+            const fromContext = feedVideos.find((p) => p.id === focusPostId);
+            if (fromContext) {
+              list = [fromContext, ...list];
+            } else {
+              const single = await fetchSingleReelById(focusPostId, currentUser.id || undefined);
+              if (single) {
+                list = [single, ...list];
+              }
             }
           }
         }
@@ -527,15 +545,43 @@ export const ReelsView: React.FC = () => {
         setLoading(false);
       }
     },
-    [currentUser.id, selectedPostNavContext]
+    [currentUser.id, selectedPostNavContext, getContextFeedVideos]
   );
 
   useEffect(() => {
+    setHasSwipedAway(false);
     loadInitialReels(selectedPostId);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [currentUser.id, selectedPostId, selectedPostNavContext?.navToken]);
 
-  // Listen to new video posts created anywhere (Home or ReelsUploadModal)
+  // Keep Reels synchronized if Home feed posts finish loading after Reels mounts
+  useEffect(() => {
+    const contextVideos = posts.filter((p) => isVideoPost(p)).map(normalizePostForReels);
+    if (contextVideos.length === 0) return;
+
+    setReels((prev) => {
+      if (prev.length === 0) {
+        if (selectedPostId) {
+          const focused = contextVideos.find((p) => p.id === selectedPostId);
+          return focused ? [focused, ...contextVideos.filter((p) => p.id !== selectedPostId)] : contextVideos;
+        }
+        return contextVideos;
+      }
+      const existingIds = new Set(prev.map((p) => p.id));
+      const missing = contextVideos.filter((p) => !existingIds.has(p.id));
+      if (missing.length === 0) return prev;
+      const merged = [...prev, ...missing];
+      if (selectedPostId) {
+        const target = merged.find((p) => p.id === selectedPostId);
+        if (target && merged[0]?.id !== selectedPostId) {
+          return [target, ...merged.filter((p) => p.id !== selectedPostId)];
+        }
+      }
+      return merged;
+    });
+  }, [posts, selectedPostId]);
+
+  // Listen to new video posts created anywhere (Home or ReelsUploadModal) and deletions
   useEffect(() => {
     const handlePostCreated = (evt: Event) => {
       const created = (evt as CustomEvent<{ post?: Post }>).detail?.post;
@@ -551,6 +597,12 @@ export const ReelsView: React.FC = () => {
       });
     };
 
+    const handlePostDeleted = (evt: Event) => {
+      const deletedId = (evt as CustomEvent<{ postId?: string }>).detail?.postId;
+      if (!deletedId) return;
+      setReels((prev) => prev.filter((p) => p.id !== deletedId));
+    };
+
     const handleRefresh = () => {
       loadInitialReels(null);
     };
@@ -562,10 +614,12 @@ export const ReelsView: React.FC = () => {
     };
 
     window.addEventListener('absu:post-created', handlePostCreated);
+    window.addEventListener('absu:post-deleted', handlePostDeleted);
     window.addEventListener('absu:refresh-reels', handleRefresh);
     window.addEventListener('absu:reels-reset-top', handleResetTop);
     return () => {
       window.removeEventListener('absu:post-created', handlePostCreated);
+      window.removeEventListener('absu:post-deleted', handlePostDeleted);
       window.removeEventListener('absu:refresh-reels', handleRefresh);
       window.removeEventListener('absu:reels-reset-top', handleResetTop);
     };
@@ -729,9 +783,21 @@ export const ReelsView: React.FC = () => {
         {/* Session-Scoped Top Header ("Reels" + Search + Camera) — visible ONLY on initial first video view */}
         {showFirstVideoHeader && (
           <div className="absolute top-0 left-0 right-0 z-30 pt-[max(0.75rem,env(safe-area-inset-top))] px-4 pb-8 bg-gradient-to-b from-black/75 via-black/35 to-transparent flex items-center justify-between pointer-events-none">
-            <h1 className="text-xl font-extrabold tracking-tight text-white drop-shadow-sm pointer-events-auto">
-              Reels
-            </h1>
+            <div className="flex items-center gap-2 pointer-events-auto">
+              {selectedPostId && (
+                <button
+                  type="button"
+                  onClick={goBack}
+                  className="min-w-[44px] min-h-[44px] -ml-2 rounded-full bg-black/35 hover:bg-black/55 backdrop-blur-xs text-white flex items-center justify-center transition-colors"
+                  aria-label="Back to feed"
+                >
+                  <ArrowLeft className="w-5 h-5" />
+                </button>
+              )}
+              <h1 className="text-xl font-extrabold tracking-tight text-white drop-shadow-sm">
+                Reels
+              </h1>
+            </div>
             <div className="flex items-center gap-1.5 pointer-events-auto">
               <button
                 type="button"
@@ -765,7 +831,7 @@ export const ReelsView: React.FC = () => {
         ) : reels.length === 0 ? (
           <div className="w-full h-full flex flex-col items-center justify-center gap-3 px-6 text-center text-white">
             <div className="w-16 h-16 rounded-3xl bg-white/10 flex items-center justify-center">
-              <Clapperboard className="w-8 h-8 text-[var(--color-primary)]" />
+              <ReelsIcon className="w-8 h-8 text-[var(--color-primary)]" />
             </div>
             <h2 className="text-base font-extrabold">No Reels Yet</h2>
             <p className="text-xs text-white/65 max-w-xs">
@@ -879,6 +945,7 @@ export const ReelsView: React.FC = () => {
       <ReelsUploadModal
         isOpen={uploadModalOpen}
         onClose={() => setUploadModalOpen(false)}
+        onPublished={() => loadInitialReels(null)}
       />
     </div>
   );

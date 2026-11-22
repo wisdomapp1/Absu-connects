@@ -32,7 +32,7 @@ import {
 } from '../lib/postService.ts';
 import { checkPostHasVideo, isVideoPost } from '../lib/reelsService.ts';
 import {
-  fetchAllProfiles,
+  fetchDiscoverProfilesPage,
   saveProfileToSupabase,
   fetchProfileById,
 } from '../lib/profileService.ts';
@@ -181,11 +181,15 @@ export interface AppContextType {
   users: User[];
   friends: User[];
   discoverUsers: User[];
+  discoverHasMore: boolean;
+  loadingMoreDiscover: boolean;
+  discoverTotalCount: number;
+  loadMoreDiscoverUsers: () => Promise<void>;
   loadingUsers: boolean;
   friendRequests: FriendRequest[];
   friendTab: FriendTab;
   setFriendTab: (tab: FriendTab) => void;
-  sendFriendRequest: (userId: string) => Promise<void>;
+  sendFriendRequest: (userId: string, userPreview?: User) => Promise<void>;
   cancelFriendRequest: (userId: string) => Promise<void>;
   acceptFriendRequest: (requestId: string) => Promise<void>;
   declineFriendRequest: (requestId: string) => Promise<void>;
@@ -950,6 +954,12 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const [users, setUsers] = useState<User[]>([]);
   const [friends, setFriends] = useState<User[]>([]);
   const [loadingUsers, setLoadingUsers] = useState<boolean>(true);
+  const [discoverHasMore, setDiscoverHasMore] = useState<boolean>(false);
+  const [loadingMoreDiscover, setLoadingMoreDiscover] = useState<boolean>(false);
+  const [discoverTotalCount, setDiscoverTotalCount] = useState<number>(0);
+  const discoverNextOffsetRef = useRef<number | null>(0);
+  const discoverExcludeIdsRef = useRef<string[]>([]);
+  const [sessionSentIds, setSessionSentIds] = useState<Set<string>>(new Set());
   const [selectedUserId, setSelectedUserId] = useState<string | null>(initialRoute.userId);
   const [selectedCommunityId, setSelectedCommunityId] = useState<string | null>(initialRoute.communityId);
   const [selectedEventId, setSelectedEventId] = useState<string | null>(initialRoute.eventId);
@@ -1097,13 +1107,14 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     }
   }, [authUserId]);
 
-  // Discoverable users: pure non-friends, not requested, not blocked, not self, prioritized by campus match
+  // Discoverable users: pure non-friends, not requested (except newly sent in-session for immediate feedback), not blocked, not self, prioritized by campus match
   const discoverUsers = React.useMemo(() => {
     const filtered = users.filter((u) => {
       if (!u.id || (authUserId && u.id === authUserId)) return false;
-      if (u.relationshipState !== 'none') return false;
       if (blockedUserIds.has(u.id)) return false;
-      return true;
+      if (u.relationshipState === 'none') return true;
+      if (u.relationshipState === 'request_sent' && sessionSentIds.has(u.id)) return true;
+      return false;
     });
 
     const myDept = (currentUser.department || '').trim().toLowerCase();
@@ -1132,7 +1143,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     };
 
     return [...filtered].sort((a, b) => scoreUser(b) - scoreUser(a));
-  }, [users, authUserId, blockedUserIds, currentUser.department, currentUser.faculty, currentUser.level, currentUser.interests, userPresenceMap]);
+  }, [users, authUserId, blockedUserIds, sessionSentIds, currentUser.department, currentUser.faculty, currentUser.level, currentUser.interests, userPresenceMap]);
 
   // Trigger at-most-once 24h discovery inactivity reminder for idle accounts
   const checkedInactivityRef = useRef<string | null>(null);
@@ -1233,9 +1244,16 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         ])
       );
 
-      const discoverProfiles = await fetchAllProfiles(authUserId, 50, excludeIds);
+      discoverExcludeIdsRef.current = excludeIds;
 
-      const decoratedDiscoverStudents: User[] = discoverProfiles.map((s) => ({
+      const discoverPage = await fetchDiscoverProfilesPage({
+        currentUserId: authUserId,
+        offset: 0,
+        limit: 30,
+        excludeIds,
+      });
+
+      const decoratedDiscoverStudents: User[] = discoverPage.users.map((s) => ({
         ...s,
         relationshipState: 'none',
       }));
@@ -1247,6 +1265,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
       setFriends(decoratedFriends);
       setUsers([...decoratedFriends, ...decoratedDiscoverStudents]);
+      setDiscoverHasMore(discoverPage.hasMore);
+      setDiscoverTotalCount(discoverPage.totalCount);
+      discoverNextOffsetRef.current = discoverPage.nextOffset;
       setFriendRequests([
         ...friendshipData.incomingRequests,
         ...friendshipData.outgoingRequests,
@@ -1256,6 +1277,34 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       setLoadingUsers(false);
     }
   }, [authUserId]);
+
+  const loadMoreDiscoverUsers = useCallback(async () => {
+    if (!authUserId) return;
+    const nextOffset = discoverNextOffsetRef.current;
+    if (loadingMoreDiscover || !discoverHasMore || nextOffset === null) return;
+    setLoadingMoreDiscover(true);
+    try {
+      const page = await fetchDiscoverProfilesPage({
+        currentUserId: authUserId,
+        offset: nextOffset,
+        limit: 30,
+        excludeIds: discoverExcludeIdsRef.current,
+      });
+
+      setUsers((prev) => {
+        const seen = new Set(prev.map((u) => u.id));
+        const appended: User[] = page.users
+          .filter((u) => !seen.has(u.id))
+          .map((u) => ({ ...u, relationshipState: 'none' }));
+        return [...prev, ...appended];
+      });
+      setDiscoverHasMore(page.hasMore);
+      if (page.totalCount > 0) setDiscoverTotalCount(page.totalCount);
+      discoverNextOffsetRef.current = page.nextOffset;
+    } finally {
+      setLoadingMoreDiscover(false);
+    }
+  }, [authUserId, loadingMoreDiscover, discoverHasMore]);
 
   const loadConversations = useCallback(async () => {
     if (!authUserId) return;
@@ -2139,6 +2188,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     const res = await deleteRealPost(postId, auth.user.id);
     if (res.success) {
       setPosts((prev) => prev.filter((p) => p.id !== postId));
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(new CustomEvent('absu:post-deleted', { detail: { postId } }));
+      }
       addToast('Post removed', 'info');
     } else {
       addToast(res.error || 'Failed to delete post from database.', 'warning');
@@ -2194,7 +2246,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     }
   };
 
-  const sendFriendRequest = async (userId: string) => {
+  const sendFriendRequest = async (userId: string, userPreview?: User) => {
     if (!auth.user) {
       addToast('Sign in to send friend requests.', 'warning');
       return;
@@ -2203,7 +2255,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
     setInFlightFriendRequests((prev) => new Set(prev).add(userId));
     try {
-      const targetUser = users.find((u) => u.id === userId);
+      const targetUser = users.find((u) => u.id === userId) || userPreview;
       const res = await sendRealFriendRequest(auth.user.id, userId);
 
       if (res.success) {
@@ -2224,9 +2276,17 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           url: '/?view=friends',
         }).catch(() => {});
 
-        setUsers((prev) =>
-          prev.map((u) => (u.id === userId ? { ...u, relationshipState: 'request_sent' } : u))
-        );
+        setSessionSentIds((prev) => new Set(prev).add(userId));
+        setUsers((prev) => {
+          const exists = prev.some((u) => u.id === userId);
+          if (exists) {
+            return prev.map((u) => (u.id === userId ? { ...u, relationshipState: 'request_sent' } : u));
+          }
+          if (targetUser) {
+            return [...prev, { ...targetUser, relationshipState: 'request_sent' }];
+          }
+          return prev;
+        });
         if (targetUser) {
           const newReq: FriendRequest = {
             id: res.friendshipId || ('req_' + Date.now()),
@@ -2325,6 +2385,11 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     if (req) {
       await declineOrCancelFriendRequest(req.id);
     }
+    setSessionSentIds((prev) => {
+      const next = new Set(prev);
+      next.delete(userId);
+      return next;
+    });
     setUsers((prev) =>
       prev.map((u) => (u.id === userId ? { ...u, relationshipState: 'none' } : u))
     );
@@ -2604,6 +2669,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         users,
         friends,
         discoverUsers,
+        discoverHasMore,
+        loadingMoreDiscover,
+        discoverTotalCount,
+        loadMoreDiscoverUsers,
         loadingUsers,
         friendRequests,
         friendTab,

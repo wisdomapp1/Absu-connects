@@ -98,6 +98,126 @@ export const EXCLUDED_STUDENT_IDS = [
   '0c3240e3-ae39-461d-bd7a-4963859b9bc7', // Mr Anonymous page ID
 ];
 
+export interface DiscoverProfilesPageResult {
+  users: User[];
+  totalCount: number;
+  hasMore: boolean;
+  nextOffset: number | null;
+}
+
+/**
+ * Paginated student discovery (calls /api/users/discover first to include ALL eligible users beyond 50,
+ * enforce blocks/restrictions, and support live search; falls back to paginated Supabase query).
+ */
+export async function fetchDiscoverProfilesPage(options: {
+  currentUserId?: string;
+  offset?: number;
+  limit?: number;
+  search?: string;
+  excludeIds?: string[];
+}): Promise<DiscoverProfilesPageResult> {
+  const offset = Math.max(0, options.offset ?? 0);
+  const limit = Math.min(Math.max(options.limit ?? 30, 1), 60);
+  const search = (options.search || '').trim();
+
+  try {
+    const params = new URLSearchParams({
+      limit: String(limit),
+      offset: String(offset),
+    });
+    if (search) params.set('q', search);
+
+    const headers: Record<string, string> = {};
+    try {
+      const { data: sessionData } = await supabase.auth.getSession();
+      const token = sessionData?.session?.access_token;
+      if (token) headers.Authorization = `Bearer ${token}`;
+    } catch {
+      // Optional auth header
+    }
+
+    const res = await fetch(`/api/users/discover?${params.toString()}`, { headers });
+    const contentType = res.headers.get('content-type') || '';
+    if (res.ok && contentType.includes('application/json')) {
+      const data = await res.json();
+      if (data?.success && Array.isArray(data.profiles)) {
+        const mapped = data.profiles.map((row: SupabaseProfileRow & { relationship_state?: User['relationshipState'] }) =>
+          mapProfileRowToUser(row, null, row.relationship_state || 'none')
+        );
+        return {
+          users: mapped,
+          totalCount: Number(data.totalCount) || mapped.length,
+          hasMore: Boolean(data.hasMore),
+          nextOffset: typeof data.nextOffset === 'number' ? data.nextOffset : null,
+        };
+      }
+    }
+  } catch {
+    // Fall back to direct Supabase paginated query below
+  }
+
+  try {
+    const excludeSet = new Set([
+      ...(options.excludeIds || []),
+      ...EXCLUDED_STUDENT_IDS,
+      ...(options.currentUserId ? [options.currentUserId] : []),
+    ]);
+
+    const scanWindow = Math.max(limit * 2, 60);
+    const collected: User[] = [];
+    let rawCursor = offset;
+    let exhausted = false;
+
+    for (let step = 0; step < 3 && collected.length < limit; step++) {
+      let query = supabase
+        .from('profiles')
+        .select('*')
+        .order('created_at', { ascending: false })
+        .order('id', { ascending: true })
+        .range(rawCursor, rawCursor + scanWindow - 1);
+
+      if (search) {
+        const term = `%${search}%`;
+        query = query.or(
+          `display_name.ilike.${term},username.ilike.${term},department.ilike.${term},campus.ilike.${term},level.ilike.${term}`
+        );
+      }
+
+      const { data, error } = await query;
+      if (error) {
+        console.warn('Supabase fetchDiscoverProfilesPage fallback error:', error.message);
+        break;
+      }
+
+      const rows = (data || []) as SupabaseProfileRow[];
+      rawCursor += rows.length;
+
+      for (const row of rows) {
+        if (!row?.id || excludeSet.has(row.id)) continue;
+        if (row.display_name?.trim().toLowerCase() === 'mr anonymous') continue;
+        collected.push(mapProfileRowToUser(row, null, 'none'));
+        if (collected.length >= limit) break;
+      }
+
+      if (rows.length < scanWindow) {
+        exhausted = true;
+        break;
+      }
+    }
+
+    const hasMore = !exhausted && collected.length >= limit;
+    return {
+      users: collected,
+      totalCount: collected.length,
+      hasMore,
+      nextOffset: hasMore ? rawCursor : null,
+    };
+  } catch (err) {
+    console.warn('Unexpected error in fetchDiscoverProfilesPage:', err);
+    return { users: [], totalCount: 0, hasMore: false, nextOffset: null };
+  }
+}
+
 /**
  * Fetch profiles for student discovery and people list
  */
@@ -106,38 +226,13 @@ export async function fetchAllProfiles(
   limit = 50,
   excludeIds?: string[]
 ): Promise<User[]> {
-  try {
-    let query = supabase
-      .from('profiles')
-      .select('*')
-      .order('created_at', { ascending: false });
-
-    if (currentUserId) {
-      query = query.neq('id', currentUserId);
-    }
-
-    const toExclude = Array.from(new Set([...(excludeIds || []), ...EXCLUDED_STUDENT_IDS])).filter(Boolean);
-    if (toExclude.length > 0) {
-      query = query.not('id', 'in', `(${toExclude.join(',')})`);
-    }
-
-    query = query.limit(limit);
-
-    const { data, error } = await query;
-    if (error) {
-      console.warn('Supabase fetchAllProfiles error:', error.message);
-      return [];
-    }
-
-    return (data || [])
-      .filter((row) => row.display_name?.toLowerCase() !== 'mr anonymous')
-      .map((row) =>
-        mapProfileRowToUser(row as SupabaseProfileRow, null, 'none')
-      );
-  } catch (err) {
-    console.warn('Unexpected error in fetchAllProfiles:', err);
-    return [];
-  }
+  const page = await fetchDiscoverProfilesPage({
+    currentUserId,
+    offset: 0,
+    limit,
+    excludeIds,
+  });
+  return page.users;
 }
 
 /**
@@ -148,37 +243,13 @@ export async function searchProfiles(
   currentUserId?: string
 ): Promise<User[]> {
   if (!searchTerm.trim()) return [];
-  try {
-    const term = `%${searchTerm.trim()}%`;
-    let query = supabase
-      .from('profiles')
-      .select('*')
-      .or(`display_name.ilike.${term},username.ilike.${term},department.ilike.${term}`)
-      .limit(20);
-
-    if (currentUserId) {
-      query = query.neq('id', currentUserId);
-    }
-
-    const { data, error } = await query;
-    if (error) {
-      console.warn('Supabase searchProfiles error:', error.message);
-      return [];
-    }
-
-    return (data || [])
-      .filter(
-        (row) =>
-          !EXCLUDED_STUDENT_IDS.includes(row.id) &&
-          row.display_name?.toLowerCase() !== 'mr anonymous'
-      )
-      .map((row) =>
-        mapProfileRowToUser(row as SupabaseProfileRow, null, 'none')
-      );
-  } catch (err) {
-    console.warn('Unexpected error searching profiles:', err);
-    return [];
-  }
+  const page = await fetchDiscoverProfilesPage({
+    currentUserId,
+    offset: 0,
+    limit: 30,
+    search: searchTerm.trim(),
+  });
+  return page.users;
 }
 
 /**

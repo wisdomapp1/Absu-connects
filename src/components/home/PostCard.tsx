@@ -3,6 +3,7 @@ import { useApp } from '../../context/AppContext.tsx';
 import type { Post, Comment, PostMediaItem } from '../../types/index.ts';
 import { Avatar } from '../common/Avatar.tsx';
 import { LinkifiedText } from '../common/LinkifiedText.tsx';
+import { ReelsIcon } from '../common/ReelsIcon.tsx';
 import {
   fetchPostComments,
   countThreadedComments,
@@ -84,11 +85,21 @@ const findNewestCommentByActor = (list: Comment[], actorId: string): Comment | n
   return flat.length > 0 ? flat[flat.length - 1] : null;
 };
 
-const FeedVideoPlayer: React.FC<{ src: string; item?: PostMediaItem }> = ({ src, item }) => {
-  const videoRef = useRef<HTMLVideoElement>(null);
-  const [isPlaying, setIsPlaying] = useState(false);
-  const [showControls, setShowControls] = useState(false);
-  const [hasError, setHasError] = useState(false);
+function formatDurationBadge(seconds?: number | null): string | null {
+  if (!seconds || !Number.isFinite(seconds) || seconds <= 0) return null;
+  const total = Math.round(seconds);
+  const mins = Math.floor(total / 60);
+  const secs = total % 60;
+  return `${mins}:${secs.toString().padStart(2, '0')}`;
+}
+
+const FeedReelPreviewCard: React.FC<{
+  src: string;
+  item?: PostMediaItem;
+  onOpenReel: () => void;
+}> = ({ src, item, onOpenReel }) => {
+  const [posterFailed, setPosterFailed] = useState(false);
+  const [videoPreviewFailed, setVideoPreviewFailed] = useState(false);
   const [retryKey, setRetryKey] = useState(0);
 
   const deliverySrc = buildCloudinaryVideoDeliveryUrl(src, {
@@ -97,101 +108,107 @@ const FeedVideoPlayer: React.FC<{ src: string; item?: PostMediaItem }> = ({ src,
     isMuted: item?.is_muted,
     aspectRatio: item?.aspect_ratio,
   });
+
   const posterSrc =
     item?.thumbnail_url ||
     buildCloudinaryVideoPosterUrl(src, { timeOffset: item?.trim_start ?? 0 }) ||
     undefined;
 
-  const isTrimmedClientFallback =
-    !src.includes('/video/upload/') &&
-    typeof item?.trim_start === 'number' &&
-    typeof item?.trim_end === 'number' &&
-    item.trim_end > item.trim_start;
+  const durationLabel = formatDurationBadge(item?.duration_seconds);
 
   const aspectClass =
     item?.aspect_ratio === '1:1'
-      ? 'aspect-square max-h-[500px]'
-      : item?.aspect_ratio === '9:16'
-      ? 'aspect-[9/16] max-h-[520px] mx-auto'
+      ? 'aspect-square max-h-[460px]'
       : item?.aspect_ratio === '16:9'
-      ? 'aspect-video max-h-[500px]'
-      : 'max-h-[500px]';
+      ? 'aspect-video max-h-[440px]'
+      : item?.aspect_ratio === '9:16'
+      ? 'aspect-[4/5] max-h-[480px]'
+      : 'aspect-[4/5] sm:aspect-video max-h-[460px]';
 
-  const togglePlay = () => {
-    if (!videoRef.current || hasError) return;
-    if (videoRef.current.paused) {
-      if (isTrimmedClientFallback && typeof item?.trim_start === 'number' && videoRef.current.currentTime < item.trim_start) {
-        videoRef.current.currentTime = item.trim_start;
-      }
-      videoRef.current.play().catch(() => {});
-      setIsPlaying(true);
-      setShowControls(true);
-    } else {
-      videoRef.current.pause();
-      setIsPlaying(false);
-    }
-  };
-
-  if (hasError) {
+  if (videoPreviewFailed && (!posterSrc || posterFailed)) {
     return (
-      <div className="rounded-2xl bg-neutral-950 p-6 flex flex-col items-center justify-center gap-2.5 text-center min-h-[200px]">
-        <p className="text-xs font-semibold text-white">Video could not be loaded</p>
-        <button
-          type="button"
-          onClick={() => {
-            setHasError(false);
-            setRetryKey((k) => k + 1);
-          }}
-          className="min-h-[44px] px-3.5 py-1.5 rounded-xl bg-white/15 hover:bg-white/25 text-white text-xs font-semibold flex items-center gap-1.5"
-        >
-          <RefreshCw className="w-3.5 h-3.5" />
-          <span>Retry Video</span>
-        </button>
+      <div className="rounded-2xl bg-neutral-950 p-6 flex flex-col items-center justify-center gap-2.5 text-center min-h-[220px]">
+        <p className="text-xs font-semibold text-white">Video preview unavailable</p>
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={() => {
+              setPosterFailed(false);
+              setVideoPreviewFailed(false);
+              setRetryKey((k) => k + 1);
+            }}
+            className="min-h-[44px] px-3.5 py-1.5 rounded-xl bg-white/15 hover:bg-white/25 text-white text-xs font-semibold flex items-center gap-1.5"
+          >
+            <RefreshCw className="w-3.5 h-3.5" />
+            <span>Retry</span>
+          </button>
+          <button
+            type="button"
+            onClick={onOpenReel}
+            className="min-h-[44px] px-4 py-1.5 rounded-xl bg-[var(--color-primary)] hover:bg-[var(--color-primary-hover)] text-white text-xs font-bold flex items-center gap-1.5"
+          >
+            <Play className="w-3.5 h-3.5 fill-current" />
+            <span>Watch Reel</span>
+          </button>
+        </div>
       </div>
     );
   }
 
   return (
-    <div className={`relative group rounded-2xl overflow-hidden bg-neutral-950 flex items-center justify-center w-full ${aspectClass}`}>
-      <video
-        key={retryKey}
-        ref={videoRef}
-        src={deliverySrc}
-        poster={posterSrc}
-        muted={Boolean(item?.is_muted)}
-        playsInline
-        preload="metadata"
-        controls={showControls}
-        onLoadedMetadata={(e) => {
-          if (isTrimmedClientFallback && typeof item?.trim_start === 'number') {
-            e.currentTarget.currentTime = item.trim_start;
-          }
-        }}
-        onTimeUpdate={(e) => {
-          if (
-            isTrimmedClientFallback &&
-            typeof item?.trim_end === 'number' &&
-            e.currentTarget.currentTime >= item.trim_end
-          ) {
-            e.currentTarget.currentTime = item.trim_start || 0;
-          }
-        }}
-        onPlay={() => setIsPlaying(true)}
-        onPause={() => setIsPlaying(false)}
-        onError={() => setHasError(true)}
-        className={`w-full h-full ${item?.aspect_ratio && item.aspect_ratio !== 'original' ? 'object-cover' : 'object-contain'} max-h-[500px] rounded-2xl`}
-      />
-      {!isPlaying && (
-        <button
-          type="button"
-          onClick={togglePlay}
-          className="absolute inset-0 m-auto w-14 h-14 rounded-full bg-black/60 hover:bg-black/80 text-white flex items-center justify-center backdrop-blur-xs transition-all active:scale-95 z-10 shadow-lg ring-2 ring-white/20"
-          aria-label="Play campus video"
-        >
-          <Play className="w-7 h-7 ml-1 fill-white" />
-        </button>
+    <button
+      type="button"
+      onClick={onOpenReel}
+      className={`relative group block w-full rounded-2xl overflow-hidden bg-neutral-950 focus:outline-none ${aspectClass}`}
+      aria-label="Open video in Reels"
+    >
+      {posterSrc && !posterFailed ? (
+        <img
+          key={`poster_${retryKey}`}
+          src={posterSrc}
+          alt="Campus reel thumbnail"
+          referrerPolicy="no-referrer"
+          loading="lazy"
+          onError={() => setPosterFailed(true)}
+          className="w-full h-full object-cover transition-transform duration-300 group-hover:scale-[1.02]"
+        />
+      ) : (
+        <video
+          key={`frame_${retryKey}`}
+          src={deliverySrc}
+          muted
+          playsInline
+          preload="metadata"
+          onLoadedMetadata={(e) => {
+            try {
+              const targetTime = typeof item?.trim_start === 'number' && item.trim_start > 0 ? item.trim_start : 0.1;
+              e.currentTarget.currentTime = targetTime;
+            } catch {
+              // Ignore seek errors on unseekable streams
+            }
+          }}
+          onError={() => setVideoPreviewFailed(true)}
+          className="w-full h-full object-cover pointer-events-none"
+        />
       )}
-    </div>
+
+      {/* Subtle gradient scrim for crisp contrast */}
+      <div className="pointer-events-none absolute inset-0 bg-gradient-to-t from-black/55 via-black/15 to-black/25 group-hover:via-black/25 transition-colors" />
+
+      {/* Top-left Reels indicator */}
+      <div className="pointer-events-none absolute top-3 left-3 flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-black/55 backdrop-blur-xs text-white text-[11px] font-bold border border-white/15">
+        <ReelsIcon className="w-3.5 h-3.5" />
+        <span>Reel</span>
+        {durationLabel && <span className="text-white/80 tabular-nums">· {durationLabel}</span>}
+      </div>
+
+      {/* Centered Play Launcher */}
+      <div className="pointer-events-none absolute inset-0 flex items-center justify-center">
+        <span className="w-15 h-15 rounded-full bg-black/60 group-hover:bg-[var(--color-primary)]/90 text-white flex items-center justify-center backdrop-blur-xs transition-all duration-200 group-hover:scale-105 group-active:scale-95 shadow-xl ring-2 ring-white/30">
+          <Play className="w-7 h-7 ml-1 fill-white" />
+        </span>
+      </div>
+    </button>
   );
 };
 
@@ -912,26 +929,48 @@ export const PostCard: React.FC<PostCardProps> = ({
                     </button>
                   </div>
                 ) : isVideo ? (
-                  <video
-                    key={retryCount}
-                    src={buildCloudinaryVideoDeliveryUrl(effectiveUrl, {
-                      trimStart: item.trim_start,
-                      trimEnd: item.trim_end,
-                      isMuted: item.is_muted,
-                      aspectRatio: item.aspect_ratio,
-                    })}
-                    poster={
-                      item.thumbnail_url ||
-                      buildCloudinaryVideoPosterUrl(effectiveUrl, { timeOffset: item.trim_start ?? 0 }) ||
-                      undefined
-                    }
-                    muted={Boolean(item.is_muted)}
-                    controls
-                    playsInline
-                    preload="metadata"
-                    onError={() => setBrokenMediaKeys((prev) => ({ ...prev, [mediaKey]: true }))}
-                    className="w-full h-full object-cover"
-                  />
+                  <button
+                    type="button"
+                    onClick={() => navigateTo('reels', { postId: post.id })}
+                    className="w-full h-full relative group block focus:outline-none"
+                    aria-label="Watch video in Reels"
+                  >
+                    {item.thumbnail_url || buildCloudinaryVideoPosterUrl(effectiveUrl, { timeOffset: item.trim_start ?? 0 }) ? (
+                      <img
+                        key={retryCount}
+                        src={
+                          item.thumbnail_url ||
+                          buildCloudinaryVideoPosterUrl(effectiveUrl, { timeOffset: item.trim_start ?? 0 }) ||
+                          undefined
+                        }
+                        alt={`Reel attachment ${idx + 1}`}
+                        referrerPolicy="no-referrer"
+                        loading="lazy"
+                        onError={() => setBrokenMediaKeys((prev) => ({ ...prev, [mediaKey]: true }))}
+                        className="w-full h-full object-cover"
+                      />
+                    ) : (
+                      <video
+                        key={retryCount}
+                        src={buildCloudinaryVideoDeliveryUrl(effectiveUrl, {
+                          trimStart: item.trim_start,
+                          trimEnd: item.trim_end,
+                          isMuted: item.is_muted,
+                          aspectRatio: item.aspect_ratio,
+                        })}
+                        muted
+                        playsInline
+                        preload="metadata"
+                        onError={() => setBrokenMediaKeys((prev) => ({ ...prev, [mediaKey]: true }))}
+                        className="w-full h-full object-cover pointer-events-none"
+                      />
+                    )}
+                    <div className="pointer-events-none absolute inset-0 bg-black/25 group-hover:bg-black/35 flex items-center justify-center transition-colors">
+                      <span className="w-12 h-12 rounded-full bg-black/60 text-white flex items-center justify-center ring-2 ring-white/30">
+                        <Play className="w-5 h-5 ml-0.5 fill-white" />
+                      </span>
+                    </div>
+                  </button>
                 ) : (
                   <button
                     type="button"
@@ -974,7 +1013,11 @@ export const PostCard: React.FC<PostCardProps> = ({
           return (
             <div className="mt-3 rounded-2xl overflow-hidden border border-[var(--color-border)] bg-black/90">
               {isSingleVideo && !isBroken ? (
-                <FeedVideoPlayer src={singleMedia} item={singleItem} />
+                <FeedReelPreviewCard
+                  src={singleMedia}
+                  item={singleItem}
+                  onOpenReel={() => navigateTo('reels', { postId: post.id })}
+                />
               ) : isBroken ? (
                 <div className="p-6 text-center flex flex-col items-center justify-center gap-2.5 min-h-[180px]">
                   <p className="text-xs font-semibold text-white">Photo could not be loaded</p>

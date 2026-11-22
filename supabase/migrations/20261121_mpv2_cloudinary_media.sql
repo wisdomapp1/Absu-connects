@@ -58,6 +58,16 @@ BEGIN
         ADD CONSTRAINT stories_cleanup_status_check
         CHECK (cleanup_status IN ('not_needed', 'pending', 'completed', 'failed', 'dead_letter'));
     END IF;
+
+    -- Relax legacy stories_storage_owner_path constraint safely to allow MPV2 Cloudinary URLs alongside MPV1 paths
+    ALTER TABLE public.stories DROP CONSTRAINT IF EXISTS stories_storage_owner_path;
+    ALTER TABLE public.stories
+      ADD CONSTRAINT stories_storage_owner_path
+      CHECK (
+        storage_path IS NULL
+        OR storage_path LIKE (user_id::text || '/%')
+        OR storage_path LIKE 'https://res.cloudinary.com/%'
+      );
   END IF;
 END $$;
 

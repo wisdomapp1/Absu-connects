@@ -4,7 +4,8 @@ import type { AttachedMediaItem, PostAudience, VideoEditSettings } from '../../t
 import { safeReadAndPrepareVideo, categorizeMediaError, type MediaRecoveryState } from '../../lib/mediaRecovery.ts';
 import { MediaRecoveryBanner } from '../common/MediaRecoveryBanner.tsx';
 import { VideoEditorModal } from '../home/VideoEditorModal.tsx';
-import { Clapperboard, Globe, GraduationCap, Loader2, Scissors, Users, Video, X } from 'lucide-react';
+import { ReelsIcon } from '../common/ReelsIcon.tsx';
+import { Globe, GraduationCap, Loader2, Scissors, Users, Video, X } from 'lucide-react';
 
 interface ReelsUploadModalProps {
   isOpen: boolean;
@@ -208,7 +209,7 @@ export const ReelsUploadModal: React.FC<ReelsUploadModalProps> = ({
         {/* Header */}
         <div className="px-4 py-3.5 border-b border-[var(--color-border)] flex items-center justify-between shrink-0">
           <div className="flex items-center gap-2">
-            <Clapperboard className="w-5 h-5 text-[var(--color-primary)]" />
+            <ReelsIcon className="w-5 h-5 text-[var(--color-primary)]" />
             <h2 className="text-base font-extrabold text-[var(--color-text-primary)]">
               Create Reel
             </h2>

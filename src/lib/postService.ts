@@ -301,14 +301,32 @@ export async function resolvePostMediaUrlsOnRows(postRows: SupabasePostRow[]): P
   }
 }
 
+let savedPostsTableUnavailable = false;
+
+function isMissingSavedPostsTableError(err: { code?: string; message?: string; status?: number } | null | undefined): boolean {
+  if (!err) return false;
+  const code = (err.code || '').toUpperCase();
+  const msg = (err.message || '').toLowerCase();
+  return (
+    err.status === 404 ||
+    code === 'PGRST205' ||
+    code === '42P01' ||
+    msg.includes('saved_posts') && (msg.includes('could not find') || msg.includes('does not exist') || msg.includes('schema cache'))
+  );
+}
+
 export async function fetchSavedPostIds(userId?: string): Promise<Set<string>> {
   const savedSet = new Set<string>();
-  if (!userId) return savedSet;
+  if (!userId || savedPostsTableUnavailable) return savedSet;
   try {
-    const { data, error } = await supabase
+    const { data, error, status } = await supabase
       .from('saved_posts')
       .select('post_id')
       .eq('user_id', userId);
+    if (error && isMissingSavedPostsTableError({ ...error, status })) {
+      savedPostsTableUnavailable = true;
+      return savedSet;
+    }
     if (!error && data) {
       for (const row of data as Array<{ post_id: string }>) {
         if (row.post_id) savedSet.add(row.post_id);
@@ -326,23 +344,40 @@ export async function toggleSavePostInDb(
   currentlySaved: boolean
 ): Promise<{ success: boolean; isSaved: boolean; error?: string }> {
   if (!postId || !userId) return { success: false, isSaved: currentlySaved, error: 'Invalid post or user.' };
+  if (savedPostsTableUnavailable) {
+    return {
+      success: false,
+      isSaved: currentlySaved,
+      error: 'Saved posts table is not yet provisioned in Supabase.',
+    };
+  }
   try {
     if (currentlySaved) {
-      const { error } = await supabase
+      const { error, status } = await supabase
         .from('saved_posts')
         .delete()
         .eq('post_id', postId)
         .eq('user_id', userId);
-      if (error) return { success: false, isSaved: currentlySaved, error: error.message };
+      if (error) {
+        if (isMissingSavedPostsTableError({ ...error, status })) {
+          savedPostsTableUnavailable = true;
+        }
+        return { success: false, isSaved: currentlySaved, error: error.message };
+      }
       return { success: true, isSaved: false };
     } else {
-      const { error } = await supabase
+      const { error, status } = await supabase
         .from('saved_posts')
         .upsert(
           { post_id: postId, user_id: userId, created_at: new Date().toISOString() },
           { onConflict: 'user_id,post_id', ignoreDuplicates: true }
         );
-      if (error) return { success: false, isSaved: currentlySaved, error: error.message };
+      if (error) {
+        if (isMissingSavedPostsTableError({ ...error, status })) {
+          savedPostsTableUnavailable = true;
+        }
+        return { success: false, isSaved: currentlySaved, error: error.message };
+      }
       return { success: true, isSaved: true };
     }
   } catch (err: unknown) {
@@ -571,12 +606,18 @@ export async function fetchSavedPosts(userId: string): Promise<Post[]> {
       }
     }
 
-    const { data: savedRows, error: savedErr } = await supabase
+    if (savedPostsTableUnavailable) return [];
+
+    const { data: savedRows, error: savedErr, status } = await supabase
       .from('saved_posts')
       .select('post_id, created_at')
       .eq('user_id', userId)
       .order('created_at', { ascending: false });
 
+    if (savedErr && isMissingSavedPostsTableError({ ...savedErr, status })) {
+      savedPostsTableUnavailable = true;
+      return [];
+    }
     if (savedErr || !savedRows || savedRows.length === 0) {
       return [];
     }

@@ -97,6 +97,14 @@ export const CreateStoryModal: React.FC<CreateStoryModalProps> = ({
   };
 
   useEffect(() => {
+    if (isOpen) {
+      setRecovery(null);
+      setUploadPercent(null);
+      setProgressMsg('');
+    }
+  }, [isOpen]);
+
+  useEffect(() => {
     return () => {
       abortControllerRef.current?.abort();
       if (activeBlobRef.current) {
@@ -360,7 +368,7 @@ export const CreateStoryModal: React.FC<CreateStoryModalProps> = ({
           <input
             ref={fileInputRef}
             type="file"
-            accept={activeTab === 'video' ? 'video/mp4,video/webm,video/quicktime,video/x-m4v' : 'image/*'}
+            accept={activeTab === 'video' ? 'video/*,video/mp4,video/webm,video/quicktime,video/x-m4v' : 'image/*'}
             onChange={handleFileSelect}
             className="hidden"
           />

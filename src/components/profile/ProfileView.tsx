@@ -36,8 +36,8 @@ import {
   Building2,
   AlertTriangle,
   Bookmark,
-  Clapperboard,
 } from 'lucide-react';
+import { ReelsIcon } from '../common/ReelsIcon.tsx';
 
 interface ProfileViewProps {
   isAnotherUser?: boolean;
@@ -576,7 +576,7 @@ export const ProfileView: React.FC<ProfileViewProps> = ({ isAnotherUser = false 
                     : 'text-[var(--color-text-secondary)] hover:text-[var(--color-text-primary)]'
                 }`}
               >
-                <Clapperboard className="w-3.5 h-3.5" />
+                <ReelsIcon className="w-3.5 h-3.5" />
                 <span>Saved Reels ({mySavedReels.length})</span>
               </button>
             </div>
@@ -590,7 +590,7 @@ export const ProfileView: React.FC<ProfileViewProps> = ({ isAnotherUser = false 
             <div className="p-8 text-center bg-[var(--color-bg-card)] border border-[var(--color-border)] rounded-2xl flex flex-col items-center gap-2.5">
               <div className="w-11 h-11 rounded-2xl bg-[var(--color-bg-main)] border border-[var(--color-border)] flex items-center justify-center text-[var(--color-text-secondary)]">
                 {savedFilter === 'reels' ? (
-                  <Clapperboard className="w-5 h-5" />
+                  <ReelsIcon className="w-5 h-5" />
                 ) : (
                   <Bookmark className="w-5 h-5" />
                 )}
@@ -609,7 +609,7 @@ export const ProfileView: React.FC<ProfileViewProps> = ({ isAnotherUser = false 
                   onClick={() => navigateTo('reels')}
                   className="mt-1 min-h-[40px] px-4 rounded-xl bg-[var(--color-primary)] text-white text-xs font-bold flex items-center gap-1.5"
                 >
-                  <Clapperboard className="w-3.5 h-3.5" />
+                  <ReelsIcon className="w-3.5 h-3.5" />
                   <span>Explore Reels</span>
                 </button>
               )}
@@ -622,7 +622,7 @@ export const ProfileView: React.FC<ProfileViewProps> = ({ isAnotherUser = false 
                   {hasVideo && (
                     <div className="flex items-center justify-between px-3 py-2 rounded-xl bg-[var(--color-bg-card)] border border-[var(--color-border)]">
                       <span className="text-[11px] font-bold text-[var(--color-text-secondary)] flex items-center gap-1.5">
-                        <Clapperboard className="w-3.5 h-3.5 text-[var(--color-primary)]" />
+                        <ReelsIcon className="w-3.5 h-3.5 text-[var(--color-primary)]" />
                         <span>Saved Video Reel</span>
                       </span>
                       <button
@@ -630,7 +630,7 @@ export const ProfileView: React.FC<ProfileViewProps> = ({ isAnotherUser = false 
                         onClick={() => navigateTo('reels', { postId: post.id })}
                         className="min-h-[36px] px-3 py-1 rounded-lg bg-[var(--color-primary)] hover:bg-[var(--color-primary-hover)] text-white text-xs font-bold flex items-center gap-1.5"
                       >
-                        <Clapperboard className="w-3.5 h-3.5" />
+                        <ReelsIcon className="w-3.5 h-3.5" />
                         <span>Watch in Reels</span>
                       </button>
                     </div>

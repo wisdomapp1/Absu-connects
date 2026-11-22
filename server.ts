@@ -4059,6 +4059,162 @@ app.get('/api/users/me/restriction', async (req, res) => {
   }
 });
 
+// Server-authoritative paginated student discovery (removes 50-user cap, supports live search across all eligible students)
+const DISCOVER_SYSTEM_EXCLUDED_IDS = new Set([
+  'b4f38505-fce6-44be-8727-8ebf04eb2ceb', // Mr Anonymous student dummy account
+  '0c3240e3-ae39-461d-bd7a-4963859b9bc7', // Mr Anonymous page ID
+]);
+
+app.get('/api/users/discover', async (req, res) => {
+  try {
+    const sb = supabaseAdmin || getAdminSupabase(req);
+    const viewer = await resolveOptionalAuthUser(req);
+    const viewerId = viewer?.id || null;
+
+    const requestedLimit = Math.min(Math.max(Number(req.query.limit) || 25, 1), 60);
+    const offset = Math.max(Number(req.query.offset) || 0, 0);
+    const rawSearch = typeof req.query.q === 'string' ? req.query.q.trim() : '';
+    const lowerSearch = rawSearch.toLowerCase();
+
+    const store = readStore();
+    const restrictedExcludedIds = new Set<string>();
+    const nowMs = Date.now();
+    for (const [uid, rest] of Object.entries(store.restrictions || {})) {
+      if (!rest) continue;
+      if (rest.status === 'disabled') {
+        restrictedExcludedIds.add(uid);
+      } else if (rest.status === 'suspended') {
+        const untilMs = rest.suspendedUntil ? new Date(rest.suspendedUntil).getTime() : Infinity;
+        if (!rest.suspendedUntil || untilMs > nowMs) {
+          restrictedExcludedIds.add(uid);
+        }
+      }
+    }
+
+    const blockedIds = new Set<string>();
+    const relationshipMap = new Map<string, { state: 'friends' | 'request_sent' | 'request_received'; requestId?: string }>();
+
+    if (sb && viewerId) {
+      const [friendsRes, blocksRes] = await Promise.allSettled([
+        sb
+          .from('friendships')
+          .select('id, requester_id, addressee_id, status')
+          .or(`requester_id.eq.${viewerId},addressee_id.eq.${viewerId}`),
+        sb
+          .from('user_blocks')
+          .select('blocker_id, blocked_id')
+          .or(`blocker_id.eq.${viewerId},blocked_id.eq.${viewerId}`),
+      ]);
+
+      if (friendsRes.status === 'fulfilled' && Array.isArray(friendsRes.value.data)) {
+        for (const f of friendsRes.value.data as any[]) {
+          const otherId = f.requester_id === viewerId ? f.addressee_id : f.requester_id;
+          if (!otherId) continue;
+          if (f.status === 'accepted') {
+            relationshipMap.set(otherId, { state: 'friends', requestId: f.id });
+          } else if (f.status === 'pending') {
+            relationshipMap.set(otherId, {
+              state: f.requester_id === viewerId ? 'request_sent' : 'request_received',
+              requestId: f.id,
+            });
+          }
+        }
+      }
+
+      if (blocksRes.status === 'fulfilled' && Array.isArray(blocksRes.value.data)) {
+        for (const b of blocksRes.value.data as any[]) {
+          if (b.blocker_id === viewerId && b.blocked_id) blockedIds.add(b.blocked_id);
+          if (b.blocked_id === viewerId && b.blocker_id) blockedIds.add(b.blocker_id);
+        }
+      }
+    }
+
+    // Fetch all profile rows in chunks of 1000 so discovery is never capped at 50 or 1000
+    const allProfiles: any[] = [];
+    const chunkSize = 1000;
+    for (let start = 0; start < 10000; start += chunkSize) {
+      let query = sb
+        .from('profiles')
+        .select('id, display_name, username, avatar_url, avatar_asset_id, department, level, campus, bio, created_at, updated_at')
+        .order('created_at', { ascending: false })
+        .order('id', { ascending: true })
+        .range(start, start + chunkSize - 1);
+
+      if (lowerSearch) {
+        const term = `%${rawSearch}%`;
+        query = query.or(
+          `display_name.ilike.${term},username.ilike.${term},department.ilike.${term},campus.ilike.${term},level.ilike.${term}`
+        );
+      }
+
+      const { data, error } = await query;
+      if (error) {
+        res.status(500).json({ success: false, error: error.message });
+        return;
+      }
+      const rows = data || [];
+      allProfiles.push(...rows);
+      if (rows.length < chunkSize) break;
+    }
+
+    const eligible: any[] = [];
+    for (const row of allProfiles) {
+      if (!row?.id) continue;
+      if (viewerId && row.id === viewerId) continue;
+      if (DISCOVER_SYSTEM_EXCLUDED_IDS.has(row.id)) continue;
+      if (blockedIds.has(row.id)) continue;
+      if (restrictedExcludedIds.has(row.id)) continue;
+      if (typeof row.display_name === 'string' && row.display_name.trim().toLowerCase() === 'mr anonymous') {
+        continue;
+      }
+
+      const rel = relationshipMap.get(row.id);
+      // For default Discover feed (no search query), exclude already-connected friends and incoming/outgoing pending requests
+      // When actively searching, include discoverable non-blocked students with their live relationship state so users can Confirm / Request Sent / Friends accurately
+      if (!lowerSearch && rel) {
+        continue;
+      }
+
+      if (lowerSearch) {
+        const haystack = [
+          row.display_name,
+          row.username,
+          row.department,
+          row.campus,
+          row.level,
+          row.bio,
+        ]
+          .filter(Boolean)
+          .join(' ')
+          .toLowerCase();
+        if (!haystack.includes(lowerSearch)) continue;
+      }
+
+      eligible.push({
+        ...row,
+        relationship_state: rel?.state || 'none',
+        friendship_id: rel?.requestId || null,
+      });
+    }
+
+    const pageRows = eligible.slice(offset, offset + requestedLimit);
+    const nextOffset = offset + pageRows.length;
+    const hasMore = nextOffset < eligible.length;
+
+    res.json({
+      success: true,
+      profiles: pageRows,
+      totalCount: eligible.length,
+      offset,
+      hasMore,
+      nextOffset: hasMore ? nextOffset : null,
+    });
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : 'Failed to load student discovery';
+    res.status(500).json({ success: false, error: msg });
+  }
+});
+
 // -------------------------------------------------------------
 // SERVER-AUTHORITATIVE POSTS FEED & PRIVACY RESOLUTION
 // Ensures previous posts (public, campus, friends, community, anonymous)

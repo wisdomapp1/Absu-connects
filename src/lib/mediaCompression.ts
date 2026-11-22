@@ -123,21 +123,48 @@ export async function compressImageForUpload(
  */
 export async function inspectVideoFile(file: File): Promise<VideoMetadata> {
   return new Promise((resolve, reject) => {
+    if (typeof document === 'undefined') {
+      resolve({ duration: 0, width: 0, height: 0 });
+      return;
+    }
+
     const video = document.createElement('video');
     video.preload = 'metadata';
+    video.muted = true;
+    video.playsInline = true;
     const objectUrl = URL.createObjectURL(file);
+    let settled = false;
+
+    const cleanup = () => {
+      video.onloadedmetadata = null;
+      video.onerror = null;
+      video.src = '';
+      URL.revokeObjectURL(objectUrl);
+    };
+
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(new Error('Timed out reading video metadata.'));
+    }, 8000);
 
     video.onloadedmetadata = () => {
-      URL.revokeObjectURL(objectUrl);
-      resolve({
-        duration: video.duration || 0,
-        width: video.videoWidth || 0,
-        height: video.videoHeight || 0,
-      });
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      const duration = Number.isFinite(video.duration) ? video.duration : 0;
+      const width = video.videoWidth || 0;
+      const height = video.videoHeight || 0;
+      cleanup();
+      resolve({ duration, width, height });
     };
 
     video.onerror = () => {
-      URL.revokeObjectURL(objectUrl);
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      cleanup();
       reject(new Error('Failed to read video metadata. The format may not be supported by this browser.'));
     };
 
@@ -146,13 +173,30 @@ export async function inspectVideoFile(file: File): Promise<VideoMetadata> {
 }
 
 /**
- * Validate video file constraints: duration <= 60 seconds, size <= 50MB
+ * Validate video file constraints: non-empty, valid video extension/MIME, size <= 50MB, and duration <= 60s when readable
  */
 export async function validatePostVideoFile(file: File): Promise<{
   valid: boolean;
   error?: string;
   metadata?: VideoMetadata;
 }> {
+  if (!file || file.size <= 0) {
+    return {
+      valid: false,
+      error: 'Selected video file is empty (0 bytes).',
+    };
+  }
+
+  const lowerName = (file.name || '').toLowerCase();
+  const isVideoMime = Boolean(file.type && file.type.startsWith('video/'));
+  const isVideoExt = /\.(mp4|webm|mov|m4v|ogg|3gp|mkv)$/i.test(lowerName);
+  if (!isVideoMime && !isVideoExt) {
+    return {
+      valid: false,
+      error: 'Please select a valid video file (MP4, WebM, or MOV).',
+    };
+  }
+
   // Max size 50 MB
   const maxBytes = 50 * 1024 * 1024;
   if (file.size > maxBytes) {
@@ -172,9 +216,9 @@ export async function validatePostVideoFile(file: File): Promise<{
       };
     }
     return { valid: true, metadata: meta };
-  } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : 'Invalid video file.';
-    return { valid: false, error: msg };
+  } catch {
+    // Allow Cloudinary upload when browser cannot locally decode container metadata (e.g. HEVC/MOV on mobile WebView)
+    return { valid: true };
   }
 }
 

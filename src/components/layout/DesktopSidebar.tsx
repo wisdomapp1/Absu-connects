@@ -1,8 +1,9 @@
 import React from 'react';
 import { useApp } from '../../context/AppContext.tsx';
 import type { MainNavTab } from '../../types/index.ts';
-import { Home, Clapperboard, Users, MessageSquare, Bell, Menu, Plus, Sparkles, EyeOff } from 'lucide-react';
+import { Home, Users, MessageSquare, Menu, Plus, Sparkles, EyeOff } from 'lucide-react';
 import { Avatar } from '../common/Avatar.tsx';
+import { ReelsIcon } from '../common/ReelsIcon.tsx';
 
 export const DesktopSidebar: React.FC = () => {
   const {
@@ -10,18 +11,21 @@ export const DesktopSidebar: React.FC = () => {
     setActiveTab,
     currentUser,
     unreadMessagesCount,
-    unreadNotificationsCount,
     setCreatePostModalOpen,
     navigateTo,
   } = useApp();
 
-  const navItems = [
-    { id: 'home' as MainNavTab, label: 'Home Feed', icon: Home },
-    { id: 'reels' as MainNavTab, label: 'Reels', icon: Clapperboard },
-    { id: 'friends' as MainNavTab, label: 'Friends & Discovery', icon: Users },
-    { id: 'messages' as MainNavTab, label: 'Messages', icon: MessageSquare, badgeCount: unreadMessagesCount },
-    { id: 'alerts' as MainNavTab, label: 'Alerts', icon: Bell, badgeCount: unreadNotificationsCount },
-    { id: 'more' as MainNavTab, label: 'More Services', icon: Menu },
+  const navItems: Array<{
+    id: MainNavTab;
+    label: string;
+    icon: React.ComponentType<{ className?: string }>;
+    badgeCount?: number;
+  }> = [
+    { id: 'home', label: 'Home Feed', icon: Home },
+    { id: 'friends', label: 'Friends & Discovery', icon: Users },
+    { id: 'messages', label: 'Messages', icon: MessageSquare, badgeCount: unreadMessagesCount },
+    { id: 'reels', label: 'Reels', icon: ReelsIcon },
+    { id: 'more', label: 'More Services', icon: Menu },
   ];
 
   return (

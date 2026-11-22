@@ -1,7 +1,8 @@
 import React from 'react';
 import { useApp } from '../../context/AppContext.tsx';
 import type { MainNavTab } from '../../types/index.ts';
-import { Home, Clapperboard, Users, MessageSquare, Bell, Menu } from 'lucide-react';
+import { Home, Users, MessageSquare, Menu } from 'lucide-react';
+import { ReelsIcon } from '../common/ReelsIcon.tsx';
 
 interface NavItem {
   id: MainNavTab;
@@ -11,15 +12,14 @@ interface NavItem {
 }
 
 export const BottomNav: React.FC = () => {
-  const { activeTab, activeView, setActiveTab, unreadMessagesCount, unreadNotificationsCount } = useApp();
+  const { activeTab, activeView, setActiveTab, unreadMessagesCount } = useApp();
   const isReelsMode = activeView === 'reels';
 
   const navItems: NavItem[] = [
     { id: 'home', label: 'Home', icon: Home },
-    { id: 'reels', label: 'Reels', icon: Clapperboard },
     { id: 'friends', label: 'Friends', icon: Users },
     { id: 'messages', label: 'Messages', icon: MessageSquare, badgeCount: unreadMessagesCount },
-    { id: 'alerts', label: 'Alerts', icon: Bell, badgeCount: unreadNotificationsCount },
+    { id: 'reels', label: 'Reels', icon: ReelsIcon },
     { id: 'more', label: 'More', icon: Menu },
   ];
 
@@ -32,7 +32,7 @@ export const BottomNav: React.FC = () => {
       }`}
       aria-label="Mobile Navigation"
     >
-      <div className="grid grid-cols-6 h-16 max-w-lg mx-auto px-0.5">
+      <div className="grid grid-cols-5 h-16 max-w-lg mx-auto px-1">
         {navItems.map((item) => {
           const isActive = activeTab === item.id;
           const IconComponent = item.icon;

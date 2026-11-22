@@ -25,6 +25,41 @@ function createUserClient(req: Request) {
   return supabaseAdmin;
 }
 
+function encodeOwnerScopedStoryRef(userId: string, mediaUrl: string | null | undefined): string | null {
+  if (!mediaUrl) return null;
+  const trimmed = String(mediaUrl).trim();
+  if (!trimmed) return null;
+  if (!trimmed.startsWith('http://') && !trimmed.startsWith('https://')) {
+    return trimmed;
+  }
+  const cleanNoQuery = trimmed.split('?')[0];
+  const extMatch = cleanNoQuery.match(/\.([a-z0-9]{2,5})$/i);
+  const ext = extMatch ? extMatch[1].toLowerCase() : 'bin';
+  const b64url = Buffer.from(trimmed, 'utf8').toString('base64url');
+  return `${userId}/cld__${b64url}.${ext}`;
+}
+
+function decodeOwnerScopedStoryRef(ref: string | null | undefined): string {
+  if (!ref) return '';
+  const trimmed = String(ref).trim();
+  const cldMatch = trimmed.match(/^[^/]+\/cld__([A-Za-z0-9_-]+)(?:\.[a-z0-9]+)?$/i);
+  if (cldMatch?.[1]) {
+    try {
+      const decoded = Buffer.from(cldMatch[1], 'base64url').toString('utf8');
+      if (decoded.startsWith('http://') || decoded.startsWith('https://')) {
+        return decoded;
+      }
+    } catch {
+      // ignore decode error
+    }
+  }
+  const directPrefixed = trimmed.match(/^[^/]+\/(https?:\/\/.+)$/i);
+  if (directPrefixed?.[1]) {
+    return directPrefixed[1];
+  }
+  return trimmed;
+}
+
 export function registerStoryRoutes(app: Express) {
   // 1. Fetch active stories directly from Supabase with signed media URLs
   app.get('/api/stories', async (req: Request, res: Response) => {
@@ -100,11 +135,11 @@ export function registerStoryRoutes(app: Express) {
         }
       }
 
-      // Batch sign private legacy story-media storage paths
+      // Batch sign private legacy story-media storage paths (skip Cloudinary & encoded URLs)
       const mediaPaths = Array.from(
         new Set(
           stories
-            .map((s) => (s.media_url || s.storage_path || '') as string)
+            .map((s) => decodeOwnerScopedStoryRef(s.media_url || s.storage_path || ''))
             .filter(
               (ref) =>
                 Boolean(ref) &&
@@ -149,7 +184,7 @@ export function registerStoryRoutes(app: Express) {
       for (const story of stories) {
         const author = profileMap.get(story.user_id);
         const displayName = author?.display_name || author?.username || 'ABSU Student';
-        const rawRef = story.media_url || story.storage_path || '';
+        const rawRef = decodeOwnerScopedStoryRef(story.media_url || story.storage_path || '');
         const resolvedPath =
           story.media_type === 'text'
             ? null
@@ -160,7 +195,7 @@ export function registerStoryRoutes(app: Express) {
         const resolvedStory = {
           ...story,
           storage_path: resolvedPath,
-          media_url: story.media_url || resolvedPath,
+          media_url: story.media_type === 'text' ? null : (decodeOwnerScopedStoryRef(story.media_url) || resolvedPath),
           provider: story.provider || (String(resolvedPath || '').includes('res.cloudinary.com') ? 'cloudinary' : 'supabase'),
           raw_storage_path: story.storage_path,
           has_viewed: viewedSet.has(story.id),
@@ -238,10 +273,15 @@ export function registerStoryRoutes(app: Express) {
         return;
       }
 
+      const ownerScopedStoragePath =
+        mediaType === 'text'
+          ? null
+          : encodeOwnerScopedStoryRef(String(userId), mediaUrl ? String(mediaUrl) : null);
+
       const extendedPayload: Record<string, any> = {
         user_id: userId,
         media_type: mediaType,
-        storage_path: mediaUrl || null,
+        storage_path: ownerScopedStoragePath,
         media_url: mediaUrl || null,
         provider: provider || 'supabase',
         cloudinary_public_id: cloudinaryPublicId,
@@ -272,7 +312,7 @@ export function registerStoryRoutes(app: Express) {
         const corePayload: Record<string, any> = {
           user_id: userId,
           media_type: mediaType,
-          storage_path: mediaUrl || null,
+          storage_path: ownerScopedStoragePath,
           text_content: textContent ? String(textContent).trim() : null,
           caption: caption ? String(caption).trim() : null,
           expires_at: expiresAt,
@@ -282,12 +322,36 @@ export function registerStoryRoutes(app: Express) {
         error = retryRes.error;
       }
 
+      if (
+        error &&
+        mediaType === 'text' &&
+        error.message?.toLowerCase().includes('stories_storage_owner_path')
+      ) {
+        const textPathRetry = await sb
+          .from('stories')
+          .insert({
+            user_id: userId,
+            media_type: mediaType,
+            storage_path: `${userId}/text_${Date.now()}.txt`,
+            text_content: textContent ? String(textContent).trim() : null,
+            caption: caption ? String(caption).trim() : null,
+            expires_at: expiresAt,
+          })
+          .select()
+          .single();
+        data = textPathRetry.data;
+        error = textPathRetry.error;
+      }
+
       if (error || !data) {
         res.status(400).json({ success: false, error: error?.message || 'Failed to save story' });
         return;
       }
 
-      let signedUrl = data.media_url || data.storage_path || mediaUrl;
+      let signedUrl =
+        data.media_type === 'text'
+          ? null
+          : decodeOwnerScopedStoryRef(data.media_url || data.storage_path || mediaUrl);
       if (
         signedUrl &&
         data.media_type !== 'text' &&
@@ -312,8 +376,8 @@ export function registerStoryRoutes(app: Express) {
         story: {
           ...data,
           storage_path: signedUrl,
-          media_url: data.media_url || signedUrl,
-          provider: data.provider || provider,
+          media_url: data.media_type === 'text' ? null : (decodeOwnerScopedStoryRef(data.media_url) || signedUrl),
+          provider: data.provider || provider || (String(signedUrl || '').includes('res.cloudinary.com') ? 'cloudinary' : 'supabase'),
           cloudinary_public_id: data.cloudinary_public_id || cloudinaryPublicId,
           cloudinary_resource_type: data.cloudinary_resource_type || cloudinaryResourceType,
           duration_seconds: data.duration_seconds ?? durationSeconds,
@@ -451,11 +515,48 @@ export function registerStoryRoutes(app: Express) {
     try {
       const sb = createUserClient(req);
       const storyId = req.params.id;
-      const { data: existing } = await sb
+      if (!storyId) {
+        res.status(400).json({ success: false, error: 'Story ID required.' });
+        return;
+      }
+
+      const authHeader = req.headers.authorization;
+      let callerId: string | null = null;
+      if (authHeader && authHeader.startsWith('Bearer ')) {
+        const token = authHeader.slice(7).trim();
+        if (token) {
+          const { data: authData } = await supabaseAdmin.auth.getUser(token).catch(() => ({ data: null } as any));
+          callerId = authData?.user?.id || null;
+        }
+      }
+
+      let existing: any = null;
+      const extSel = await sb
         .from('stories')
-        .select('storage_path')
+        .select('id, user_id, storage_path, media_url, provider')
         .eq('id', storyId)
         .maybeSingle();
+
+      if (extSel.error) {
+        const coreSel = await sb
+          .from('stories')
+          .select('id, user_id, storage_path')
+          .eq('id', storyId)
+          .maybeSingle();
+        existing = coreSel.data;
+      } else {
+        existing = extSel.data;
+      }
+
+      if (!existing) {
+        res.status(404).json({ success: false, error: 'Story not found.' });
+        return;
+      }
+
+      if (callerId && existing.user_id && existing.user_id !== callerId) {
+        res.status(403).json({ success: false, error: 'Not authorized to delete this story.' });
+        return;
+      }
 
       const { error } = await sb.from('stories').delete().eq('id', storyId);
       if (error) {
@@ -463,8 +564,16 @@ export function registerStoryRoutes(app: Express) {
         return;
       }
 
-      if (existing?.storage_path && !existing.storage_path.startsWith('http')) {
-        await sb.storage.from('story-media').remove([existing.storage_path]).catch(() => {});
+      const legacyRef = decodeOwnerScopedStoryRef(existing.storage_path || '');
+      if (
+        legacyRef &&
+        existing.provider !== 'cloudinary' &&
+        !legacyRef.startsWith('http://') &&
+        !legacyRef.startsWith('https://') &&
+        !String(existing.storage_path || '').includes('/cld__') &&
+        !String(existing.storage_path || '').match(/\/text_\d+\.txt$/)
+      ) {
+        await sb.storage.from('story-media').remove([legacyRef]).catch(() => {});
       }
 
       res.json({ success: true });

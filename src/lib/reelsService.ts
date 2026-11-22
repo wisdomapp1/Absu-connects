@@ -5,8 +5,11 @@ import {
   fetchSavedPostIds,
   fetchSinglePostById,
   getDirectSafetyContext,
+  getOptionalAuthHeaders,
   hydratePostRowsFromSupabase,
   mapSupabasePostToFrontend,
+  parseApiJson,
+  querySupabasePostsResilient,
   resolvePostMediaUrlsOnRows,
   type SupabasePostRow,
 } from './postService.ts';
@@ -37,7 +40,7 @@ const REELS_CORE_SELECT = `
 
 export function isVideoMediaItem(item?: PostMediaItem | null): boolean {
   if (!item) return false;
-  if (item.kind === 'video') return true;
+  if (String(item.kind || '').toLowerCase() === 'video') return true;
   const url = (item.secure_url || '').toLowerCase();
   const fmt = (item.format || '').toLowerCase();
   return (
@@ -45,6 +48,7 @@ export function isVideoMediaItem(item?: PostMediaItem | null): boolean {
     fmt === 'webm' ||
     fmt === 'mov' ||
     fmt === 'm4v' ||
+    fmt === 'ogg' ||
     url.includes('/video/') ||
     Boolean(url.match(/\.(mp4|webm|mov|ogg|m4v)(\?.*)?$/i))
   );
@@ -80,6 +84,19 @@ export function normalizePostForReels(post: Post): Post {
   };
 }
 
+export function mergeAndDedupeReels(primary: Post[], secondary: Post[]): Post[] {
+  const seen = new Set<string>();
+  const out: Post[] = [];
+  for (const list of [primary, secondary]) {
+    for (const item of list) {
+      if (!item?.id || seen.has(item.id) || !isVideoPost(item)) continue;
+      seen.add(item.id);
+      out.push(normalizePostForReels(item));
+    }
+  }
+  return out;
+}
+
 function isRowEligibleForReels(
   row: SupabasePostRow,
   currentUserId: string | undefined,
@@ -102,14 +119,14 @@ function isRowEligibleForReels(
 }
 
 async function queryReelsRowsResilient(
-  applyFilters: (query: any, useInner: boolean) => any
+  applyFilters: (query: any) => any
 ): Promise<{ rows: SupabasePostRow[]; error?: string }> {
-  const richRes = await applyFilters(supabase.from('posts').select(REELS_RICH_SELECT), true);
+  const richRes = await applyFilters(supabase.from('posts').select(REELS_RICH_SELECT));
   if (!richRes.error) {
     return { rows: (richRes.data || []) as unknown as SupabasePostRow[] };
   }
 
-  const coreRes = await applyFilters(supabase.from('posts').select(REELS_CORE_SELECT), true);
+  const coreRes = await applyFilters(supabase.from('posts').select(REELS_CORE_SELECT));
   if (!coreRes.error) {
     const hydrated = await hydratePostRowsFromSupabase(
       (coreRes.data || []) as unknown as SupabasePostRow[]
@@ -118,8 +135,7 @@ async function queryReelsRowsResilient(
   }
 
   const minimalRes = await applyFilters(
-    supabase.from('posts').select('*, post_media!inner(*)'),
-    true
+    supabase.from('posts').select('*, post_media!inner(*)')
   );
   if (!minimalRes.error) {
     const hydrated = await hydratePostRowsFromSupabase(
@@ -136,42 +152,102 @@ async function queryReelsRowsResilient(
 
 /**
  * Fetch paginated video-only social posts for the dedicated Reels screen.
- * Strictly reads from public social `posts` + `post_media` (NEVER `messages` or `message_attachments`).
+ * 1. Uses `/api/posts/reels` server route first so all published feed/community/legacy videos appear.
+ * 2. Falls back to resilient direct Supabase queries (without dropping NULL visibility rows).
+ * Strictly reads public social `posts` + `post_media` (NEVER `messages` or `message_attachments`).
  */
 export async function fetchReelsFeedPage(options: {
   currentUserId?: string;
   cursor?: string | null;
   limit?: number;
 }): Promise<ReelsPageResult> {
-  const limit = Math.min(Math.max(options.limit ?? 8, 2), 30);
+  const limit = Math.min(Math.max(options.limit ?? 10, 2), 30);
   const cursor = options.cursor || null;
 
   try {
+    // 1. Server API route first
+    try {
+      const headers = await getOptionalAuthHeaders();
+      const params = new URLSearchParams({ limit: String(limit) });
+      if (cursor) params.set('before', cursor);
+      const apiRes = await fetch(`/api/posts/reels?${params.toString()}`, { headers }).catch(() => null);
+      const json = apiRes?.ok ? await parseApiJson(apiRes) : null;
+      if (json?.success && Array.isArray(json.posts)) {
+        const rows = json.posts as SupabasePostRow[];
+        const savedSet = new Set<string>(json.savedPostIds || []);
+        const friendSet = new Set<string>(json.friendIds || []);
+        const reels = rows
+          .map((row) =>
+            normalizePostForReels(
+              mapSupabasePostToFrontend(row, options.currentUserId, savedSet, friendSet)
+            )
+          )
+          .filter((p) => isVideoPost(p));
+
+        return {
+          reels,
+          hasMore: Boolean(json.hasMore),
+          nextCursor: typeof json.nextCursor === 'string' ? json.nextCursor : null,
+        };
+      }
+    } catch {
+      // Fall back to direct Supabase queries below
+    }
+
+    // 2. Direct Supabase fallback (do NOT use SQL .neq('visibility', 'hidden') which drops NULL visibility!)
     const [postsRes, savedSet, moderatedSet, safetyCtx] = await Promise.all([
       queryReelsRowsResilient((q) => {
-        let next = q
-          .eq('post_media.kind', 'video')
-          .neq('visibility', 'hidden')
-          .order('created_at', { ascending: false });
+        let next = q.eq('post_media.kind', 'video').order('created_at', { ascending: false });
         if (cursor) {
           next = next.lt('created_at', cursor);
         }
-        return next.limit(limit);
+        return next.limit(limit * 2);
       }),
       fetchSavedPostIds(options.currentUserId),
       fetchModeratedPostIds(),
       getDirectSafetyContext(options.currentUserId),
     ]);
 
-    if (postsRes.error || postsRes.rows.length === 0) {
+    let sourceRows = postsRes.rows;
+
+    // 3. Secondary fallback: scan post_media directly if !inner join returned 0 rows (e.g. kind='image' with .mp4 URL or join RLS quirk)
+    if (sourceRows.length === 0) {
+      const { data: mediaRows } = await supabase
+        .from('post_media')
+        .select('post_id, kind, format, secure_url, created_at')
+        .order('created_at', { ascending: false })
+        .limit(120);
+
+      const candidatePostIds = Array.from(
+        new Set(
+          (mediaRows || [])
+            .filter((m: any) => isVideoMediaItem(m as PostMediaItem))
+            .map((m: any) => m.post_id)
+            .filter(Boolean)
+        )
+      ).slice(0, 40);
+
+      if (candidatePostIds.length > 0) {
+        const directRes = await querySupabasePostsResilient((q) => {
+          let next = q.in('id', candidatePostIds).order('created_at', { ascending: false });
+          if (cursor) {
+            next = next.lt('created_at', cursor);
+          }
+          return next;
+        });
+        sourceRows = directRes.rows;
+      }
+    }
+
+    if (sourceRows.length === 0) {
       return { reels: [], hasMore: false, nextCursor: null };
     }
 
-    await resolvePostMediaUrlsOnRows(postsRes.rows);
+    await resolvePostMediaUrlsOnRows(sourceRows);
 
     const seenIds = new Set<string>();
     const eligibleRows: SupabasePostRow[] = [];
-    for (const row of postsRes.rows) {
+    for (const row of sourceRows) {
       if (seenIds.has(row.id)) continue;
       seenIds.add(row.id);
       if (
@@ -188,6 +264,7 @@ export async function fetchReelsFeedPage(options: {
     }
 
     const reels = eligibleRows
+      .slice(0, limit)
       .map((row) =>
         normalizePostForReels(
           mapSupabasePostToFrontend(row, options.currentUserId, savedSet, safetyCtx.friendIds)
@@ -195,8 +272,8 @@ export async function fetchReelsFeedPage(options: {
       )
       .filter((p) => isVideoPost(p));
 
-    const hasMore = postsRes.rows.length >= limit;
-    const nextCursor = hasMore ? postsRes.rows[postsRes.rows.length - 1]?.created_at || null : null;
+    const hasMore = eligibleRows.length > limit || sourceRows.length >= limit * 2;
+    const nextCursor = hasMore ? sourceRows[sourceRows.length - 1]?.created_at || null : null;
 
     return { reels, hasMore, nextCursor };
   } catch (err) {
@@ -254,6 +331,27 @@ export async function searchReelsVideos(
   }
 
   try {
+    try {
+      const headers = await getOptionalAuthHeaders();
+      const params = new URLSearchParams({ q: cleaned, limit: String(limit) });
+      const apiRes = await fetch(`/api/posts/reels/search?${params.toString()}`, { headers }).catch(() => null);
+      const json = apiRes?.ok ? await parseApiJson(apiRes) : null;
+      if (json?.success && Array.isArray(json.posts)) {
+        const rows = json.posts as SupabasePostRow[];
+        const savedSet = new Set<string>(json.savedPostIds || []);
+        const friendSet = new Set<string>(json.friendIds || []);
+        return rows
+          .map((row) =>
+            normalizePostForReels(
+              mapSupabasePostToFrontend(row, currentUserId, savedSet, friendSet)
+            )
+          )
+          .filter((p) => isVideoPost(p));
+      }
+    } catch {
+      // Fall back to direct Supabase query below
+    }
+
     const noHash = cleaned.replace(/^#+/, '').trim();
     const captionPattern = `%${cleaned}%`;
     const tagPattern = noHash ? `%#${noHash}%` : captionPattern;
@@ -283,10 +381,9 @@ export async function searchReelsVideos(
       queryReelsRowsResilient((q) =>
         q
           .eq('post_media.kind', 'video')
-          .neq('visibility', 'hidden')
           .or(orClauses.join(','))
           .order('created_at', { ascending: false })
-          .limit(limit)
+          .limit(limit * 2)
       ),
       fetchSavedPostIds(currentUserId),
       fetchModeratedPostIds(),
@@ -315,6 +412,7 @@ export async function searchReelsVideos(
         );
         if (isVideoPost(mapped)) {
           results.push(mapped);
+          if (results.length >= limit) break;
         }
       }
     }

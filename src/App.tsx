@@ -71,6 +71,12 @@ const AppContent: React.FC = () => {
     if (!el) return;
     const savedTop = scrollPositionsRef.current.get(viewScrollKey) ?? 0;
     el.scrollTop = savedTop;
+    const rafId = requestAnimationFrame(() => {
+      if (mainScrollRef.current && viewScrollKeyRef.current === viewScrollKey) {
+        mainScrollRef.current.scrollTop = savedTop;
+      }
+    });
+    return () => cancelAnimationFrame(rafId);
   }, [viewScrollKey]);
 
   const handleMainScroll = React.useCallback(() => {

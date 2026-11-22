@@ -558,12 +558,21 @@ export async function sendTestNotification(userId: string, userName?: string): P
   success: boolean;
   message: string;
   pushDelivered?: boolean;
+  ranFcmFallback?: boolean;
+  sent?: number;
 }> {
   try {
     playNotificationChime();
+    const { data: sessionData } = await supabase.auth.getSession();
+    const token = sessionData?.session?.access_token;
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    if (token) {
+      headers.Authorization = `Bearer ${token}`;
+    }
+
     const res = await fetch('/api/notifications/send-test', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers,
       body: JSON.stringify({ userId, userName }),
     }).catch(() => null);
 
@@ -575,6 +584,7 @@ export async function sendTestNotification(userId: string, userName?: string): P
           success: true,
           message: data?.message || 'Test notification delivered!',
           pushDelivered: Boolean(data?.pushDelivered),
+          ranFcmFallback: false,
         };
       }
     }
@@ -585,6 +595,8 @@ export async function sendTestNotification(userId: string, userName?: string): P
       success: fcmDiag.success,
       message: fcmDiag.message,
       pushDelivered: (fcmDiag.sent ?? 0) > 0,
+      ranFcmFallback: true,
+      sent: fcmDiag.sent ?? 0,
     };
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : 'Chime played!';

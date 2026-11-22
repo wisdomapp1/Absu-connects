@@ -12,7 +12,61 @@ import {
 } from './cloudinaryService.ts';
 import { compressImageForUpload, validatePostVideoFile } from './mediaCompression.ts';
 import { getOrCreateDirectConversation, sendRealMessage } from './messageService.ts';
+import { getOptionalAuthHeaders, parseApiJson } from './postService.ts';
 import type { User } from '../types/index.ts';
+
+function encodeBase64Url(input: string): string {
+  const bytes = new TextEncoder().encode(input);
+  let binary = '';
+  for (let i = 0; i < bytes.length; i++) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+}
+
+function decodeBase64Url(b64url: string): string {
+  const padded = b64url.replace(/-/g, '+').replace(/_/g, '/') + '==='.slice((b64url.length + 3) % 4);
+  const binary = atob(padded);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return new TextDecoder().decode(bytes);
+}
+
+export function encodeOwnerScopedStoryRef(userId: string, mediaUrl: string | null | undefined): string | null {
+  if (!mediaUrl) return null;
+  const trimmed = String(mediaUrl).trim();
+  if (!trimmed) return null;
+  if (!trimmed.startsWith('http://') && !trimmed.startsWith('https://')) {
+    return trimmed;
+  }
+  const cleanNoQuery = trimmed.split('?')[0];
+  const extMatch = cleanNoQuery.match(/\.([a-z0-9]{2,5})$/i);
+  const ext = extMatch ? extMatch[1].toLowerCase() : 'bin';
+  return `${userId}/cld__${encodeBase64Url(trimmed)}.${ext}`;
+}
+
+export function decodeOwnerScopedStoryRef(ref: string | null | undefined): string {
+  if (!ref) return '';
+  const trimmed = String(ref).trim();
+  const cldMatch = trimmed.match(/^[^/]+\/cld__([A-Za-z0-9_-]+)(?:\.[a-z0-9]+)?$/i);
+  if (cldMatch?.[1]) {
+    try {
+      const decoded = decodeBase64Url(cldMatch[1]);
+      if (decoded.startsWith('http://') || decoded.startsWith('https://')) {
+        return decoded;
+      }
+    } catch {
+      // ignore decode errors
+    }
+  }
+  const directPrefixed = trimmed.match(/^[^/]+\/(https?:\/\/.+)$/i);
+  if (directPrefixed?.[1]) {
+    return directPrefixed[1];
+  }
+  return trimmed;
+}
 
 /**
  * Deterministic Story Group Sorting:
@@ -55,6 +109,19 @@ export function sortStoryGroups(
  */
 export async function fetchActiveStories(currentUserId?: string): Promise<UserStoryGroup[]> {
   try {
+    // 1. Try Express API endpoint first (uses admin client so schema/RLS never blocks story feed)
+    try {
+      const headers = await getOptionalAuthHeaders();
+      const qs = currentUserId ? `?userId=${encodeURIComponent(currentUserId)}` : '';
+      const apiRes = await fetch(`/api/stories${qs}`, { headers }).catch(() => null);
+      const json = apiRes?.ok ? await parseApiJson(apiRes) : null;
+      if (json?.success && Array.isArray(json.groups)) {
+        return sortStoryGroups(json.groups as UserStoryGroup[], currentUserId);
+      }
+    } catch {
+      // Fall back to direct Supabase client below (for static Vercel / offline hosts)
+    }
+
     const nowIso = new Date().toISOString();
 
     let storiesData: any[] | null = null;
@@ -89,22 +156,13 @@ export async function fetchActiveStories(currentUserId?: string): Promise<UserSt
       extRes.error &&
       (extRes.error.code === '42703' ||
         extRes.error.code === 'PGRST204' ||
+        extRes.error.message?.toLowerCase().includes('schema cache') ||
         extRes.error.message?.toLowerCase().includes('column'))
     ) {
+      // Strictly select MPV1 baseline columns (no background_color / font_style / deleted_at)
       const coreRes = await supabase
         .from('stories')
-        .select(`
-          id,
-          user_id,
-          media_type,
-          storage_path,
-          text_content,
-          caption,
-          background_color,
-          font_style,
-          created_at,
-          expires_at
-        `)
+        .select('id, user_id, media_type, storage_path, text_content, caption, created_at, expires_at')
         .gt('expires_at', nowIso)
         .order('created_at', { ascending: true });
       storiesData = coreRes.data;
@@ -116,7 +174,7 @@ export async function fetchActiveStories(currentUserId?: string): Promise<UserSt
 
     if (storiesErr || !storiesData || storiesData.length === 0) {
       if (storiesErr) {
-        console.warn('[Stories] Supabase fetch error:', storiesErr.message);
+        console.warn('[Stories] Supabase fetch note:', storiesErr.message);
       }
       return [];
     }
@@ -162,7 +220,10 @@ export async function fetchActiveStories(currentUserId?: string): Promise<UserSt
 
     const resolvedStories: Story[] = await Promise.all(
       storiesData.map(async (row) => {
-        const rawMediaRef = row.media_url || row.storage_path || '';
+        const rawMediaRef =
+          row.media_type === 'text'
+            ? ''
+            : decodeOwnerScopedStoryRef(row.media_url || row.storage_path || '');
         const isDirectUrl =
           row.provider === 'cloudinary' ||
           rawMediaRef.startsWith('https://') ||
@@ -182,8 +243,8 @@ export async function fetchActiveStories(currentUserId?: string): Promise<UserSt
           id: row.id,
           user_id: row.user_id,
           media_type: row.media_type as StoryMediaType,
-          storage_path: signedUrl,
-          media_url: row.media_url || signedUrl,
+          storage_path: row.media_type === 'text' ? null : signedUrl,
+          media_url: row.media_type === 'text' ? null : (decodeOwnerScopedStoryRef(row.media_url) || signedUrl),
           provider: row.provider || (signedUrl.includes('res.cloudinary.com') ? 'cloudinary' : 'supabase'),
           cloudinary_public_id: row.cloudinary_public_id || null,
           cloudinary_resource_type: row.cloudinary_resource_type || null,
@@ -354,10 +415,59 @@ export async function createStory(params: {
     onProgress?.('Saving story...');
     onPercent?.(95);
 
+    const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+
+    // 1. Try Express API endpoint first (handles MPV1/MPV2 schema variations + admin fallback cleanly)
+    try {
+      const authHeaders = await getOptionalAuthHeaders();
+      const apiRes = await fetch('/api/stories', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...authHeaders,
+        },
+        body: JSON.stringify({
+          userId: effectiveUserId,
+          mediaType,
+          storagePath: resolvedMediaUrl,
+          mediaUrl: resolvedMediaUrl,
+          provider: resolvedMediaUrl ? 'cloudinary' : null,
+          cloudinaryPublicId: uploadedPublicId,
+          cloudinaryResourceType: resolvedMediaUrl ? uploadedResourceType : null,
+          durationSeconds,
+          thumbnailUrl,
+          textContent: mediaType === 'text' ? textContent?.trim() : null,
+          caption: caption?.trim() || null,
+          backgroundColor: backgroundColor || null,
+          fontStyle: fontStyle || null,
+          expiresAt,
+        }),
+      }).catch(() => null);
+
+      const apiJson = apiRes ? await parseApiJson(apiRes) : null;
+      if (apiRes && apiRes.ok && apiJson?.success && apiJson.story) {
+        onPercent?.(100);
+        return {
+          success: true,
+          story: {
+            ...apiJson.story,
+            has_viewed: true,
+          },
+        };
+      }
+    } catch {
+      // Fall back to direct Supabase insert below
+    }
+
+    const ownerScopedStoragePath =
+      mediaType === 'text'
+        ? null
+        : encodeOwnerScopedStoryRef(effectiveUserId, resolvedMediaUrl);
+
     const extendedPayload: Record<string, any> = {
       user_id: effectiveUserId,
       media_type: mediaType,
-      storage_path: resolvedMediaUrl,
+      storage_path: ownerScopedStoragePath,
       media_url: resolvedMediaUrl,
       provider: resolvedMediaUrl ? 'cloudinary' : null,
       cloudinary_public_id: uploadedPublicId,
@@ -369,6 +479,7 @@ export async function createStory(params: {
       caption: caption?.trim() || null,
       background_color: backgroundColor || null,
       font_style: fontStyle || null,
+      expires_at: expiresAt,
     };
 
     let { data: sbData, error: insertError } = await supabase
@@ -384,18 +495,39 @@ export async function createStory(params: {
         insertError.message?.toLowerCase().includes('schema cache') ||
         insertError.message?.toLowerCase().includes('column'))
     ) {
+      // Strictly insert MPV1 baseline columns (omit background_color / font_style / media_url if unmigrated)
       const corePayload: Record<string, any> = {
         user_id: effectiveUserId,
         media_type: mediaType,
-        storage_path: resolvedMediaUrl,
+        storage_path: ownerScopedStoragePath,
         text_content: mediaType === 'text' ? textContent?.trim() : null,
         caption: caption?.trim() || null,
-        background_color: backgroundColor || null,
-        font_style: fontStyle || null,
+        expires_at: expiresAt,
       };
       const fallbackRes = await supabase.from('stories').insert(corePayload).select().single();
       sbData = fallbackRes.data;
       insertError = fallbackRes.error;
+    }
+
+    if (
+      insertError &&
+      mediaType === 'text' &&
+      insertError.message?.toLowerCase().includes('stories_storage_owner_path')
+    ) {
+      const textRetryRes = await supabase
+        .from('stories')
+        .insert({
+          user_id: effectiveUserId,
+          media_type: mediaType,
+          storage_path: `${effectiveUserId}/text_${Date.now()}.txt`,
+          text_content: textContent?.trim() || null,
+          caption: caption?.trim() || null,
+          expires_at: expiresAt,
+        })
+        .select()
+        .single();
+      sbData = textRetryRes.data;
+      insertError = textRetryRes.error;
     }
 
     if (insertError || !sbData) {
@@ -409,17 +541,22 @@ export async function createStory(params: {
 
     onPercent?.(100);
 
+    const decodedStoryMediaUrl =
+      mediaType === 'text'
+        ? null
+        : resolvedMediaUrl || decodeOwnerScopedStoryRef(sbData.media_url || sbData.storage_path || '');
+
     return {
       success: true,
       story: {
         id: sbData.id,
         user_id: sbData.user_id,
         media_type: sbData.media_type as StoryMediaType,
-        storage_path: resolvedMediaUrl || sbData.storage_path || null,
-        media_url: sbData.media_url || resolvedMediaUrl || sbData.storage_path || null,
-        provider: sbData.provider || (resolvedMediaUrl ? 'cloudinary' : null),
+        storage_path: decodedStoryMediaUrl,
+        media_url: decodedStoryMediaUrl,
+        provider: sbData.provider || (decodedStoryMediaUrl ? 'cloudinary' : null),
         cloudinary_public_id: sbData.cloudinary_public_id || uploadedPublicId,
-        cloudinary_resource_type: sbData.cloudinary_resource_type || (resolvedMediaUrl ? uploadedResourceType : null),
+        cloudinary_resource_type: sbData.cloudinary_resource_type || (decodedStoryMediaUrl ? uploadedResourceType : null),
         duration_seconds: sbData.duration_seconds ?? durationSeconds,
         thumbnail_url: sbData.thumbnail_url ?? thumbnailUrl,
         text_content: sbData.text_content,
@@ -444,6 +581,15 @@ export async function createStory(params: {
 export async function recordStoryView(storyId: string, viewerId: string): Promise<void> {
   if (!storyId || !viewerId) return;
   try {
+    const authHeaders = await getOptionalAuthHeaders();
+    const apiRes = await fetch(`/api/stories/${encodeURIComponent(storyId)}/view`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...authHeaders },
+      body: JSON.stringify({ viewerId }),
+    }).catch(() => null);
+    const json = apiRes?.ok ? await parseApiJson(apiRes) : null;
+    if (json?.success) return;
+
     const { error } = await supabase
       .from('story_views')
       .upsert(
@@ -462,7 +608,7 @@ export async function recordStoryView(storyId: string, viewerId: string): Promis
 }
 
 /**
- * Toggle reaction (like) on a story directly in Supabase `story_reactions`.
+ * Toggle reaction (like) on a story via Express API first with Supabase fallback.
  */
 export async function toggleStoryReaction(
   storyId: string,
@@ -470,6 +616,17 @@ export async function toggleStoryReaction(
   currentlyLiked: boolean
 ): Promise<{ success: boolean; liked: boolean; error?: string }> {
   try {
+    const authHeaders = await getOptionalAuthHeaders();
+    const apiRes = await fetch(`/api/stories/${encodeURIComponent(storyId)}/reaction`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...authHeaders },
+      body: JSON.stringify({ userId, currentlyLiked }),
+    }).catch(() => null);
+    const json = apiRes?.ok ? await parseApiJson(apiRes) : null;
+    if (json?.success) {
+      return { success: true, liked: Boolean(json.liked) };
+    }
+
     if (currentlyLiked) {
       const { error } = await supabase
         .from('story_reactions')
@@ -586,6 +743,18 @@ export async function fetchStoryInsights(storyId: string): Promise<{
   reactionsCount: number;
 }> {
   try {
+    const authHeaders = await getOptionalAuthHeaders();
+    const apiRes = await fetch(`/api/stories/${encodeURIComponent(storyId)}/insights`, {
+      headers: authHeaders,
+    }).catch(() => null);
+    const json = apiRes?.ok ? await parseApiJson(apiRes) : null;
+    if (json?.success) {
+      return {
+        views: Array.isArray(json.views) ? json.views : [],
+        reactionsCount: Number(json.reactionsCount) || 0,
+      };
+    }
+
     const [viewsRes, reactionsRes] = await Promise.all([
       supabase
         .from('story_views')
@@ -664,11 +833,13 @@ export async function deleteStory(
       storyRow = extSel.data;
     }
 
-    const mediaRef = storyRow?.media_url || storyRow?.storage_path || storagePath || '';
+    const rawStoragePath = storyRow?.storage_path || storagePath || '';
+    const mediaRef = decodeOwnerScopedStoryRef(storyRow?.media_url || rawStoragePath || '');
     const isCloudinary =
       storyRow?.provider === 'cloudinary' ||
       Boolean(storyRow?.cloudinary_public_id) ||
-      String(mediaRef).includes('res.cloudinary.com');
+      String(mediaRef).includes('res.cloudinary.com') ||
+      String(rawStoragePath).includes('/cld__');
 
     let cloudCleanupSucceeded = true;
 
@@ -708,12 +879,27 @@ export async function deleteStory(
       // If deleted_at column is not yet migrated, proceed with hard delete
     }
 
+    const authHeaders = await getOptionalAuthHeaders();
+    const apiDelRes = await fetch(`/api/stories/${encodeURIComponent(storyId)}`, {
+      method: 'DELETE',
+      headers: authHeaders,
+    }).catch(() => null);
+    const apiDelJson = apiDelRes?.ok ? await parseApiJson(apiDelRes) : null;
+    if (apiDelJson?.success) {
+      return { success: true };
+    }
+
     const { error } = await supabase.from('stories').delete().eq('id', storyId);
     if (error) {
       return { success: false, error: error.message };
     }
 
-    if (!isCloudinary && mediaRef && !mediaRef.startsWith('http')) {
+    if (
+      !isCloudinary &&
+      mediaRef &&
+      !mediaRef.startsWith('http') &&
+      !String(rawStoragePath).match(/\/text_\d+\.txt$/)
+    ) {
       await deleteStoryMediaFromStorage(mediaRef);
     }
     return { success: true };
