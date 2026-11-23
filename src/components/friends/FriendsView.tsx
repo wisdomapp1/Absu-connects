@@ -45,6 +45,7 @@ export const FriendsView: React.FC = () => {
     navigateTo,
     goBack,
     isUserOnline,
+    isRefreshingScreen,
     addToast,
   } = useApp();
   const { user } = useAuth();
@@ -74,6 +75,39 @@ export const FriendsView: React.FC = () => {
       }
     });
   }, [currentUserId]);
+
+  const discoverySearchRef = useRef(discoverySearch);
+  discoverySearchRef.current = discoverySearch;
+
+  useEffect(() => {
+    const handleFriendsRefresh = () => {
+      fetchMrAnonymousPage(currentUserId).then((page) => {
+        if (page) {
+          setAnonPage(page);
+          setFollowingAnon(Boolean(page.isFollowing));
+        }
+      });
+      const activeQuery = discoverySearchRef.current.trim();
+      if (activeQuery) {
+        setSearchingServer(true);
+        fetchDiscoverProfilesPage({
+          currentUserId,
+          offset: 0,
+          limit: 40,
+          search: activeQuery,
+          excludeIds: Array.from(blockedUserIds),
+        })
+          .then((page) => {
+            setServerSearchResults(page.users);
+            setSearchHasMore(page.hasMore);
+            setSearchNextOffset(page.nextOffset);
+          })
+          .finally(() => setSearchingServer(false));
+      }
+    };
+    window.addEventListener('absu:refresh-friends', handleFriendsRefresh);
+    return () => window.removeEventListener('absu:refresh-friends', handleFriendsRefresh);
+  }, [currentUserId, blockedUserIds]);
 
   const handleFollowAnon = async () => {
     if (!anonPage || !currentUserId || followLoading) return;
@@ -256,6 +290,12 @@ export const FriendsView: React.FC = () => {
 
   return (
     <div className="flex flex-col gap-3 pb-8">
+      {isRefreshingScreen && (
+        <div className="flex items-center justify-center gap-2 py-1 text-[11px] font-semibold text-[var(--color-primary)] animate-in fade-in duration-150">
+          <Loader2 className="w-3.5 h-3.5 animate-spin" />
+          <span>Refreshing discovery...</span>
+        </div>
+      )}
       {/* Facebook-style Friends Header with Back Arrow and Search */}
       <div className="flex items-center justify-between px-1 py-1">
         <div className="flex items-center gap-2">
@@ -266,8 +306,11 @@ export const FriendsView: React.FC = () => {
           >
             <ArrowLeft className="w-5 h-5" />
           </button>
-          <h1 className="text-2xl font-black text-[var(--color-text-primary)] tracking-tight">
-            Friends
+          <h1 className="text-2xl font-black text-[var(--color-text-primary)] tracking-tight flex items-center gap-2">
+            <span>Friends</span>
+            {isRefreshingScreen && (
+              <Loader2 className="w-4 h-4 animate-spin text-[var(--color-primary)]" aria-label="Refreshing discovery" />
+            )}
           </h1>
         </div>
 
@@ -293,6 +336,10 @@ export const FriendsView: React.FC = () => {
             }}
             placeholder="Search all ABSU students by name, @username, department..."
             autoFocus
+            autoCorrect="on"
+            autoCapitalize="none"
+            spellCheck={true}
+            enterKeyHint="search"
             className="w-full pl-10 pr-10 py-2.5 bg-[var(--color-bg-card)] border border-[var(--color-border)] rounded-2xl text-xs sm:text-sm text-[var(--color-text-primary)] placeholder:text-[var(--color-text-secondary)] focus:outline-none focus:ring-2 focus:ring-[var(--color-primary)]"
           />
           {discoverySearch && (

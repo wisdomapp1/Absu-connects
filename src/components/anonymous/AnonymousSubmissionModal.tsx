@@ -191,6 +191,9 @@ export const AnonymousSubmissionModal: React.FC<AnonymousSubmissionModalProps> =
                 placeholder="Share your confession, experience, campus gist, or question here. Please remember not to include real names, phone numbers, or identifying details..."
                 rows={6}
                 maxLength={maxChars}
+                autoCorrect="on"
+                autoCapitalize="sentences"
+                spellCheck={true}
                 className="w-full p-4 rounded-2xl bg-[var(--color-bg-main)] border border-[var(--color-border)] text-xs sm:text-sm text-[var(--color-text-primary)] placeholder-[var(--color-text-secondary)]/60 focus:outline-none focus:ring-2 focus:ring-[var(--color-primary)]/40 resize-none transition-all leading-relaxed"
               />
 

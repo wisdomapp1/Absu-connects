@@ -269,6 +269,10 @@ export const ReelsCommentsModal: React.FC<ReelsCommentsModalProps> = ({
                   type="text"
                   value={editDraft}
                   onChange={(e) => setEditDraft(e.target.value)}
+                  autoCorrect="on"
+                  autoCapitalize="sentences"
+                  spellCheck={true}
+                  enterKeyHint="done"
                   className="flex-1 px-3 py-1.5 rounded-xl bg-[var(--color-bg-main)] border border-[var(--color-border)] text-xs text-[var(--color-text-primary)] outline-none focus:border-[var(--color-primary)]"
                 />
                 <button
@@ -356,6 +360,10 @@ export const ReelsCommentsModal: React.FC<ReelsCommentsModalProps> = ({
                   onChange={(e) => setReplyDraft(e.target.value)}
                   placeholder={`Reply to ${c.author.name}...`}
                   autoFocus
+                  autoCorrect="on"
+                  autoCapitalize="sentences"
+                  spellCheck={true}
+                  enterKeyHint="send"
                   onKeyDown={(e) => {
                     if (e.key === 'Enter') {
                       e.preventDefault();
@@ -480,6 +488,10 @@ export const ReelsCommentsModal: React.FC<ReelsCommentsModalProps> = ({
             value={commentText}
             onChange={(e) => setCommentText(e.target.value)}
             placeholder="Add a comment..."
+            autoCorrect="on"
+            autoCapitalize="sentences"
+            spellCheck={true}
+            enterKeyHint="send"
             className="flex-1 px-3.5 py-2 rounded-full bg-[var(--color-bg-main)] border border-[var(--color-border)] text-xs sm:text-sm text-[var(--color-text-primary)] placeholder-[var(--color-text-secondary)] outline-none focus:border-[var(--color-primary)]"
           />
           <button

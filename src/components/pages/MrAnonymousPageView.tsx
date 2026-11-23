@@ -17,7 +17,6 @@ import {
   ShieldCheck,
   EyeOff,
   ArrowLeft,
-  Share2,
   Check,
   Plus,
   Loader2,
@@ -114,11 +113,6 @@ export const MrAnonymousPageView: React.FC = () => {
     }
   };
 
-  const handleSharePage = () => {
-    navigator.clipboard?.writeText(window.location.href);
-    addToast('Mr Anonymous page link copied to clipboard!', 'info');
-  };
-
   // Collect all photos from posts
   const postPhotos = posts.flatMap((p) => {
     const list: string[] = [];
@@ -170,15 +164,6 @@ export const MrAnonymousPageView: React.FC = () => {
               aria-label="Back to feed"
             >
               <ArrowLeft className="w-5 h-5" />
-            </button>
-
-            <button
-              onClick={handleSharePage}
-              className="p-2.5 rounded-full bg-black/40 hover:bg-black/60 text-white backdrop-blur-md transition-all active:scale-95 flex items-center gap-1.5 text-xs font-semibold"
-              aria-label="Share page"
-            >
-              <Share2 className="w-4 h-4" />
-              <span className="hidden sm:inline">Share</span>
             </button>
           </div>
         </div>

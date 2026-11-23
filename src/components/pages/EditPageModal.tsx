@@ -409,6 +409,9 @@ export const EditPageModal: React.FC<EditPageModalProps> = ({
               required
               value={name}
               onChange={(e) => setName(e.target.value)}
+              autoCorrect="on"
+              autoCapitalize="words"
+              spellCheck={true}
               className="w-full px-3.5 py-2.5 rounded-xl bg-[var(--color-bg-main)] border border-[var(--color-border)] text-xs sm:text-sm text-[var(--color-text-primary)] focus:outline-none focus:ring-2 focus:ring-[var(--color-primary)]/40 font-medium transition-all"
             />
           </div>
@@ -441,6 +444,9 @@ export const EditPageModal: React.FC<EditPageModalProps> = ({
               rows={3}
               value={description}
               onChange={(e) => setDescription(e.target.value)}
+              autoCorrect="on"
+              autoCapitalize="sentences"
+              spellCheck={true}
               className="w-full p-3 rounded-xl bg-[var(--color-bg-main)] border border-[var(--color-border)] text-xs sm:text-sm text-[var(--color-text-primary)] focus:outline-none focus:ring-2 focus:ring-[var(--color-primary)]/40 resize-none transition-all"
             />
           </div>
@@ -458,6 +464,9 @@ export const EditPageModal: React.FC<EditPageModalProps> = ({
                   value={location}
                   onChange={(e) => setLocation(e.target.value)}
                   placeholder="e.g. Uturu Campus"
+                  autoCorrect="on"
+                  autoCapitalize="words"
+                  spellCheck={true}
                   className="w-full pl-8 pr-2.5 py-2 rounded-xl bg-[var(--color-bg-main)] border border-[var(--color-border)] text-xs text-[var(--color-text-primary)] focus:outline-none focus:ring-2 focus:ring-[var(--color-primary)]/40"
                 />
               </div>
@@ -474,6 +483,11 @@ export const EditPageModal: React.FC<EditPageModalProps> = ({
                   value={contactEmail}
                   onChange={(e) => setContactEmail(e.target.value)}
                   placeholder="contact@..."
+                  autoComplete="email"
+                  inputMode="email"
+                  autoCorrect="off"
+                  autoCapitalize="none"
+                  spellCheck={false}
                   className="w-full pl-8 pr-2.5 py-2 rounded-xl bg-[var(--color-bg-main)] border border-[var(--color-border)] text-xs text-[var(--color-text-primary)] focus:outline-none focus:ring-2 focus:ring-[var(--color-primary)]/40"
                 />
               </div>
@@ -490,6 +504,8 @@ export const EditPageModal: React.FC<EditPageModalProps> = ({
                   value={contactPhone}
                   onChange={(e) => setContactPhone(e.target.value)}
                   placeholder="+234..."
+                  autoComplete="tel"
+                  inputMode="tel"
                   className="w-full pl-8 pr-2.5 py-2 rounded-xl bg-[var(--color-bg-main)] border border-[var(--color-border)] text-xs text-[var(--color-text-primary)] focus:outline-none focus:ring-2 focus:ring-[var(--color-primary)]/40"
                 />
               </div>

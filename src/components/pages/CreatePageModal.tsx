@@ -447,6 +447,9 @@ export const CreatePageModal: React.FC<CreatePageModalProps> = ({
                 value={name}
                 onChange={(e) => setName(e.target.value)}
                 placeholder="e.g. LAWSA ABSU, NACOS Chapter, Campus Daily News"
+                autoCorrect="on"
+                autoCapitalize="words"
+                spellCheck={true}
                 className="w-full px-3.5 py-2.5 rounded-xl bg-[var(--color-bg-main)] border border-[var(--color-border)] text-xs sm:text-sm text-[var(--color-text-primary)] placeholder-[var(--color-text-secondary)]/60 focus:outline-none focus:ring-2 focus:ring-[var(--color-primary)]/40 font-medium transition-all"
               />
             </div>
@@ -480,6 +483,9 @@ export const CreatePageModal: React.FC<CreatePageModalProps> = ({
                 value={description}
                 onChange={(e) => setDescription(e.target.value)}
                 placeholder="Describe your organization, department, or initiative..."
+                autoCorrect="on"
+                autoCapitalize="sentences"
+                spellCheck={true}
                 className="w-full p-3 rounded-xl bg-[var(--color-bg-main)] border border-[var(--color-border)] text-xs sm:text-sm text-[var(--color-text-primary)] placeholder-[var(--color-text-secondary)]/60 focus:outline-none focus:ring-2 focus:ring-[var(--color-primary)]/40 resize-none transition-all"
               />
             </div>
@@ -495,6 +501,9 @@ export const CreatePageModal: React.FC<CreatePageModalProps> = ({
                 value={whyCreate}
                 onChange={(e) => setWhyCreate(e.target.value)}
                 placeholder="Briefly state your role (e.g. Association PRO, President, Founder) and purpose..."
+                autoCorrect="on"
+                autoCapitalize="sentences"
+                spellCheck={true}
                 className="w-full p-3 rounded-xl bg-[var(--color-bg-main)] border border-[var(--color-border)] text-xs sm:text-sm text-[var(--color-text-primary)] placeholder-[var(--color-text-secondary)]/60 focus:outline-none focus:ring-2 focus:ring-[var(--color-primary)]/40 resize-none transition-all"
               />
             </div>
@@ -512,6 +521,9 @@ export const CreatePageModal: React.FC<CreatePageModalProps> = ({
                     value={location}
                     onChange={(e) => setLocation(e.target.value)}
                     placeholder="e.g. Faculty of Law, Uturu"
+                    autoCorrect="on"
+                    autoCapitalize="words"
+                    spellCheck={true}
                     className="w-full pl-9 pr-3 py-2 rounded-xl bg-[var(--color-bg-main)] border border-[var(--color-border)] text-xs text-[var(--color-text-primary)] placeholder-[var(--color-text-secondary)]/60 focus:outline-none focus:ring-2 focus:ring-[var(--color-primary)]/40"
                   />
                 </div>
@@ -528,6 +540,8 @@ export const CreatePageModal: React.FC<CreatePageModalProps> = ({
                     value={contactPhone}
                     onChange={(e) => setContactPhone(e.target.value)}
                     placeholder="+234..."
+                    autoComplete="tel"
+                    inputMode="tel"
                     className="w-full pl-9 pr-3 py-2 rounded-xl bg-[var(--color-bg-main)] border border-[var(--color-border)] text-xs text-[var(--color-text-primary)] placeholder-[var(--color-text-secondary)]/60 focus:outline-none focus:ring-2 focus:ring-[var(--color-primary)]/40"
                   />
                 </div>

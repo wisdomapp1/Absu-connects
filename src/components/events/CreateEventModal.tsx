@@ -315,6 +315,9 @@ export const CreateEventModal: React.FC<CreateEventModalProps> = ({
               onChange={(e) => setTitle(e.target.value)}
               placeholder="e.g. LAWSA Annual Moot Court Finals, NACOS Hackathon"
               maxLength={120}
+              autoCorrect="on"
+              autoCapitalize="words"
+              spellCheck={true}
               className="w-full px-3.5 py-2.5 rounded-xl bg-[var(--color-bg-main)] border border-[var(--color-border)] text-xs sm:text-sm text-[var(--color-text-primary)] placeholder-[var(--color-text-secondary)]/60 focus:outline-none focus:ring-2 focus:ring-[var(--color-primary)]/40 transition-all"
             />
           </div>
@@ -369,6 +372,9 @@ export const CreateEventModal: React.FC<CreateEventModalProps> = ({
                 onChange={(e) => setVenue(e.target.value)}
                 placeholder="e.g. University e-Library Hall, Pavilion A Sports Arena"
                 maxLength={100}
+                autoCorrect="on"
+                autoCapitalize="words"
+                spellCheck={true}
                 className="w-full pl-9 pr-4 py-2.5 rounded-xl bg-[var(--color-bg-main)] border border-[var(--color-border)] text-xs sm:text-sm text-[var(--color-text-primary)] placeholder-[var(--color-text-secondary)]/60 focus:outline-none focus:ring-2 focus:ring-[var(--color-primary)]/40 transition-all"
               />
             </div>
@@ -414,6 +420,9 @@ export const CreateEventModal: React.FC<CreateEventModalProps> = ({
               onChange={(e) => setDescription(e.target.value)}
               placeholder="What should students expect? Mention speakers, agenda, special activities, and requirements..."
               maxLength={1000}
+              autoCorrect="on"
+              autoCapitalize="sentences"
+              spellCheck={true}
               className="w-full p-3 rounded-xl bg-[var(--color-bg-main)] border border-[var(--color-border)] text-xs sm:text-sm text-[var(--color-text-primary)] placeholder-[var(--color-text-secondary)]/60 focus:outline-none focus:ring-2 focus:ring-[var(--color-primary)]/40 resize-none transition-all"
             />
           </div>
@@ -430,6 +439,10 @@ export const CreateEventModal: React.FC<CreateEventModalProps> = ({
                 value={registrationLink}
                 onChange={(e) => setRegistrationLink(e.target.value)}
                 placeholder="https://... (Google Forms, official portal or external RSVP link)"
+                autoCorrect="off"
+                autoCapitalize="none"
+                spellCheck={false}
+                inputMode="url"
                 className="w-full pl-9 pr-4 py-2.5 rounded-xl bg-[var(--color-bg-main)] border border-[var(--color-border)] text-xs sm:text-sm text-[var(--color-text-primary)] placeholder-[var(--color-text-secondary)]/60 focus:outline-none focus:ring-2 focus:ring-[var(--color-primary)]/40 transition-all"
               />
             </div>

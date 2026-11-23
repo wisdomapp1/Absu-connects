@@ -683,6 +683,9 @@ export const CreatePostModal: React.FC = () => {
                 maxLength={2000}
                 rows={isFullScreen ? 8 : 5}
                 placeholder="Share course updates, lecture notes, campus questions, or hostel news..."
+                autoCorrect="on"
+                autoCapitalize="sentences"
+                spellCheck={true}
                 className="w-full bg-transparent resize-none text-[15px] sm:text-[16px] text-[var(--color-text-primary)] placeholder:text-[var(--color-text-secondary)] focus:outline-none leading-relaxed"
               />
             </div>

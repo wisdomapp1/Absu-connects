@@ -908,6 +908,10 @@ export const SettingsView: React.FC = () => {
                   onChange={(e) => setNewPassword(e.target.value)}
                   required
                   placeholder="Minimum 6 characters"
+                  autoComplete="new-password"
+                  autoCorrect="off"
+                  autoCapitalize="none"
+                  spellCheck={false}
                   className="w-full p-2.5 rounded-xl bg-[var(--color-bg-main)] border border-[var(--color-border)] text-[var(--color-text-primary)]"
                 />
               </div>
@@ -922,6 +926,10 @@ export const SettingsView: React.FC = () => {
                   onChange={(e) => setConfirmPassword(e.target.value)}
                   required
                   placeholder="Confirm new password"
+                  autoComplete="new-password"
+                  autoCorrect="off"
+                  autoCapitalize="none"
+                  spellCheck={false}
                   className="w-full p-2.5 rounded-xl bg-[var(--color-bg-main)] border border-[var(--color-border)] text-[var(--color-text-primary)]"
                 />
               </div>

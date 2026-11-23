@@ -171,7 +171,7 @@ export interface AppContextType {
     }
   ) => Promise<boolean>;
   toggleLike: (postId: string) => Promise<void>;
-  toggleSave: (postId: string, explicitWasSaved?: boolean) => Promise<void>;
+  toggleSave: (postId: string, explicitWasSaved?: boolean) => Promise<boolean>;
   addComment: (postId: string, text: string, parentId?: string | null) => Promise<void>;
   deletePost: (postId: string) => Promise<void>;
   hidePost: (postId: string) => void;
@@ -611,18 +611,47 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     setInitialPostMedia([]);
   }, []);
 
+  const lastRetapRefreshRef = useRef<number>(0);
+
   const setActiveTab = (tab: MainNavTab) => {
     if (tab === 'reels') {
       // Clear any previous deep-link target when user taps the main Reels nav tab directly
       setSelectedPostId(null);
       setSelectedPostNavContext(null);
     }
-    if (activeTabRef.current === tab && activeViewRef.current === tab) {
+
+    const isAlreadyViewingTab =
+      activeTabRef.current === tab &&
+      activeViewRef.current === tab &&
+      !searchOpenRef.current;
+
+    if (isAlreadyViewingTab) {
       if (tab === 'reels' && typeof window !== 'undefined') {
         window.dispatchEvent(new CustomEvent('absu:reels-reset-top'));
+      } else if (tab === 'home' || tab === 'friends') {
+        if (typeof window !== 'undefined') {
+          window.dispatchEvent(
+            new CustomEvent('absu:scroll-top', { detail: { view: tab } })
+          );
+        }
+        const now = Date.now();
+        if (!isRefreshingScreenRef.current && now - lastRetapRefreshRef.current > 350) {
+          lastRetapRefreshRef.current = now;
+          if (typeof window !== 'undefined') {
+            window.dispatchEvent(
+              new CustomEvent(tab === 'home' ? 'absu:refresh-home' : 'absu:refresh-friends')
+            );
+          }
+          refreshCurrentScreen().catch(() => {});
+        }
       }
       return;
     }
+
+    if (searchOpenRef.current) {
+      setSearchOpenState(false);
+    }
+
     setActiveTabState(tab);
     setActiveView(tab);
     const entry: NavigationEntry = { view: tab, tab };
@@ -1990,23 +2019,74 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     }
   };
 
-  const toggleSave = async (postId: string, explicitWasSaved?: boolean) => {
+  const savingPostIdsRef = useRef<Set<string>>(new Set());
+
+  const toggleSave = async (postId: string, explicitWasSaved?: boolean): Promise<boolean> => {
+    if (!auth.user) {
+      addToast('Sign in to save posts.', 'warning');
+      return false;
+    }
+
+    if (savingPostIdsRef.current.has(postId)) {
+      return false;
+    }
+
     const target = posts.find((p) => p.id === postId);
     const wasSaved = explicitWasSaved !== undefined ? explicitWasSaved : (target?.isSaved ?? false);
     const nextSaved = !wasSaved;
 
+    savingPostIdsRef.current.add(postId);
     setPosts((prev) =>
       prev.map((post) => (post.id === postId ? { ...post, isSaved: nextSaved } : post))
     );
-    addToast(nextSaved ? 'Saved to bookmarks' : 'Removed from bookmarks', 'info');
 
-    if (!auth.user) return;
-    const res = await toggleSavePostInDb(postId, auth.user.id, wasSaved);
-    if (!res.success) {
+    try {
+      const res = await toggleSavePostInDb(postId, auth.user.id, wasSaved);
+      if (res.success) {
+        setPosts((prev) =>
+          prev.map((post) => (post.id === postId ? { ...post, isSaved: res.isSaved } : post))
+        );
+        if (typeof window !== 'undefined') {
+          window.dispatchEvent(
+            new CustomEvent('absu:saved-posts-changed', {
+              detail: { postId, isSaved: res.isSaved },
+            })
+          );
+        }
+        addToast(
+          res.isSaved ? 'Post saved' : 'Removed from saved posts',
+          'info'
+        );
+        return true;
+      }
+
       setPosts((prev) =>
         prev.map((post) => (post.id === postId ? { ...post, isSaved: wasSaved } : post))
       );
-      if (res.error) addToast(res.error, 'warning');
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(
+          new CustomEvent('absu:saved-posts-changed', {
+            detail: { postId, isSaved: wasSaved },
+          })
+        );
+      }
+      addToast(res.error || 'Could not update saved post. Please try again.', 'warning');
+      return false;
+    } catch {
+      setPosts((prev) =>
+        prev.map((post) => (post.id === postId ? { ...post, isSaved: wasSaved } : post))
+      );
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(
+          new CustomEvent('absu:saved-posts-changed', {
+            detail: { postId, isSaved: wasSaved },
+          })
+        );
+      }
+      addToast('Could not update saved post. Please check your connection.', 'warning');
+      return false;
+    } finally {
+      savingPostIdsRef.current.delete(postId);
     }
   };
 

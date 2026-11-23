@@ -448,6 +448,10 @@ export const VideoEditorModal: React.FC<VideoEditorModalProps> = ({
               value={caption}
               onChange={(e) => setCaption(e.target.value)}
               placeholder="e.g. Highlights from SUG football finals at Sports Complex"
+              autoCorrect="on"
+              autoCapitalize="sentences"
+              spellCheck={true}
+              enterKeyHint="done"
               className="w-full bg-[var(--color-bg-card)] border border-[var(--color-border)] rounded-xl px-3 py-2 text-xs text-[var(--color-text-primary)] placeholder:text-[var(--color-text-secondary)] focus:ring-1 focus:ring-[var(--color-primary)] focus:outline-none"
             />
           </div>

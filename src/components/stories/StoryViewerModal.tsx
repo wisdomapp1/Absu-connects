@@ -538,7 +538,11 @@ export const StoryViewerModal: React.FC<StoryViewerModalProps> = ({
                   onBlur={() => setIsReplyFocused(false)}
                   onChange={(e) => setReplyText(e.target.value)}
                   placeholder={`Send direct message to ${currentGroup.user_name.split(' ')[0]}...`}
-                  className="w-full min-h-[44px] bg-white/20 hover:bg-white/25 focus:bg-white/30 text-white placeholder-white/70 text-xs rounded-xl py-2.5 pl-4 pr-14 border border-white/20 focus:outline-none focus:ring-1 focus:ring-white/50 backdrop-blur-md"
+                  autoCorrect="on"
+                  autoCapitalize="sentences"
+                  spellCheck={true}
+                  enterKeyHint="send"
+                  className="w-full min-h-[44px] bg-white/20 hover:bg-white/25 focus:bg-white/30 text-white placeholder-white/70 text-xs rounded-xl py-2.5 pl-4 pr-14 border border-white/20 focus:outline-none focus:ring-1 focus:ring-white/50 backdrop-blur-md select-text"
                 />
                 {replyText.trim() && (
                   <button

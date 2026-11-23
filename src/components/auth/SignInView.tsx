@@ -76,6 +76,12 @@ export const SignInView: React.FC = () => {
               value={email}
               onChange={(e) => setEmail(e.target.value)}
               placeholder="e.g. yourname@gmail.com or student@absu.edu.ng"
+              autoComplete="email"
+              autoCorrect="off"
+              autoCapitalize="none"
+              spellCheck={false}
+              inputMode="email"
+              enterKeyHint="next"
               required
               disabled={loading}
               className="w-full pl-9 pr-3 py-2.5 bg-[var(--color-bg-main)] border border-[var(--color-border)] rounded-xl text-xs sm:text-sm text-[var(--color-text-primary)] placeholder:text-[var(--color-text-secondary)] focus:ring-1 focus:ring-[var(--color-primary)] focus:outline-none disabled:opacity-50"
@@ -104,6 +110,11 @@ export const SignInView: React.FC = () => {
               value={password}
               onChange={(e) => setPassword(e.target.value)}
               placeholder="Enter your password"
+              autoComplete="current-password"
+              autoCorrect="off"
+              autoCapitalize="none"
+              spellCheck={false}
+              enterKeyHint="done"
               required
               disabled={loading}
               className="w-full pl-9 pr-10 py-2.5 bg-[var(--color-bg-main)] border border-[var(--color-border)] rounded-xl text-xs sm:text-sm text-[var(--color-text-primary)] placeholder:text-[var(--color-text-secondary)] focus:ring-1 focus:ring-[var(--color-primary)] focus:outline-none disabled:opacity-50"

@@ -27,12 +27,23 @@ export const PullToRefresh: React.FC<PullToRefreshProps> = ({ children, scrollCo
 
   // Sync with global isRefreshingScreen (both start and completion of external refreshes)
   useEffect(() => {
-    if (isRefreshingScreen && refreshStateRef.current === 'idle') {
+    if (isRefreshingScreen && !isLocalRefreshRef.current) {
       setRefreshState('refreshing');
       setPullDistance(50);
     } else if (!isRefreshingScreen && !isLocalRefreshRef.current && refreshStateRef.current === 'refreshing') {
-      setPullDistance(0);
-      setRefreshState('idle');
+      setRefreshState('success');
+      setSuccessMessage('Updated');
+      const t1 = setTimeout(() => {
+        setPullDistance(0);
+      }, 600);
+      const t2 = setTimeout(() => {
+        setRefreshState('idle');
+        setSuccessMessage('');
+      }, 850);
+      return () => {
+        clearTimeout(t1);
+        clearTimeout(t2);
+      };
     }
   }, [isRefreshingScreen]);
 
@@ -193,7 +204,7 @@ export const PullToRefresh: React.FC<PullToRefreshProps> = ({ children, scrollCo
     <div ref={containerRef} className="relative w-full min-h-full">
       {/* Pull Indicator Container */}
       <div
-        className={`fixed sm:absolute top-16 left-1/2 -translate-x-1/2 z-40 pointer-events-none transition-all duration-200 flex items-center justify-center ${
+        className={`fixed top-16 md:top-20 left-1/2 -translate-x-1/2 z-40 pointer-events-none transition-all duration-200 flex items-center justify-center ${
           pullDistance > 0 || refreshState === 'refreshing' || refreshState === 'success'
             ? 'opacity-100 scale-100'
             : 'opacity-0 scale-90'

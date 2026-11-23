@@ -110,6 +110,10 @@ export const ConversationList: React.FC<ConversationListProps> = ({ onSelectChat
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
             placeholder="Search conversations..."
+            autoCorrect="on"
+            autoCapitalize="none"
+            spellCheck={true}
+            enterKeyHint="search"
             className="w-full pl-9 pr-3 py-2 bg-[var(--color-bg-main)] border border-[var(--color-border)] rounded-xl text-xs sm:text-sm text-[var(--color-text-primary)] placeholder:text-[var(--color-text-secondary)] focus:outline-none focus:ring-1 focus:ring-[var(--color-primary)]"
           />
         </div>

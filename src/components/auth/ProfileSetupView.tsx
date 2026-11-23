@@ -274,6 +274,9 @@ export const ProfileSetupView: React.FC = () => {
               value={department}
               onChange={(e) => setDepartment(e.target.value)}
               placeholder="e.g. Computer Science, Law"
+              autoCorrect="on"
+              autoCapitalize="words"
+              spellCheck={true}
               className="w-full px-3 py-2 bg-[var(--color-bg-main)] border border-[var(--color-border)] rounded-xl text-xs text-[var(--color-text-primary)] placeholder:text-[var(--color-text-secondary)] focus:ring-1 focus:ring-[var(--color-primary)] focus:outline-none"
             />
           </div>
@@ -287,6 +290,9 @@ export const ProfileSetupView: React.FC = () => {
               value={faculty}
               onChange={(e) => setFaculty(e.target.value)}
               placeholder="e.g. Physical Sciences"
+              autoCorrect="on"
+              autoCapitalize="words"
+              spellCheck={true}
               className="w-full px-3 py-2 bg-[var(--color-bg-main)] border border-[var(--color-border)] rounded-xl text-xs text-[var(--color-text-primary)] placeholder:text-[var(--color-text-secondary)] focus:ring-1 focus:ring-[var(--color-primary)] focus:outline-none"
             />
           </div>
@@ -343,6 +349,9 @@ export const ProfileSetupView: React.FC = () => {
             value={bio}
             onChange={(e) => setBio(e.target.value.slice(0, 250))}
             placeholder="Tell coursemates about your academic passions, research interests, or favorite study spot..."
+            autoCorrect="on"
+            autoCapitalize="sentences"
+            spellCheck={true}
             rows={3}
             className="w-full p-2.5 bg-[var(--color-bg-main)] border border-[var(--color-border)] rounded-xl text-xs text-[var(--color-text-primary)] placeholder:text-[var(--color-text-secondary)] focus:ring-1 focus:ring-[var(--color-primary)] focus:outline-none resize-none leading-relaxed"
           />
@@ -381,6 +390,9 @@ export const ProfileSetupView: React.FC = () => {
               value={customInterest}
               onChange={(e) => setCustomInterest(e.target.value)}
               placeholder="Add other interest..."
+              autoCorrect="on"
+              autoCapitalize="words"
+              spellCheck={true}
               className="flex-1 px-3 py-1.5 bg-[var(--color-bg-main)] border border-[var(--color-border)] rounded-lg text-xs text-[var(--color-text-primary)] placeholder:text-[var(--color-text-secondary)] focus:ring-1 focus:ring-[var(--color-primary)] focus:outline-none"
             />
             <button

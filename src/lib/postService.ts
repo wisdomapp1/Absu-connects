@@ -301,39 +301,24 @@ export async function resolvePostMediaUrlsOnRows(postRows: SupabasePostRow[]): P
   }
 }
 
-let savedPostsTableUnavailable = false;
-
-function isMissingSavedPostsTableError(err: { code?: string; message?: string; status?: number } | null | undefined): boolean {
-  if (!err) return false;
-  const code = (err.code || '').toUpperCase();
-  const msg = (err.message || '').toLowerCase();
-  return (
-    err.status === 404 ||
-    code === 'PGRST205' ||
-    code === '42P01' ||
-    msg.includes('saved_posts') && (msg.includes('could not find') || msg.includes('does not exist') || msg.includes('schema cache'))
-  );
-}
+const UUID_REGEX =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 export async function fetchSavedPostIds(userId?: string): Promise<Set<string>> {
   const savedSet = new Set<string>();
-  if (!userId || savedPostsTableUnavailable) return savedSet;
+  if (!userId || !UUID_REGEX.test(userId)) return savedSet;
   try {
-    const { data, error, status } = await supabase
+    const { data, error } = await supabase
       .from('saved_posts')
       .select('post_id')
       .eq('user_id', userId);
-    if (error && isMissingSavedPostsTableError({ ...error, status })) {
-      savedPostsTableUnavailable = true;
-      return savedSet;
-    }
-    if (!error && data) {
+    if (!error && Array.isArray(data)) {
       for (const row of data as Array<{ post_id: string }>) {
         if (row.post_id) savedSet.add(row.post_id);
       }
     }
-  } catch {
-    // Graceful fallback if table hasn't been migrated yet
+  } catch (err) {
+    console.warn('[SavedPosts] Failed to fetch saved post IDs:', err);
   }
   return savedSet;
 }
@@ -343,48 +328,69 @@ export async function toggleSavePostInDb(
   userId: string,
   currentlySaved: boolean
 ): Promise<{ success: boolean; isSaved: boolean; error?: string }> {
-  if (!postId || !userId) return { success: false, isSaved: currentlySaved, error: 'Invalid post or user.' };
-  if (savedPostsTableUnavailable) {
+  if (!postId || !userId) {
+    return { success: false, isSaved: currentlySaved, error: 'Sign in to save posts.' };
+  }
+  if (!UUID_REGEX.test(postId) || !UUID_REGEX.test(userId)) {
     return {
       success: false,
       isSaved: currentlySaved,
-      error: 'Saved posts table is not yet provisioned in Supabase.',
+      error: 'This post cannot be saved right now.',
     };
   }
+
   try {
     if (currentlySaved) {
-      const { error, status } = await supabase
+      const { error } = await supabase
         .from('saved_posts')
         .delete()
         .eq('post_id', postId)
         .eq('user_id', userId);
       if (error) {
-        if (isMissingSavedPostsTableError({ ...error, status })) {
-          savedPostsTableUnavailable = true;
-        }
         return { success: false, isSaved: currentlySaved, error: error.message };
       }
       return { success: true, isSaved: false };
-    } else {
-      const { error, status } = await supabase
-        .from('saved_posts')
-        .upsert(
-          { post_id: postId, user_id: userId, created_at: new Date().toISOString() },
-          { onConflict: 'user_id,post_id', ignoreDuplicates: true }
-        );
-      if (error) {
-        if (isMissingSavedPostsTableError({ ...error, status })) {
-          savedPostsTableUnavailable = true;
-        }
-        return { success: false, isSaved: currentlySaved, error: error.message };
-      }
+    }
+
+    // Prevent duplicates gracefully without relying on UPDATE RLS via upsert
+    const { data: existing, error: checkErr } = await supabase
+      .from('saved_posts')
+      .select('id')
+      .eq('user_id', userId)
+      .eq('post_id', postId)
+      .maybeSingle();
+
+    if (!checkErr && existing?.id) {
       return { success: true, isSaved: true };
     }
+
+    const { error } = await supabase.from('saved_posts').insert({
+      user_id: userId,
+      post_id: postId,
+    });
+
+    if (error) {
+      const code = (error.code || '').toUpperCase();
+      if (code === '23505') {
+        // Unique constraint race: already saved in public.saved_posts
+        return { success: true, isSaved: true };
+      }
+      if (code === '23503') {
+        return {
+          success: false,
+          isSaved: currentlySaved,
+          error: 'This post is no longer available to save.',
+        };
+      }
+      return { success: false, isSaved: currentlySaved, error: error.message };
+    }
+
+    return { success: true, isSaved: true };
   } catch (err: unknown) {
     return {
       success: false,
       isSaved: currentlySaved,
-      error: err instanceof Error ? err.message : 'Failed to update saved status',
+      error: err instanceof Error ? err.message : 'Failed to update saved status.',
     };
   }
 }
@@ -591,44 +597,60 @@ export async function querySupabasePostsResilient(
   return { rows: [], error: richRes.error.message || coreRes.error.message || baseRes.error.message };
 }
 
-export async function fetchSavedPosts(userId: string): Promise<Post[]> {
-  if (!userId) return [];
+export async function fetchSavedPostsWithStatus(
+  userId: string
+): Promise<{ posts: Post[]; error?: string }> {
+  if (!userId || !UUID_REGEX.test(userId)) {
+    return { posts: [], error: 'Sign in to view your saved posts.' };
+  }
   try {
-    const headers = await getOptionalAuthHeaders();
-    if (headers.Authorization) {
-      const apiRes = await fetch('/api/posts/saved', { headers }).catch(() => null);
-      const json = apiRes?.ok ? await parseApiJson(apiRes) : null;
-      if (json?.success && Array.isArray(json.posts)) {
-        const rows = json.posts as SupabasePostRow[];
-        const savedSet = new Set<string>(json.savedPostIds || rows.map((r) => r.id));
-        const friendSet = new Set<string>(json.friendIds || []);
-        return rows.map((row) => mapSupabasePostToFrontend(row, userId, savedSet, friendSet));
-      }
-    }
-
-    if (savedPostsTableUnavailable) return [];
-
-    const { data: savedRows, error: savedErr, status } = await supabase
+    const { data: savedRows, error: savedErr } = await supabase
       .from('saved_posts')
       .select('post_id, created_at')
       .eq('user_id', userId)
       .order('created_at', { ascending: false });
 
-    if (savedErr && isMissingSavedPostsTableError({ ...savedErr, status })) {
-      savedPostsTableUnavailable = true;
-      return [];
-    }
-    if (savedErr || !savedRows || savedRows.length === 0) {
-      return [];
+    if (savedErr) {
+      console.warn('[SavedPosts] Direct saved_posts query error:', savedErr.message);
+      // Fallback to server route if web backend is active
+      const headers = await getOptionalAuthHeaders();
+      if (headers.Authorization) {
+        const apiRes = await fetch('/api/posts/saved', { headers }).catch(() => null);
+        const json = apiRes?.ok ? await parseApiJson(apiRes) : null;
+        if (json?.success && Array.isArray(json.posts)) {
+          const rows = json.posts as SupabasePostRow[];
+          const savedSet = new Set<string>(json.savedPostIds || rows.map((r) => r.id));
+          const friendSet = new Set<string>(json.friendIds || []);
+          return {
+            posts: rows.map((row) => mapSupabasePostToFrontend(row, userId, savedSet, friendSet)),
+          };
+        }
+      }
+      return { posts: [], error: savedErr.message || 'Unable to load saved posts.' };
     }
 
-    const postIds = savedRows.map((r: any) => r.post_id).filter(Boolean);
+    if (!savedRows || savedRows.length === 0) {
+      return { posts: [] };
+    }
+
+    const postIds = Array.from(
+      new Set(savedRows.map((r: any) => r.post_id).filter((id: any) => typeof id === 'string' && id.length > 0))
+    );
+    if (postIds.length === 0) {
+      return { posts: [] };
+    }
+
     const [{ rows: postRows, error }, safetyCtx] = await Promise.all([
       querySupabasePostsResilient((q) => q.in('id', postIds)),
       getDirectSafetyContext(userId),
     ]);
 
-    if (error || postRows.length === 0) return [];
+    if (error) {
+      return { posts: [], error };
+    }
+    if (postRows.length === 0) {
+      return { posts: [] };
+    }
 
     await resolvePostMediaUrlsOnRows(postRows);
 
@@ -640,11 +662,21 @@ export async function fetchSavedPosts(userId: string): Promise<Post[]> {
       }
     }
 
-    return postIds.map((id) => byId.get(id)).filter((p): p is Post => Boolean(p));
-  } catch (err) {
+    return {
+      posts: postIds.map((id) => byId.get(id)).filter((p): p is Post => Boolean(p)),
+    };
+  } catch (err: unknown) {
     console.warn('Error fetching saved posts:', err);
-    return [];
+    return {
+      posts: [],
+      error: err instanceof Error ? err.message : 'Unable to load saved posts right now.',
+    };
   }
+}
+
+export async function fetchSavedPosts(userId: string): Promise<Post[]> {
+  const res = await fetchSavedPostsWithStatus(userId);
+  return res.posts;
 }
 
 export async function fetchCommunityPostsFromSupabase(

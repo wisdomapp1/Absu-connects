@@ -384,6 +384,9 @@ export const CreateStoryModal: React.FC<CreateStoryModalProps> = ({
                   onChange={(e) => setTextContent(e.target.value)}
                   maxLength={300}
                   placeholder="Type your story here...&#10;(e.g. Study group at e-Library till 5pm!)"
+                  autoCorrect="on"
+                  autoCapitalize="sentences"
+                  spellCheck={true}
                   className={`w-full bg-transparent text-white text-center text-lg sm:text-xl placeholder-white/40 resize-none focus:outline-none drop-shadow-md leading-relaxed ${activeFontClass}`}
                   rows={4}
                 />
@@ -495,6 +498,10 @@ export const CreateStoryModal: React.FC<CreateStoryModalProps> = ({
                   onChange={(e) => setCaption(e.target.value)}
                   maxLength={120}
                   placeholder="Add a campus caption..."
+                  autoCorrect="on"
+                  autoCapitalize="sentences"
+                  spellCheck={true}
+                  enterKeyHint="done"
                   className="w-full px-4 py-2.5 text-xs bg-slate-800/80 border border-slate-700/60 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500 text-white placeholder-slate-500"
                 />
               </div>
@@ -595,6 +602,10 @@ export const CreateStoryModal: React.FC<CreateStoryModalProps> = ({
                   onChange={(e) => setCaption(e.target.value)}
                   maxLength={120}
                   placeholder="Add a campus caption..."
+                  autoCorrect="on"
+                  autoCapitalize="sentences"
+                  spellCheck={true}
+                  enterKeyHint="done"
                   className="w-full px-4 py-2.5 text-xs bg-slate-800/80 border border-slate-700/60 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500 text-white placeholder-slate-500"
                 />
               </div>

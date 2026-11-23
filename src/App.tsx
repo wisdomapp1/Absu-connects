@@ -85,6 +85,47 @@ const AppContent: React.FC = () => {
     scrollPositionsRef.current.set(viewScrollKeyRef.current, el.scrollTop);
   }, []);
 
+  React.useEffect(() => {
+    const handleScrollToTop = (event: Event) => {
+      const detail = (event as CustomEvent<{ view?: string }>).detail;
+      scrollPositionsRef.current.set(viewScrollKeyRef.current, 0);
+      if (detail?.view) {
+        scrollPositionsRef.current.set(`${detail.view}:`, 0);
+      }
+
+      const el = mainScrollRef.current;
+      if (el) {
+        try {
+          el.scrollTo({ top: 0, behavior: 'instant' as ScrollBehavior });
+        } catch {
+          // Fallback for WebViews without 'instant' option
+        }
+        el.scrollTop = 0;
+
+        const nestedScrollables = el.querySelectorAll<HTMLElement>('[data-scroll-container]');
+        nestedScrollables.forEach((child) => {
+          try {
+            child.scrollTo({ top: 0, behavior: 'instant' as ScrollBehavior });
+          } catch {
+            // ignore
+          }
+          child.scrollTop = 0;
+        });
+      }
+
+      if (typeof window !== 'undefined') {
+        try {
+          window.scrollTo({ top: 0, behavior: 'instant' as ScrollBehavior });
+        } catch {
+          window.scrollTo(0, 0);
+        }
+      }
+    };
+
+    window.addEventListener('absu:scroll-top', handleScrollToTop);
+    return () => window.removeEventListener('absu:scroll-top', handleScrollToTop);
+  }, []);
+
   // 1. Initial Session Resolution Splash
   if (loading) {
     return (

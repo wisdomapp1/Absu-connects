@@ -26,6 +26,7 @@ export const HomeView: React.FC = () => {
     feedFilter,
     setCreatePostModalOpen,
     refreshPosts,
+    isRefreshingScreen,
     addToast,
   } = useApp();
   const [anonIntroOpen, setAnonIntroOpen] = useState(false);
@@ -55,6 +56,14 @@ export const HomeView: React.FC = () => {
   useEffect(() => {
     setLoadingStories(true);
     loadStories();
+  }, [loadStories]);
+
+  useEffect(() => {
+    const handleHomeRefresh = () => {
+      loadStories();
+    };
+    window.addEventListener('absu:refresh-home', handleHomeRefresh);
+    return () => window.removeEventListener('absu:refresh-home', handleHomeRefresh);
   }, [loadStories]);
 
   const handleStoryViewed = useCallback(
@@ -95,6 +104,12 @@ export const HomeView: React.FC = () => {
 
   return (
     <div className="flex flex-col gap-4">
+      {isRefreshingScreen && (
+        <div className="flex items-center justify-center gap-2 py-1 text-[11px] font-semibold text-[var(--color-primary)] animate-in fade-in duration-150">
+          <Loader2 className="w-3.5 h-3.5 animate-spin" />
+          <span>Refreshing feed...</span>
+        </div>
+      )}
       {/* 0. Campus Stories Bar */}
       <StoriesBar
         currentUserId={currentUser.id || undefined}

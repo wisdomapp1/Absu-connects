@@ -233,6 +233,10 @@ export const EditProfileModal: React.FC = () => {
               type="text"
               value={name}
               onChange={(e) => setName(e.target.value)}
+              autoComplete="name"
+              autoCorrect="on"
+              autoCapitalize="words"
+              spellCheck={true}
               className="w-full bg-[var(--color-bg-main)] border border-[var(--color-border)] rounded-xl px-3 py-2 text-xs sm:text-sm text-[var(--color-text-primary)] focus:ring-1 focus:ring-[var(--color-primary)] focus:outline-none"
               required
             />
@@ -247,6 +251,9 @@ export const EditProfileModal: React.FC = () => {
                 type="text"
                 value={department}
                 onChange={(e) => setDepartment(e.target.value)}
+                autoCorrect="on"
+                autoCapitalize="words"
+                spellCheck={true}
                 className="w-full bg-[var(--color-bg-main)] border border-[var(--color-border)] rounded-xl px-3 py-2 text-xs text-[var(--color-text-primary)] focus:ring-1 focus:ring-[var(--color-primary)] focus:outline-none"
                 required
               />
@@ -278,6 +285,9 @@ export const EditProfileModal: React.FC = () => {
               type="text"
               value={faculty}
               onChange={(e) => setFaculty(e.target.value)}
+              autoCorrect="on"
+              autoCapitalize="words"
+              spellCheck={true}
               className="w-full bg-[var(--color-bg-main)] border border-[var(--color-border)] rounded-xl px-3 py-2 text-xs text-[var(--color-text-primary)] focus:ring-1 focus:ring-[var(--color-primary)] focus:outline-none"
             />
           </div>
@@ -305,6 +315,9 @@ export const EditProfileModal: React.FC = () => {
               value={bio}
               onChange={(e) => setBio(e.target.value)}
               rows={3}
+              autoCorrect="on"
+              autoCapitalize="sentences"
+              spellCheck={true}
               className="w-full bg-[var(--color-bg-main)] border border-[var(--color-border)] rounded-xl p-3 text-xs text-[var(--color-text-primary)] focus:ring-1 focus:ring-[var(--color-primary)] focus:outline-none resize-none"
             />
           </div>
@@ -318,6 +331,9 @@ export const EditProfileModal: React.FC = () => {
               value={interestsString}
               onChange={(e) => setInterestsString(e.target.value)}
               placeholder="e.g. Football, Robotics, Literature"
+              autoCorrect="on"
+              autoCapitalize="sentences"
+              spellCheck={true}
               className="w-full bg-[var(--color-bg-main)] border border-[var(--color-border)] rounded-xl px-3 py-2 text-xs text-[var(--color-text-primary)] focus:ring-1 focus:ring-[var(--color-primary)] focus:outline-none"
             />
           </div>

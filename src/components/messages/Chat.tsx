@@ -11,6 +11,7 @@ import {
   type MediaRecoveryState,
 } from '../../lib/mediaRecovery.ts';
 import { MediaRecoveryBanner } from '../common/MediaRecoveryBanner.tsx';
+import { pickNativeGalleryPhotos } from '../../lib/nativeGalleryService.ts';
 import {
   ArrowLeft,
   Send,
@@ -26,7 +27,7 @@ import {
   Reply,
   WifiOff,
   Loader2,
-  Film,
+  Play,
   FileText,
   Music,
   RotateCcw,
@@ -111,9 +112,7 @@ export const Chat: React.FC<ChatProps> = ({
     }
   }, [hasMore, loadingMore, loadMoreMessages]);
 
-  const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const files = Array.from(e.target.files || []);
-    e.target.value = '';
+  const processSelectedFiles = async (files: File[]) => {
     if (files.length === 0) return;
 
     const maxBytes = 25 * 1024 * 1024;
@@ -183,6 +182,27 @@ export const Chat: React.FC<ChatProps> = ({
     } else if (lastRecovery) {
       setMediaRecovery(lastRecovery);
     }
+  };
+
+  const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(e.target.files || []);
+    e.target.value = '';
+    await processSelectedFiles(files);
+  };
+
+  const handleOpenPhotoGallery = async () => {
+    try {
+      const nativeResult = await pickNativeGalleryPhotos(10);
+      if (nativeResult.supported) {
+        if (!nativeResult.cancelled && nativeResult.files.length > 0) {
+          await processSelectedFiles(nativeResult.files);
+        }
+        return;
+      }
+    } catch {
+      // Fallback to HTML photo input if native plugin throws
+    }
+    fileInputRef.current?.click();
   };
 
   const removePendingFile = (idx: number) => {
@@ -261,12 +281,12 @@ export const Chat: React.FC<ChatProps> = ({
 
   return (
     <div className="flex flex-col h-full min-h-0 w-full bg-[var(--color-bg-card)] border border-[var(--color-border)] rounded-2xl overflow-hidden relative shadow-sm">
-      {/* Hidden file input */}
+      {/* Hidden photo/video gallery fallback input */}
       <input
         ref={fileInputRef}
         type="file"
         multiple
-        accept="image/*,video/*,audio/*,application/pdf"
+        accept="image/*,video/*"
         onChange={handleFileChange}
         className="hidden"
       />
@@ -527,8 +547,19 @@ export const Chat: React.FC<ChatProps> = ({
             return (
               <div key={i} className="relative rounded-lg overflow-hidden shrink-0 border border-[var(--color-border)]">
                 {isVideo ? (
-                  <div className="w-12 h-12 bg-black flex items-center justify-center text-violet-400">
-                    <Film className="w-5 h-5" />
+                  <div className="relative w-14 h-14 bg-black overflow-hidden">
+                    <video
+                      src={url}
+                      muted
+                      playsInline
+                      preload="metadata"
+                      className="w-full h-full object-cover"
+                    />
+                    <span className="pointer-events-none absolute inset-0 flex items-center justify-center bg-black/25">
+                      <span className="w-5 h-5 rounded-full bg-black/70 text-white flex items-center justify-center">
+                        <Play className="w-2.5 h-2.5 ml-0.5 fill-white" />
+                      </span>
+                    </span>
                   </div>
                 ) : isAudio ? (
                   <div className="w-12 h-12 bg-violet-600/20 flex items-center justify-center text-violet-400">
@@ -539,7 +570,7 @@ export const Chat: React.FC<ChatProps> = ({
                     <FileText className="w-5 h-5" />
                   </div>
                 ) : (
-                  <img src={url} alt="Preview" className="w-12 h-12 object-cover" />
+                  <img src={url} alt="Preview" className="w-14 h-14 object-cover" />
                 )}
                 <button
                   type="button"
@@ -606,7 +637,7 @@ export const Chat: React.FC<ChatProps> = ({
         <div className="px-3 py-2 border-t border-[var(--color-border)] bg-[var(--color-bg-card)] shrink-0">
           <MediaRecoveryBanner
             recovery={mediaRecovery}
-            onChooseAgain={() => fileInputRef.current?.click()}
+            onChooseAgain={handleOpenPhotoGallery}
             onDismiss={() => setMediaRecovery(null)}
           />
         </div>
@@ -631,11 +662,17 @@ export const Chat: React.FC<ChatProps> = ({
             value={inputText}
             onChange={handleInputChange}
             placeholder="Type a message..."
+            autoCorrect="on"
+            autoCapitalize="sentences"
+            spellCheck={true}
+            enterKeyHint="send"
             className="flex-1 bg-transparent border-0 px-2.5 py-1 text-xs sm:text-sm text-[var(--color-text-primary)] focus:outline-none"
           />
           <button
             type="button"
-            onClick={() => fileInputRef.current?.click()}
+            onClick={handleOpenPhotoGallery}
+            title="Choose photos or videos from gallery"
+            aria-label="Open photo and video gallery"
             className="w-8 h-8 rounded-full flex items-center justify-center text-[var(--color-text-secondary)] hover:text-[var(--color-primary)]"
           >
             <Camera className="w-5 h-5" />

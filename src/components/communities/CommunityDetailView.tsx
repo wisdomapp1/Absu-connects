@@ -440,6 +440,9 @@ export const CommunityDetailView: React.FC<CommunityDetailViewProps> = ({
                 value={postText}
                 onChange={(e) => setPostText(e.target.value)}
                 placeholder={`Share an update, note, or discussion in ${community.name}...`}
+                autoCorrect="on"
+                autoCapitalize="sentences"
+                spellCheck={true}
                 className="w-full bg-[var(--color-bg-main)] border border-[var(--color-border)] rounded-xl p-3 text-xs sm:text-sm text-[var(--color-text-primary)] resize-none focus:outline-none focus:ring-2 focus:ring-[var(--color-primary)]"
               />
               {attachments.length > 0 && (

@@ -21,7 +21,6 @@ import { sendPrivacySafePush } from '../../lib/pushService.ts';
 import {
   Heart,
   MessageCircle,
-  Share2,
   Bookmark,
   MoreHorizontal,
   Globe,
@@ -47,6 +46,7 @@ interface PostCardProps {
   highlightParentCommentId?: string | null;
   highlightActorId?: string | null;
   navToken?: number;
+  onOpenPost?: (post: Post) => void;
 }
 
 const findCommentById = (list: Comment[], id: string): Comment | null => {
@@ -219,6 +219,7 @@ export const PostCard: React.FC<PostCardProps> = ({
   highlightParentCommentId = null,
   highlightActorId = null,
   navToken = 0,
+  onOpenPost,
 }) => {
   const {
     currentUser,
@@ -426,10 +427,13 @@ export const PostCard: React.FC<PostCardProps> = ({
     return () => document.removeEventListener('mousedown', handleOutsideClick);
   }, []);
 
-  const handleShare = () => {
-    const shareUrl = `${window.location.origin}/?view=post-detail&postId=${encodeURIComponent(post.id)}`;
-    navigator.clipboard?.writeText(shareUrl);
-    addToast('Post link copied to clipboard!', 'success');
+  const handleToggleSave = async () => {
+    const prevSaved = localIsSaved;
+    setLocalIsSaved(!prevSaved);
+    const ok = await toggleSave(post.id, prevSaved);
+    if (!ok) {
+      setLocalIsSaved(prevSaved);
+    }
   };
 
   const handleCommentSubmit = async (e: React.FormEvent) => {
@@ -627,6 +631,10 @@ export const PostCard: React.FC<PostCardProps> = ({
                   type="text"
                   value={editDraft}
                   onChange={(e) => setEditDraft(e.target.value)}
+                  autoCorrect="on"
+                  autoCapitalize="sentences"
+                  spellCheck={true}
+                  enterKeyHint="done"
                   className="flex-1 bg-[var(--color-bg-card)] border border-[var(--color-border)] rounded-lg px-2.5 py-1.5 text-xs text-[var(--color-text-primary)] focus:outline-none focus:ring-1 focus:ring-[var(--color-primary)]"
                 />
                 <button
@@ -726,6 +734,10 @@ export const PostCard: React.FC<PostCardProps> = ({
               onChange={(e) => setReplyDraft(e.target.value)}
               placeholder={`Reply to ${comment.author.name.split(' ')[0]}...`}
               autoFocus
+              autoCorrect="on"
+              autoCapitalize="sentences"
+              spellCheck={true}
+              enterKeyHint="send"
               className="flex-1 bg-[var(--color-bg-main)] border border-[var(--color-border)] rounded-xl px-3 py-1.5 text-xs text-[var(--color-text-primary)] focus:outline-none focus:ring-1 focus:ring-[var(--color-primary)]"
             />
             <button
@@ -822,15 +834,15 @@ export const PostCard: React.FC<PostCardProps> = ({
           {menuOpen && (
             <div className="absolute right-0 mt-1 w-48 rounded-2xl bg-[var(--color-bg-card)] border border-[var(--color-border)] shadow-xl p-1.5 z-20 animate-in fade-in zoom-in-95 duration-150">
               <button
+                type="button"
                 onClick={() => {
-                  setLocalIsSaved((prev) => !prev);
-                  toggleSave(post.id);
                   setMenuOpen(false);
+                  void handleToggleSave();
                 }}
                 className="w-full flex items-center gap-2.5 px-3 py-2 text-xs font-medium text-[var(--color-text-primary)] hover:bg-[var(--color-primary-subtle)] rounded-xl transition-colors min-h-[36px]"
               >
-                <Bookmark className="w-4 h-4 text-[var(--color-primary)]" />
-                <span>{localIsSaved ? 'Remove Bookmark' : 'Save Post'}</span>
+                <Bookmark className={`w-4 h-4 text-[var(--color-primary)] ${localIsSaved ? 'fill-current' : ''}`} />
+                <span>{localIsSaved ? 'Saved' : 'Save Post'}</span>
               </button>
 
               <button
@@ -887,7 +899,17 @@ export const PostCard: React.FC<PostCardProps> = ({
       ) : null}
 
       {/* Content text */}
-      <div className="mt-3 text-[14px] sm:text-[15px] leading-relaxed text-[var(--color-text-primary)] whitespace-pre-line break-words">
+      <div
+        onClick={(e) => {
+          if (!onOpenPost) return;
+          const target = e.target as HTMLElement;
+          if (target.closest('a, button')) return;
+          onOpenPost(post);
+        }}
+        className={`mt-3 text-[14px] sm:text-[15px] leading-relaxed text-[var(--color-text-primary)] whitespace-pre-line break-words ${
+          onOpenPost ? 'cursor-pointer hover:opacity-90' : ''
+        }`}
+      >
         <LinkifiedText text={post.content} />
       </div>
 
@@ -1118,14 +1140,19 @@ export const PostCard: React.FC<PostCardProps> = ({
           <span>Comment</span>
         </button>
 
-        {/* Share Button */}
+        {/* Save Button */}
         <button
-          onClick={handleShare}
-          className="min-h-[44px] flex items-center justify-center gap-2 py-2.5 rounded-xl text-xs sm:text-sm font-semibold text-[var(--color-text-secondary)] hover:text-[var(--color-text-primary)] hover:bg-[var(--color-bg-main)] transition-colors"
-          aria-label="Share post link"
+          type="button"
+          onClick={handleToggleSave}
+          className={`min-h-[44px] flex items-center justify-center gap-2 py-2.5 rounded-xl text-xs sm:text-sm font-semibold transition-all active:scale-95 ${
+            localIsSaved
+              ? 'text-[var(--color-primary)] bg-[var(--color-primary-subtle)]'
+              : 'text-[var(--color-text-secondary)] hover:text-[var(--color-text-primary)] hover:bg-[var(--color-bg-main)]'
+          }`}
+          aria-label={localIsSaved ? 'Unsave post' : 'Save post'}
         >
-          <Share2 className="w-4 h-4" />
-          <span>Share</span>
+          <Bookmark className={`w-4 h-4 ${localIsSaved ? 'fill-current stroke-current' : ''}`} />
+          <span>{localIsSaved ? 'Saved' : 'Save'}</span>
         </button>
       </div>
 
@@ -1141,6 +1168,10 @@ export const PostCard: React.FC<PostCardProps> = ({
                 value={commentText}
                 onChange={(e) => setCommentText(e.target.value)}
                 placeholder="Write a comment..."
+                autoCorrect="on"
+                autoCapitalize="sentences"
+                spellCheck={true}
+                enterKeyHint="send"
                 className="w-full min-h-[40px] bg-[var(--color-bg-main)] border border-[var(--color-border)] rounded-xl px-4 py-2 text-xs sm:text-sm text-[var(--color-text-primary)] placeholder:text-[var(--color-text-secondary)] focus:outline-none focus:ring-1 focus:ring-[var(--color-primary)]"
               />
             </div>

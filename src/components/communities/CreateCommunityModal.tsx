@@ -453,6 +453,9 @@ export const CreateCommunityModal: React.FC<CreateCommunityModalProps> = ({
               value={name}
               onChange={(e) => setName(e.target.value)}
               placeholder="e.g. Computer Science Hub, Law Students Union..."
+              autoCorrect="on"
+              autoCapitalize="words"
+              spellCheck={true}
               className="w-full px-3.5 py-2.5 rounded-xl bg-[var(--color-bg-main)] border border-[var(--color-border)] text-xs sm:text-sm text-[var(--color-text-primary)] placeholder-[var(--color-text-secondary)]/60 focus:outline-none focus:ring-2 focus:ring-[var(--color-primary)]/40 font-medium transition-all"
             />
           </div>
@@ -504,6 +507,9 @@ export const CreateCommunityModal: React.FC<CreateCommunityModalProps> = ({
               value={description}
               onChange={(e) => setDescription(e.target.value)}
               placeholder="What is this community about? Share mission, study topics, or activities..."
+              autoCorrect="on"
+              autoCapitalize="sentences"
+              spellCheck={true}
               className="w-full p-3 rounded-xl bg-[var(--color-bg-main)] border border-[var(--color-border)] text-xs sm:text-sm text-[var(--color-text-primary)] placeholder-[var(--color-text-secondary)]/60 focus:outline-none focus:ring-2 focus:ring-[var(--color-primary)]/40 resize-none transition-all"
             />
           </div>
@@ -565,6 +571,10 @@ export const CreateCommunityModal: React.FC<CreateCommunityModalProps> = ({
                   }
                 }}
                 placeholder="e.g. Keep discussions relevant to course syllabus"
+                autoCorrect="on"
+                autoCapitalize="sentences"
+                spellCheck={true}
+                enterKeyHint="done"
                 className="flex-1 px-3 py-2 rounded-xl bg-[var(--color-bg-main)] border border-[var(--color-border)] text-xs text-[var(--color-text-primary)] placeholder-[var(--color-text-secondary)]/60 focus:outline-none focus:ring-2 focus:ring-[var(--color-primary)]/40"
               />
               <button

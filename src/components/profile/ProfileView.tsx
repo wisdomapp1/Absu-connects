@@ -23,7 +23,6 @@ import {
   GraduationCap,
   BookOpen,
   Calendar,
-  Share2,
   ArrowLeft,
   ShieldAlert,
   Camera,
@@ -141,25 +140,38 @@ export const ProfileView: React.FC<ProfileViewProps> = ({ isAnotherUser = false 
     }
   }, [isMe, activeTab]);
 
-  // Load saved posts for own profile when Saved tab is opened or posts bookmark state changes
+  // Load saved posts for own profile when Saved tab is opened or bookmark state changes
+  const loadProfileSavedPosts = React.useCallback(async () => {
+    if (!isMe || !currentUser.id) return;
+    setLoadingSaved(true);
+    try {
+      const loaded = await fetchSavedPosts(currentUser.id);
+      setFetchedSavedPosts(loaded);
+    } catch {
+      // keep existing
+    } finally {
+      setLoadingSaved(false);
+    }
+  }, [isMe, currentUser.id]);
+
   React.useEffect(() => {
     if (!isMe || !currentUser.id || activeTab !== 'saved') return;
-    let cancelled = false;
-    setLoadingSaved(true);
-    fetchSavedPosts(currentUser.id)
-      .then((loaded) => {
-        if (!cancelled) {
-          setFetchedSavedPosts(loaded);
-        }
-      })
-      .catch(() => {})
-      .finally(() => {
-        if (!cancelled) setLoadingSaved(false);
-      });
-    return () => {
-      cancelled = true;
+    void loadProfileSavedPosts();
+  }, [isMe, currentUser.id, activeTab, loadProfileSavedPosts]);
+
+  React.useEffect(() => {
+    const handleSavedChange = (evt: Event) => {
+      const detail = (evt as CustomEvent<{ postId?: string; isSaved?: boolean }>).detail;
+      if (!detail?.postId || typeof detail.isSaved !== 'boolean') return;
+      if (!detail.isSaved) {
+        setFetchedSavedPosts((prev) => (prev ? prev.filter((p) => p.id !== detail.postId) : prev));
+      } else if (activeTab === 'saved') {
+        void loadProfileSavedPosts();
+      }
     };
-  }, [isMe, currentUser.id, activeTab]);
+    window.addEventListener('absu:saved-posts-changed', handleSavedChange);
+    return () => window.removeEventListener('absu:saved-posts-changed', handleSavedChange);
+  }, [activeTab, loadProfileSavedPosts]);
 
   const mySavedPosts = React.useMemo(() => {
     if (!isMe) return [];
@@ -167,15 +179,17 @@ export const ProfileView: React.FC<ProfileViewProps> = ({ isAnotherUser = false 
     const contextMap = new Map(posts.map((p) => [p.id, p]));
     const merged = new Map<string, Post>();
 
-    for (const p of contextSaved) {
-      merged.set(p.id, p);
-    }
     for (const dbPost of fetchedSavedPosts || []) {
       const liveVersion = contextMap.get(dbPost.id);
       if (liveVersion) {
         if (liveVersion.isSaved) merged.set(liveVersion.id, liveVersion);
       } else {
         merged.set(dbPost.id, dbPost);
+      }
+    }
+    for (const p of contextSaved) {
+      if (!merged.has(p.id)) {
+        merged.set(p.id, p);
       }
     }
     return Array.from(merged.values());
@@ -255,15 +269,9 @@ export const ProfileView: React.FC<ProfileViewProps> = ({ isAnotherUser = false 
       ? fetchedUserPosts
       : cachedUserPosts;
 
-  // Compute friend count for this user
   const friendsCount = isMe
     ? users.filter((u) => u.relationshipState === 'friends').length
     : (profileUser.mutualFriendsCount ?? 0);
-
-  const handleShare = () => {
-    navigator.clipboard?.writeText(window.location.href);
-    addToast('Profile link copied to clipboard!', 'success');
-  };
 
   return (
     <div className="flex flex-col gap-4">
@@ -332,13 +340,6 @@ export const ProfileView: React.FC<ProfileViewProps> = ({ isAnotherUser = false 
                   >
                     <Edit3 className="w-3.5 h-3.5" />
                     <span>Edit Profile</span>
-                  </button>
-                  <button
-                    onClick={handleShare}
-                    className="p-2 rounded-xl border border-[var(--color-border)] text-[var(--color-text-secondary)] hover:text-[var(--color-text-primary)] transition-colors"
-                    aria-label="Share profile"
-                  >
-                    <Share2 className="w-4 h-4" />
                   </button>
 
                   {/* Profile Three-Dot Menu (⋮) */}
@@ -635,7 +636,12 @@ export const ProfileView: React.FC<ProfileViewProps> = ({ isAnotherUser = false 
                       </button>
                     </div>
                   )}
-                  <PostCard post={post} />
+                  <PostCard
+                    post={post}
+                    onOpenPost={(p) =>
+                      navigateTo(isVideoPost(p) ? 'reels' : 'post-detail', { postId: p.id })
+                    }
+                  />
                 </div>
               );
             })
@@ -742,6 +748,10 @@ export const ProfileView: React.FC<ProfileViewProps> = ({ isAnotherUser = false 
               value={deleteConfirmationText}
               onChange={(e) => setDeleteConfirmationText(e.target.value)}
               placeholder="DELETE"
+              autoCorrect="off"
+              autoCapitalize="characters"
+              spellCheck={false}
+              enterKeyHint="done"
               className="w-full px-3.5 py-2.5 bg-[var(--color-bg-main)] border border-[var(--color-border)] rounded-xl font-mono font-bold text-center tracking-widest text-[var(--color-text-primary)] focus:outline-none focus:ring-2 focus:ring-red-500 uppercase text-xs"
             />
 

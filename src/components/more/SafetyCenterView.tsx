@@ -203,6 +203,9 @@ export const SafetyCenterView: React.FC = () => {
                     onChange={(e) => setReportText(e.target.value)}
                     placeholder="Describe what occurred, location (Uturu/Aba/Umuahia), date/time, and parties involved..."
                     required
+                    autoCorrect="on"
+                    autoCapitalize="sentences"
+                    spellCheck={true}
                     className="w-full p-2.5 rounded-xl bg-[var(--color-bg-main)] border border-[var(--color-border)] text-[var(--color-text-primary)] resize-none"
                   />
                 </div>

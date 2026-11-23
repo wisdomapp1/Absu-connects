@@ -4616,7 +4616,12 @@ app.get('/api/posts/saved', async (req, res) => {
       .eq('user_id', viewer.id)
       .order('created_at', { ascending: false });
 
-    if (savedErr || !savedRows || savedRows.length === 0) {
+    if (savedErr) {
+      res.status(500).json({ success: false, error: savedErr.message });
+      return;
+    }
+
+    if (!savedRows || savedRows.length === 0) {
       res.json({ success: true, posts: [], savedPostIds: [] });
       return;
     }

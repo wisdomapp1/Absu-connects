@@ -11,7 +11,7 @@ import {
   Smile,
   Gamepad2,
   X,
-  Film,
+  Play,
   Check,
   CheckCheck,
   Clock,
@@ -41,6 +41,7 @@ import {
   type MediaRecoveryState,
 } from '../../lib/mediaRecovery.ts';
 import { MediaRecoveryBanner } from '../common/MediaRecoveryBanner.tsx';
+import { pickNativeGalleryPhotos } from '../../lib/nativeGalleryService.ts';
 
 interface PendingAttachment {
   id: string;
@@ -255,10 +256,7 @@ export const ConversationView: React.FC = () => {
   const { participant } = selectedConversation;
   const isOnline = isUserOnline(participant.id);
 
-  // Gallery file select with buffered in-memory read & validation (max 25MB, video <= 40s)
-  const handleFileSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const files = Array.from(e.target.files || []);
-    e.target.value = '';
+  const processSelectedFiles = async (files: File[]) => {
     if (files.length === 0) return;
 
     const maxBytes = 25 * 1024 * 1024; // 25 MB max
@@ -352,6 +350,28 @@ export const ConversationView: React.FC = () => {
     } else if (lastRecovery) {
       setMediaRecovery(lastRecovery);
     }
+  };
+
+  // Gallery file select with buffered in-memory read & validation (max 25MB)
+  const handleFileSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(e.target.files || []);
+    e.target.value = '';
+    await processSelectedFiles(files);
+  };
+
+  const handleOpenPhotoGallery = async () => {
+    try {
+      const nativeResult = await pickNativeGalleryPhotos(10);
+      if (nativeResult.supported) {
+        if (!nativeResult.cancelled && nativeResult.files.length > 0) {
+          await processSelectedFiles(nativeResult.files);
+        }
+        return;
+      }
+    } catch {
+      addToast('Unable to read from photo gallery. Falling back to device picker.', 'warning');
+    }
+    fileInputRef.current?.click();
   };
 
   const removePendingAttachment = (id: string) => {
@@ -584,12 +604,12 @@ export const ConversationView: React.FC = () => {
 
   return (
     <div className="flex flex-col h-full min-h-0 max-w-4xl mx-auto w-full bg-[var(--color-bg-card)] sm:border sm:border-[var(--color-border)] sm:rounded-2xl shadow-sm overflow-hidden transition-colors relative">
-      {/* Hidden native image/video/audio/PDF picker */}
+      {/* Hidden photo/video gallery fallback picker */}
       <input
         ref={fileInputRef}
         type="file"
         multiple
-        accept="image/*,video/*,audio/*,application/pdf"
+        accept="image/*,video/*"
         onChange={handleFileSelect}
         className="hidden"
         aria-hidden="true"
@@ -974,11 +994,22 @@ export const ConversationView: React.FC = () => {
                   <img
                     src={item.previewUrl}
                     alt={item.name}
-                    className="w-10 h-10 rounded-lg object-cover shrink-0"
+                    className="w-14 h-14 rounded-lg object-cover shrink-0 border border-[var(--color-border)]"
                   />
                 ) : item.type === 'video' ? (
-                  <div className="w-10 h-10 rounded-lg bg-black flex items-center justify-center shrink-0">
-                    <Film className="w-4 h-4 text-violet-400" />
+                  <div className="relative w-14 h-14 rounded-lg overflow-hidden bg-black shrink-0 border border-[var(--color-border)]">
+                    <video
+                      src={item.previewUrl}
+                      muted
+                      playsInline
+                      preload="metadata"
+                      className="w-full h-full object-cover"
+                    />
+                    <span className="pointer-events-none absolute inset-0 flex items-center justify-center bg-black/25">
+                      <span className="w-6 h-6 rounded-full bg-black/70 text-white flex items-center justify-center">
+                        <Play className="w-3 h-3 ml-0.5 fill-white" />
+                      </span>
+                    </span>
                   </div>
                 ) : item.type === 'pdf' ? (
                   <div className="w-10 h-10 rounded-lg bg-amber-500/15 text-amber-500 flex items-center justify-center shrink-0">
@@ -1074,7 +1105,7 @@ export const ConversationView: React.FC = () => {
         <div className="px-3.5 py-2 border-t border-[var(--color-border)] bg-[var(--color-bg-card)] shrink-0">
           <MediaRecoveryBanner
             recovery={mediaRecovery}
-            onChooseAgain={() => fileInputRef.current?.click()}
+            onChooseAgain={handleOpenPhotoGallery}
             onDismiss={() => setMediaRecovery(null)}
           />
         </div>
@@ -1143,16 +1174,20 @@ export const ConversationView: React.FC = () => {
               value={inputMessage}
               onChange={handleInputChange}
               placeholder={`Message ${participant.name.split(' ')[0]}...`}
+              autoCorrect="on"
+              autoCapitalize="sentences"
+              spellCheck={true}
+              enterKeyHint="send"
               className="flex-1 bg-transparent border-0 px-2.5 py-1 text-xs sm:text-sm text-[var(--color-text-primary)] placeholder:text-[var(--color-text-secondary)] focus:outline-none"
             />
 
-            {/* Inside Right: Direct Gallery / Media Picker */}
+            {/* Inside Right: Direct Photo & Video Gallery Picker */}
             <button
               type="button"
-              onClick={() => fileInputRef.current?.click()}
+              onClick={handleOpenPhotoGallery}
               className="w-8 h-8 rounded-full flex items-center justify-center text-[var(--color-text-secondary)] hover:text-[var(--color-primary)] transition-colors shrink-0"
-              title="Choose photo, video or audio from phone gallery"
-              aria-label="Open Gallery"
+              title="Choose photos or videos from gallery"
+              aria-label="Open photo and video gallery"
             >
               <Camera className="w-5 h-5" />
             </button>

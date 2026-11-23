@@ -388,6 +388,9 @@ export const ContactInfoView: React.FC = () => {
               value={reportReason}
               onChange={(e) => setReportReason(e.target.value)}
               placeholder="e.g. Harassment, impersonation, spam..."
+              autoCorrect="on"
+              autoCapitalize="sentences"
+              spellCheck={true}
               className="w-full mt-3 p-3 bg-[var(--color-bg-main)] border border-[var(--color-border)] rounded-xl text-xs text-[var(--color-text-primary)] placeholder:text-[var(--color-text-secondary)] focus:outline-none focus:ring-1 focus:ring-[var(--color-primary)]"
             />
             <div className="flex items-center justify-end gap-2.5 mt-4">

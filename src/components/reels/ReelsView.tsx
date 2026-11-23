@@ -33,7 +33,6 @@ import {
   Play,
   RefreshCw,
   Search,
-  Share2,
   UserPlus,
   Volume2,
   VolumeX,
@@ -55,7 +54,6 @@ interface ReelSlideProps {
   onLike: (postId: string) => void;
   onSave: (post: Post) => void;
   onOpenComments: (post: Post) => void;
-  onShare: (post: Post) => void;
   onOpenHashtag: (tag: string) => void;
 }
 
@@ -68,7 +66,6 @@ const ReelSlide: React.FC<ReelSlideProps> = ({
   onLike,
   onSave,
   onOpenComments,
-  onShare,
   onOpenHashtag,
 }) => {
   const {
@@ -401,18 +398,6 @@ const ReelSlide: React.FC<ReelSlideProps> = ({
 
         <button
           type="button"
-          onClick={() => onShare(post)}
-          className="min-w-[44px] min-h-[44px] flex flex-col items-center justify-center gap-1 text-white active:scale-90 transition-transform"
-          aria-label="Share reel"
-        >
-          <div className="w-11 h-11 rounded-full bg-black/45 hover:bg-black/65 backdrop-blur-xs flex items-center justify-center">
-            <Share2 className="w-5 h-5" />
-          </div>
-          <span className="text-[11px] font-bold drop-shadow-sm">Share</span>
-        </button>
-
-        <button
-          type="button"
           onClick={() => onSave(post)}
           className="min-w-[44px] min-h-[44px] flex flex-col items-center justify-center gap-1 text-white active:scale-90 transition-transform"
           aria-label={post.isSaved ? 'Remove reel bookmark' : 'Save reel'}
@@ -463,7 +448,6 @@ export const ReelsView: React.FC = () => {
     toggleLike,
     toggleSave,
     goBack,
-    addToast,
   } = useApp();
 
   const containerRef = useRef<HTMLDivElement>(null);
@@ -610,18 +594,28 @@ export const ReelsView: React.FC = () => {
     const handleResetTop = () => {
       setHasSwipedAway(false);
       setActiveIndex(0);
-      containerRef.current?.scrollTo({ top: 0, behavior: 'smooth' });
+      containerRef.current?.scrollTo({ top: 0, behavior: 'auto' });
+    };
+
+    const handleSavedChanged = (evt: Event) => {
+      const detail = (evt as CustomEvent<{ postId?: string; isSaved?: boolean }>).detail;
+      if (!detail?.postId || typeof detail.isSaved !== 'boolean') return;
+      setReels((prev) =>
+        prev.map((p) => (p.id === detail.postId ? { ...p, isSaved: detail.isSaved! } : p))
+      );
     };
 
     window.addEventListener('absu:post-created', handlePostCreated);
     window.addEventListener('absu:post-deleted', handlePostDeleted);
     window.addEventListener('absu:refresh-reels', handleRefresh);
     window.addEventListener('absu:reels-reset-top', handleResetTop);
+    window.addEventListener('absu:saved-posts-changed', handleSavedChanged);
     return () => {
       window.removeEventListener('absu:post-created', handlePostCreated);
       window.removeEventListener('absu:post-deleted', handlePostDeleted);
       window.removeEventListener('absu:refresh-reels', handleRefresh);
       window.removeEventListener('absu:reels-reset-top', handleResetTop);
+      window.removeEventListener('absu:saved-posts-changed', handleSavedChanged);
     };
   }, [loadInitialReels]);
 
@@ -724,37 +718,17 @@ export const ReelsView: React.FC = () => {
     toggleLike(postId);
   };
 
-  const handleSaveReel = (post: Post) => {
-    const nextSaved = !post.isSaved;
+  const handleSaveReel = async (post: Post) => {
+    const prevSaved = post.isSaved;
+    const nextSaved = !prevSaved;
     setReels((prev) =>
       prev.map((p) => (p.id === post.id ? { ...p, isSaved: nextSaved } : p))
     );
-    toggleSave(post.id, post.isSaved);
-  };
-
-  const handleShareReel = async (post: Post) => {
-    const origin =
-      typeof window !== 'undefined' && window.location.origin.startsWith('http')
-        ? window.location.origin
-        : 'https://absu-connect.vercel.app';
-    const shareUrl = `${origin}/?view=reels&postId=${encodeURIComponent(post.id)}`;
-    const shareTitle = `${post.author.name} on ABSU Connect Reels`;
-    const shareText = post.content ? post.content.slice(0, 120) : 'Watch this campus reel on ABSU Connect!';
-
-    try {
-      if (typeof navigator !== 'undefined' && typeof navigator.share === 'function') {
-        await navigator.share({ title: shareTitle, text: shareText, url: shareUrl });
-        return;
-      }
-    } catch {
-      // User dismissed or share API unavailable -> copy fallback
-    }
-
-    try {
-      await navigator.clipboard.writeText(shareUrl);
-      addToast('Reel link copied to clipboard!', 'success');
-    } catch {
-      addToast(shareUrl, 'info');
+    const ok = await toggleSave(post.id, prevSaved);
+    if (!ok) {
+      setReels((prev) =>
+        prev.map((p) => (p.id === post.id ? { ...p, isSaved: prevSaved } : p))
+      );
     }
   };
 
@@ -870,7 +844,6 @@ export const ReelsView: React.FC = () => {
                   onLike={handleLikeReel}
                   onSave={handleSaveReel}
                   onOpenComments={(p) => setCommentsPost(p)}
-                  onShare={handleShareReel}
                   onOpenHashtag={(tag) => {
                     setSearchSeedQuery(tag);
                     setSearchModalOpen(true);

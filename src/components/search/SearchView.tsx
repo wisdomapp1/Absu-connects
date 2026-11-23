@@ -59,6 +59,10 @@ export const SearchView: React.FC = () => {
               value={query}
               onChange={(e) => setQuery(e.target.value)}
               placeholder="Search ABSU students, departments, posts..."
+              autoCorrect="on"
+              autoCapitalize="none"
+              spellCheck={true}
+              enterKeyHint="search"
               className="w-full pl-9 pr-9 py-2 bg-[var(--color-bg-main)] border border-[var(--color-border)] rounded-xl text-xs sm:text-sm text-[var(--color-text-primary)] placeholder:text-[var(--color-text-secondary)] focus:outline-none focus:ring-1 focus:ring-[var(--color-primary)]"
               autoFocus
             />

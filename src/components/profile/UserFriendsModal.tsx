@@ -125,6 +125,10 @@ export const UserFriendsModal: React.FC<UserFriendsModalProps> = ({
                 value={search}
                 onChange={(e) => setSearch(e.target.value)}
                 placeholder="Search friends..."
+                autoCorrect="on"
+                autoCapitalize="none"
+                spellCheck={true}
+                enterKeyHint="search"
                 className="w-full pl-8 pr-3 py-1.5 bg-[var(--color-bg-main)] border border-[var(--color-border)] rounded-xl text-xs text-[var(--color-text-primary)] placeholder:text-[var(--color-text-secondary)] focus:outline-none focus:ring-1 focus:ring-[var(--color-primary)]"
               />
             </div>

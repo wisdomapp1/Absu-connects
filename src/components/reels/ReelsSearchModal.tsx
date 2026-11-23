@@ -92,6 +92,10 @@ export const ReelsSearchModal: React.FC<ReelsSearchModalProps> = ({
             onChange={(e) => setQuery(e.target.value)}
             placeholder="Search Reels by caption, #hashtag, or creator..."
             autoFocus
+            autoCorrect="on"
+            autoCapitalize="none"
+            spellCheck={true}
+            enterKeyHint="search"
             className="flex-1 bg-transparent text-sm text-white placeholder-white/50 outline-none"
           />
           {query && (
