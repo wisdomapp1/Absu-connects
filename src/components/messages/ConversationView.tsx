@@ -42,6 +42,8 @@ import {
 } from '../../lib/mediaRecovery.ts';
 import { MediaRecoveryBanner } from '../common/MediaRecoveryBanner.tsx';
 import { pickNativeGalleryPhotos } from '../../lib/nativeGalleryService.ts';
+import { StoryReplyAttachmentCard } from './StoryReplyAttachmentCard.tsx';
+import { isStoryAttachment } from '../../lib/storyUtils.ts';
 
 interface PendingAttachment {
   id: string;
@@ -785,7 +787,12 @@ export const ConversationView: React.FC = () => {
                     <div className="flex flex-col gap-2 mb-1.5">
                       {msg.attachments!.map((att) => (
                         <div key={att.id} className="rounded-xl overflow-hidden">
-                          {att.kind === 'image' ? (
+                          {isStoryAttachment(att) ? (
+                            <StoryReplyAttachmentCard
+                              attachment={att}
+                              isOutgoing={msg.isOutgoing}
+                            />
+                          ) : att.kind === 'image' ? (
                             <button
                               type="button"
                               onClick={() => setImageLightboxUrl(att.secure_url || null)}

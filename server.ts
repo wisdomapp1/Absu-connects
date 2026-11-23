@@ -1871,7 +1871,21 @@ app.post('/api/notifications/create', async (req, res) => {
     const pushTitle = senderName ? `${senderName}` : title;
     const pushBody = safeBody;
     let pushUrl = url || '';
-    if (!pushUrl && safePostId) {
+    const isStoryPush =
+      type === 'story_comment' ||
+      type === 'story_reaction' ||
+      type === 'story_view' ||
+      targetEntityType === 'story' ||
+      targetEntityType === 'story_comment' ||
+      targetEntityType === 'story_reaction' ||
+      targetEntityType === 'story_view';
+
+    if (!pushUrl && isStoryPush && targetEntityId) {
+      const qs = new URLSearchParams({ view: 'story', storyId: targetEntityId });
+      if (type === 'story_reaction') qs.set('tab', 'reactions');
+      if (type === 'story_view') qs.set('tab', 'viewers');
+      pushUrl = `/?${qs.toString()}`;
+    } else if (!pushUrl && safePostId) {
       const qs = new URLSearchParams({ view: 'post-detail', postId: safePostId });
       if (safeCommentId) qs.set('commentId', safeCommentId);
       if (safeParentCommentId) qs.set('parentCommentId', safeParentCommentId);
@@ -2047,12 +2061,37 @@ app.get('/api/notifications/user/:userId', async (req, res) => {
 
     const commentLookupIds = new Set<string>();
     const legacyCommentPostIds = new Set<string>();
+    const storyCommentStoryIds = new Set<string>();
+
+    const isStoryRow = (n: Record<string, any>): boolean => {
+      const nt = String(n.type || '').toLowerCase().trim();
+      const et = String(n.entity_type || '').toLowerCase().trim();
+      return (
+        nt === 'story_comment' ||
+        nt === 'story_reaction' ||
+        nt === 'story_view' ||
+        nt === 'story_like' ||
+        et === 'story_comment' ||
+        et === 'story_reaction' ||
+        et === 'story_view' ||
+        et === 'story_like' ||
+        et === 'story'
+      );
+    };
 
     for (const n of rows as Array<Record<string, any>>) {
+      const nt = String(n.type || '').toLowerCase().trim();
+      const et = String(n.entity_type || '').toLowerCase().trim();
+      if (isStoryRow(n)) {
+        if ((nt === 'story_comment' || et === 'story_comment') && isValidUuid(n.story_id || n.entity_id)) {
+          storyCommentStoryIds.add(isValidUuid(n.story_id) ? n.story_id : n.entity_id);
+        }
+        continue;
+      }
+
       if (isValidUuid(n.comment_id)) {
         commentLookupIds.add(n.comment_id);
       }
-      const et = String(n.entity_type || '').toLowerCase();
       if (
         (et === 'comment' || et === 'comment_reply' || et === 'comment_reaction') &&
         isValidUuid(n.entity_id)
@@ -2073,6 +2112,7 @@ app.get('/api/notifications/user/:userId', async (req, res) => {
       string,
       Array<{ id: string; post_id: string; author_id: string; parent_comment_id: string | null; created_at: string }>
     >();
+    const storyCommentConvMap = new Map<string, string>();
 
     const batchPromises: Array<Promise<void>> = [];
 
@@ -2134,12 +2174,67 @@ app.get('/api/notifications/user/:userId', async (req, res) => {
       );
     }
 
+    if (storyCommentStoryIds.size > 0) {
+      batchPromises.push(
+        (async () => {
+          try {
+            const { data: scRows } = await client
+              .from('story_comments')
+              .select('story_id, commenter_id, conversation_id, created_at')
+              .in('story_id', Array.from(storyCommentStoryIds))
+              .order('created_at', { ascending: false });
+            for (const sc of (scRows || []) as Array<{
+              story_id?: string;
+              commenter_id?: string;
+              conversation_id?: string;
+            }>) {
+              if (sc.story_id && sc.conversation_id) {
+                if (sc.commenter_id && !storyCommentConvMap.has(`${sc.story_id}_${sc.commenter_id}`)) {
+                  storyCommentConvMap.set(`${sc.story_id}_${sc.commenter_id}`, sc.conversation_id);
+                }
+                if (!storyCommentConvMap.has(sc.story_id)) {
+                  storyCommentConvMap.set(sc.story_id, sc.conversation_id);
+                }
+              }
+            }
+          } catch {
+            // story_comments table optional fallback
+          }
+        })()
+      );
+    }
+
     await Promise.all(batchPromises);
 
-    // Attach actor profiles & resolved navigation IDs (post_id, comment_id, parent_comment_id)
+    // Attach actor profiles & resolved navigation IDs
     const enriched = rows.map((n: Record<string, any>) => {
       const profile = n.actor_id ? profilesMap.get(n.actor_id) : null;
       const et = String(n.entity_type || '').toLowerCase();
+
+      if (isStoryRow(n)) {
+        const resolvedStoryId: string | null = isValidUuid(n.story_id)
+          ? n.story_id
+          : isValidUuid(n.entity_id)
+          ? n.entity_id
+          : null;
+        const resolvedStoryConvId: string | null = isValidUuid(n.conversation_id)
+          ? n.conversation_id
+          : resolvedStoryId
+          ? (isValidUuid(n.actor_id) && storyCommentConvMap.get(`${resolvedStoryId}_${n.actor_id}`)) ||
+            storyCommentConvMap.get(resolvedStoryId) ||
+            null
+          : null;
+
+        return {
+          ...n,
+          story_id: resolvedStoryId,
+          conversation_id: resolvedStoryConvId,
+          post_id: null,
+          comment_id: null,
+          parent_comment_id: null,
+          actor: profile || null,
+        };
+      }
 
       let resolvedPostId: string | null = isValidUuid(n.post_id) ? n.post_id : null;
       let resolvedCommentId: string | null = isValidUuid(n.comment_id) ? n.comment_id : null;
@@ -2148,7 +2243,9 @@ app.get('/api/notifications/user/:userId', async (req, res) => {
         : null;
 
       if (!resolvedCommentId && (et === 'comment' || et === 'comment_reply' || et === 'comment_reaction') && isValidUuid(n.entity_id)) {
-        resolvedCommentId = n.entity_id;
+        if (et !== 'comment' || commentMetaMap.has(n.entity_id)) {
+          resolvedCommentId = n.entity_id;
+        }
       }
 
       if (resolvedCommentId && commentMetaMap.has(resolvedCommentId)) {

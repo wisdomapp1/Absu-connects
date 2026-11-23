@@ -5,6 +5,7 @@ import {
   getImageDimensions,
 } from './mediaCompression.ts';
 import type { MessageAttachment } from '../types/index.ts';
+import { isStoryAttachment } from './storyUtils.ts';
 
 export const AVATAR_BUCKET = 'profile-avatars';
 export const POST_MEDIA_BUCKET = 'post-media';
@@ -944,6 +945,9 @@ export async function batchResolveChatAttachmentSignedUrls(
   const now = Date.now();
 
   for (const a of attachments) {
+    if (isStoryAttachment(a)) {
+      continue;
+    }
     if (a.provider === 'cloudinary' || a.secure_url?.startsWith('http://') || a.secure_url?.startsWith('https://')) {
       if (a.secure_url) {
         urlMap.set(a.asset_id, a.secure_url);

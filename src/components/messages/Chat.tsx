@@ -12,6 +12,8 @@ import {
 } from '../../lib/mediaRecovery.ts';
 import { MediaRecoveryBanner } from '../common/MediaRecoveryBanner.tsx';
 import { pickNativeGalleryPhotos } from '../../lib/nativeGalleryService.ts';
+import { StoryReplyAttachmentCard } from './StoryReplyAttachmentCard.tsx';
+import { isStoryAttachment } from '../../lib/storyUtils.ts';
 import {
   ArrowLeft,
   Send,
@@ -381,7 +383,12 @@ export const Chat: React.FC<ChatProps> = ({
                   <div className="flex flex-col gap-1.5 mb-1.5">
                     {msg.attachments.map((att) => (
                       <div key={att.id} className="rounded-xl overflow-hidden">
-                        {att.kind === 'image' ? (
+                        {isStoryAttachment(att) ? (
+                          <StoryReplyAttachmentCard
+                            attachment={att}
+                            isOutgoing={msg.isOutgoing}
+                          />
+                        ) : att.kind === 'image' ? (
                           <img
                             src={att.secure_url}
                             alt={att.file_name || 'Attachment'}

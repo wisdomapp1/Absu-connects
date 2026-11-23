@@ -170,14 +170,43 @@ export function registerStoryRoutes(app: Express) {
 
       const viewedSet = new Set<string>();
       const reactedSet = new Set<string>();
+      const myReactionMap = new Map<string, string>();
+      const viewsCountMap = new Map<string, Set<string>>();
+      const reactionsCountMap = new Map<string, Set<string>>();
 
-      if (currentUserId && storyIds.length > 0) {
+      if (storyIds.length > 0) {
+        const ownerByStoryId = new Map<string, string>();
+        for (const s of stories) {
+          ownerByStoryId.set(s.id, s.user_id);
+        }
+
         const [viewsRes, reactionsRes] = await Promise.all([
-          sb.from('story_views').select('story_id').in('story_id', storyIds).eq('viewer_id', currentUserId),
-          sb.from('story_reactions').select('story_id').in('story_id', storyIds).eq('user_id', currentUserId),
+          sb.from('story_views').select('story_id, viewer_id').in('story_id', storyIds),
+          sb.from('story_reactions').select('story_id, user_id, reaction').in('story_id', storyIds),
         ]);
-        for (const v of viewsRes.data || []) viewedSet.add(v.story_id);
-        for (const r of reactionsRes.data || []) reactedSet.add(r.story_id);
+
+        for (const v of (viewsRes.data || []) as Array<{ story_id: string; viewer_id: string }>) {
+          if (currentUserId && v.viewer_id === currentUserId) {
+            viewedSet.add(v.story_id);
+          }
+          const ownerId = ownerByStoryId.get(v.story_id);
+          if (ownerId && v.viewer_id === ownerId) continue;
+          if (!viewsCountMap.has(v.story_id)) viewsCountMap.set(v.story_id, new Set());
+          viewsCountMap.get(v.story_id)!.add(v.viewer_id);
+        }
+
+        for (const r of (reactionsRes.data || []) as Array<{
+          story_id: string;
+          user_id: string;
+          reaction?: string | null;
+        }>) {
+          if (!reactionsCountMap.has(r.story_id)) reactionsCountMap.set(r.story_id, new Set());
+          reactionsCountMap.get(r.story_id)!.add(r.user_id);
+          if (currentUserId && r.user_id === currentUserId) {
+            reactedSet.add(r.story_id);
+            myReactionMap.set(r.story_id, r.reaction || '❤️');
+          }
+        }
       }
 
       const groupMap = new Map<string, any>();
@@ -198,8 +227,11 @@ export function registerStoryRoutes(app: Express) {
           media_url: story.media_type === 'text' ? null : (decodeOwnerScopedStoryRef(story.media_url) || resolvedPath),
           provider: story.provider || (String(resolvedPath || '').includes('res.cloudinary.com') ? 'cloudinary' : 'supabase'),
           raw_storage_path: story.storage_path,
+          views_count: viewsCountMap.get(story.id)?.size ?? 0,
+          reactions_count: reactionsCountMap.get(story.id)?.size ?? 0,
           has_viewed: viewedSet.has(story.id),
           has_reacted: reactedSet.has(story.id),
+          user_reaction: myReactionMap.get(story.id) ?? null,
           user: {
             id: story.user_id,
             name: displayName,
@@ -393,7 +425,7 @@ export function registerStoryRoutes(app: Express) {
     }
   });
 
-  // 3. Record story view
+  // 3. Record story view (skips owner self-views, idempotent)
   app.post('/api/stories/:id/view', async (req: Request, res: Response) => {
     try {
       const sb = createUserClient(req);
@@ -405,9 +437,53 @@ export function registerStoryRoutes(app: Express) {
         return;
       }
 
-      const { error } = await sb
+      const { data: storyRow } = await sb
+        .from('stories')
+        .select('user_id')
+        .eq('id', storyId)
+        .maybeSingle();
+
+      if (storyRow?.user_id && storyRow.user_id === viewerId) {
+        res.json({ success: true, skippedOwnerView: true });
+        return;
+      }
+
+      const nowIso = new Date().toISOString();
+      let { error } = await sb
         .from('story_views')
-        .upsert({ story_id: storyId, viewer_id: viewerId }, { onConflict: 'story_id,viewer_id', ignoreDuplicates: true });
+        .upsert(
+          { story_id: storyId, viewer_id: viewerId, viewed_at: nowIso },
+          { onConflict: 'story_id,viewer_id', ignoreDuplicates: true }
+        );
+
+      if (error && (error.code === '42703' || error.code === 'PGRST204' || error.message?.toLowerCase().includes('column'))) {
+        const retry = await sb
+          .from('story_views')
+          .upsert(
+            { story_id: storyId, viewer_id: viewerId },
+            { onConflict: 'story_id,viewer_id', ignoreDuplicates: true }
+          );
+        error = retry.error;
+      }
+
+      if (error) {
+        const { data: existing } = await sb
+          .from('story_views')
+          .select('viewer_id')
+          .eq('story_id', storyId)
+          .eq('viewer_id', viewerId)
+          .limit(1)
+          .maybeSingle();
+
+        if (!existing) {
+          const ins = await sb
+            .from('story_views')
+            .insert({ story_id: storyId, viewer_id: viewerId, viewed_at: nowIso });
+          error = ins.error;
+        } else {
+          error = null;
+        }
+      }
 
       if (error) {
         res.status(400).json({ success: false, error: error.message });
@@ -420,90 +496,216 @@ export function registerStoryRoutes(app: Express) {
     }
   });
 
-  // 4. Toggle reaction (like)
+  // 4. Add, change, or remove reaction cleanly without duplicates
   app.post('/api/stories/:id/reaction', async (req: Request, res: Response) => {
     try {
       const sb = createUserClient(req);
       const storyId = req.params.id;
-      const { userId, currentlyLiked } = req.body;
+      const { userId, currentlyLiked, reaction } = req.body;
 
       if (!storyId || !userId) {
         res.status(400).json({ success: false, error: 'storyId and userId required.' });
         return;
       }
 
-      if (currentlyLiked) {
-        const { error } = await sb.from('story_reactions').delete().eq('story_id', storyId).eq('user_id', userId);
+      const hasExplicitReaction = 'reaction' in (req.body || {});
+      const targetReaction: string | null = hasExplicitReaction
+        ? reaction
+          ? String(reaction).trim()
+          : null
+        : currentlyLiked
+        ? null
+        : '❤️';
+
+      if (!targetReaction) {
+        const { error } = await sb
+          .from('story_reactions')
+          .delete()
+          .eq('story_id', storyId)
+          .eq('user_id', userId);
+
         if (error) {
           res.status(400).json({ success: false, error: error.message });
           return;
         }
-        res.json({ success: true, liked: false });
-      } else {
-        const { error } = await sb.from('story_reactions').upsert(
-          { story_id: storyId, user_id: userId, reaction: 'like' },
-          { onConflict: 'story_id,user_id', ignoreDuplicates: true }
-        );
-        if (error) {
-          res.status(400).json({ success: false, error: error.message });
-          return;
-        }
-        res.json({ success: true, liked: true });
+        res.json({ success: true, liked: false, reaction: null });
+        return;
       }
+
+      const { error: upsertErr } = await sb.from('story_reactions').upsert(
+        { story_id: storyId, user_id: userId, reaction: targetReaction },
+        { onConflict: 'story_id,user_id', ignoreDuplicates: false }
+      );
+
+      if (upsertErr) {
+        await sb
+          .from('story_reactions')
+          .delete()
+          .eq('story_id', storyId)
+          .eq('user_id', userId);
+
+        const { error: insertErr } = await sb.from('story_reactions').insert({
+          story_id: storyId,
+          user_id: userId,
+          reaction: targetReaction,
+        });
+
+        if (insertErr) {
+          res.status(400).json({ success: false, error: insertErr.message });
+          return;
+        }
+      }
+
+      res.json({ success: true, liked: true, reaction: targetReaction });
     } catch {
-      res.status(500).json({ success: false, error: 'Reaction toggle failed' });
+      res.status(500).json({ success: false, error: 'Reaction update failed' });
     }
   });
 
-  // 5. Story insights
+  // 5. Story insights (viewers & reactions with full profile hydration + owner exclusion)
   app.get('/api/stories/:id/insights', async (req: Request, res: Response) => {
     try {
       const sb = createUserClient(req);
       const storyId = req.params.id;
 
-      const [viewsRes, reactionsRes] = await Promise.all([
+      const { data: storyRow } = await sb
+        .from('stories')
+        .select('user_id')
+        .eq('id', storyId)
+        .maybeSingle();
+      const storyOwnerId: string | null = storyRow?.user_id || null;
+
+      const [primaryViewsRes, primaryReactionsRes] = await Promise.all([
         sb
           .from('story_views')
-          .select(`
-            id,
-            story_id,
-            viewer_id,
-            created_at,
-            profiles:viewer_id (
-              id,
-              display_name,
-              username,
-              avatar_url,
-              department,
-              level
-            )
-          `)
+          .select('story_id, viewer_id, viewed_at')
+          .eq('story_id', storyId)
+          .order('viewed_at', { ascending: false }),
+        sb
+          .from('story_reactions')
+          .select('story_id, user_id, reaction, created_at')
           .eq('story_id', storyId)
           .order('created_at', { ascending: false }),
-        sb.from('story_reactions').select('id', { count: 'exact', head: true }).eq('story_id', storyId),
       ]);
 
-      const views = (viewsRes.data || []).map((row: any) => ({
-        id: row.id,
-        story_id: row.story_id,
-        viewer_id: row.viewer_id,
-        created_at: row.created_at,
-        viewer: row.profiles
-          ? {
-              id: row.profiles.id,
-              name: row.profiles.display_name || row.profiles.username || 'ABSU Student',
-              avatar_url: row.profiles.avatar_url,
-              department: row.profiles.department,
-              level: row.profiles.level,
-            }
-          : undefined,
-      }));
+      let viewsRows: any[] = primaryViewsRes.data || [];
+      if (primaryViewsRes.error) {
+        const legacyViews = await sb
+          .from('story_views')
+          .select('id, story_id, viewer_id, created_at')
+          .eq('story_id', storyId)
+          .order('created_at', { ascending: false });
+        if (!legacyViews.error) {
+          viewsRows = legacyViews.data || [];
+        }
+      }
+
+      let reactionRows: any[] = primaryReactionsRes.data || [];
+      if (primaryReactionsRes.error) {
+        const legacyReactions = await sb
+          .from('story_reactions')
+          .select('story_id, user_id, reaction_type, created_at')
+          .eq('story_id', storyId)
+          .order('created_at', { ascending: false });
+        if (!legacyReactions.error) {
+          reactionRows = legacyReactions.data || [];
+        }
+      }
+
+      const userIds = new Set<string>();
+      for (const v of viewsRows) {
+        if (v.viewer_id && (!storyOwnerId || v.viewer_id !== storyOwnerId)) {
+          userIds.add(v.viewer_id);
+        }
+      }
+      for (const r of reactionRows) {
+        if (r.user_id) {
+          userIds.add(r.user_id);
+        }
+      }
+
+      const profileMap = new Map<string, any>();
+      if (userIds.size > 0) {
+        const { data: profiles } = await sb
+          .from('profiles')
+          .select('id, display_name, username, avatar_url, department, level')
+          .in('id', Array.from(userIds));
+        for (const p of profiles || []) {
+          profileMap.set(p.id, p);
+        }
+      }
+
+      const viewsByViewer = new Map<string, any>();
+      for (const row of viewsRows) {
+        if (!row?.viewer_id) continue;
+        if (storyOwnerId && row.viewer_id === storyOwnerId) continue;
+        const viewedAt = row.viewed_at || row.created_at || new Date(0).toISOString();
+        const prev = viewsByViewer.get(row.viewer_id);
+        if (prev && new Date(prev.viewed_at).getTime() >= new Date(viewedAt).getTime()) {
+          continue;
+        }
+        const prof = profileMap.get(row.viewer_id);
+        viewsByViewer.set(row.viewer_id, {
+          id: row.id || `${row.story_id}_${row.viewer_id}`,
+          story_id: row.story_id,
+          viewer_id: row.viewer_id,
+          viewed_at: viewedAt,
+          created_at: row.created_at || viewedAt,
+          viewer: prof
+            ? {
+                id: prof.id,
+                name: prof.display_name || prof.username || 'ABSU Student',
+                avatar_url: prof.avatar_url,
+                department: prof.department,
+                level: prof.level,
+              }
+            : undefined,
+        });
+      }
+
+      const views = Array.from(viewsByViewer.values()).sort(
+        (a, b) => new Date(b.viewed_at).getTime() - new Date(a.viewed_at).getTime()
+      );
+
+      const reactionsByUser = new Map<string, any>();
+      for (const row of reactionRows) {
+        if (!row?.user_id) continue;
+        const createdAt = row.created_at || new Date(0).toISOString();
+        const prev = reactionsByUser.get(row.user_id);
+        if (prev && new Date(prev.created_at).getTime() >= new Date(createdAt).getTime()) {
+          continue;
+        }
+        const prof = profileMap.get(row.user_id);
+        const reactionVal = row.reaction || row.reaction_type || 'like';
+        reactionsByUser.set(row.user_id, {
+          id: row.id || `${row.story_id}_${row.user_id}`,
+          story_id: row.story_id,
+          user_id: row.user_id,
+          reaction: reactionVal,
+          reaction_type: reactionVal,
+          created_at: createdAt,
+          user: prof
+            ? {
+                id: prof.id,
+                name: prof.display_name || prof.username || 'ABSU Student',
+                avatar_url: prof.avatar_url,
+                department: prof.department,
+                level: prof.level,
+              }
+            : undefined,
+        });
+      }
+
+      const reactions = Array.from(reactionsByUser.values()).sort(
+        (a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
+      );
 
       res.json({
         success: true,
         viewsCount: views.length,
         views,
-        reactionsCount: reactionsRes.count || 0,
+        reactionsCount: reactions.length,
+        reactions,
       });
     } catch {
       res.status(500).json({ success: false, error: 'Insights failed' });

@@ -124,6 +124,7 @@ export interface MessageAttachment {
   format?: string;
   kind: 'image' | 'video' | 'audio' | 'pdf' | 'document';
   asset_id: string;
+  story_id?: string | null;
   secure_url?: string;
   provider: string;
   thumbnail_url?: string;
@@ -161,6 +162,10 @@ export type NotificationType =
   | 'comment'
   | 'mention'
   | 'message'
+  | 'story_comment'
+  | 'story_reaction'
+  | 'story_view'
+  | 'story_like'
   | 'campus_notice'
   | 'game_invitation'
   | 'community_invite'
@@ -176,8 +181,10 @@ export type NotificationType =
 export interface NotificationItem {
   id: string;
   type: NotificationType;
+  rawType?: string;
   title?: string;
   entityType?: string;
+  entityId?: string;
   actor: {
     id: string;
     name: string;
@@ -192,6 +199,7 @@ export interface NotificationItem {
   targetPostId?: string;
   targetCommentId?: string;
   targetParentCommentId?: string;
+  targetStoryId?: string;
   targetIsVideo?: boolean;
   conversationId?: string;
 }

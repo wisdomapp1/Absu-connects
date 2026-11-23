@@ -1,5 +1,11 @@
 import { supabase } from './supabase.ts';
-import type { Story, UserStoryGroup, StoryMediaType, StoryViewItem } from '../types/stories.ts';
+import type {
+  Story,
+  UserStoryGroup,
+  StoryMediaType,
+  StoryViewItem,
+  StoryReactionItem,
+} from '../types/stories.ts';
 import {
   resolveStoryMediaSignedUrl,
   deleteStoryMediaFromStorage,
@@ -13,7 +19,27 @@ import {
 import { compressImageForUpload, validatePostVideoFile } from './mediaCompression.ts';
 import { getOrCreateDirectConversation, sendRealMessage } from './messageService.ts';
 import { getOptionalAuthHeaders, parseApiJson } from './postService.ts';
+import { fetchUserBlocks } from './moderationService.ts';
 import type { User } from '../types/index.ts';
+import {
+  isStoryExpired,
+  normalizeStoryInsightsRows,
+  shouldSkipStoryViewRecord,
+  type RawProfileMiniRow,
+  type RawStoryReactionRow,
+  type RawStoryViewRow,
+} from './storyUtils.ts';
+
+function isMissingColumnError(err: { code?: string; message?: string } | null | undefined): boolean {
+  if (!err) return false;
+  const msg = (err.message || '').toLowerCase();
+  return (
+    err.code === '42703' ||
+    err.code === 'PGRST204' ||
+    msg.includes('schema cache') ||
+    msg.includes('column')
+  );
+}
 
 function encodeBase64Url(input: string): string {
   const bytes = new TextEncoder().encode(input);
@@ -104,6 +130,308 @@ export function sortStoryGroups(
   return normalized;
 }
 
+function isStoryPermissionError(error: unknown): boolean {
+  const msg =
+    error && typeof error === 'object' && 'message' in error
+      ? String((error as any).message || '').toLowerCase()
+      : '';
+  const code =
+    error && typeof error === 'object' && 'code' in error
+      ? String((error as any).code || '').trim()
+      : '';
+  return (
+    code === '42501' ||
+    code === 'PGRST301' ||
+    msg.includes('row-level security') ||
+    msg.includes('permission denied') ||
+    msg.includes('insufficient_privilege') ||
+    msg.includes('not authorized') ||
+    msg.includes('jwt')
+  );
+}
+
+export type StoryByIdResult =
+  | { status: 'ok'; story: Story }
+  | { status: 'unavailable'; reason: 'not_found' | 'restricted' | 'error'; error?: string };
+
+// Short-lived cache for single-story lookups (DM story replies & notification routing)
+const storyLookupCache = new Map<
+  string,
+  { result: StoryByIdResult; expiresAt: number }
+>();
+const inFlightStoryLookups = new Map<string, Promise<StoryByIdResult>>();
+const STORY_LOOKUP_CACHE_TTL_MS = 60 * 1000;
+
+export function invalidateStoryCache(storyId?: string): void {
+  if (!storyId) {
+    storyLookupCache.clear();
+    return;
+  }
+  for (const key of Array.from(storyLookupCache.keys())) {
+    if (key.startsWith(`${storyId}:`)) {
+      storyLookupCache.delete(key);
+    }
+  }
+}
+
+async function hydrateStoryRow(
+  row: any,
+  profileRow: any,
+  opts: {
+    currentUserId?: string;
+    viewsCount?: number;
+    reactionsCount?: number;
+    hasViewed?: boolean;
+    hasReacted?: boolean;
+    userReaction?: string | null;
+  }
+): Promise<Story> {
+  const rawMediaRef =
+    row.media_type === 'text'
+      ? ''
+      : decodeOwnerScopedStoryRef(row.media_url || row.storage_path || '');
+  const isDirectUrl =
+    row.provider === 'cloudinary' ||
+    rawMediaRef.startsWith('https://') ||
+    rawMediaRef.startsWith('http://') ||
+    rawMediaRef.startsWith('data:');
+
+  let signedUrl = rawMediaRef;
+  if (rawMediaRef && row.media_type !== 'text' && !isDirectUrl) {
+    signedUrl = await resolveStoryMediaSignedUrl(rawMediaRef);
+  }
+
+  const authorName =
+    profileRow?.display_name || profileRow?.username || 'ABSU Student';
+
+  return {
+    id: row.id,
+    user_id: row.user_id,
+    media_type: row.media_type as StoryMediaType,
+    storage_path: row.media_type === 'text' ? null : signedUrl,
+    media_url:
+      row.media_type === 'text'
+        ? null
+        : decodeOwnerScopedStoryRef(row.media_url) || signedUrl,
+    provider:
+      row.provider ||
+      (signedUrl.includes('res.cloudinary.com') ? 'cloudinary' : 'supabase'),
+    cloudinary_public_id: row.cloudinary_public_id || null,
+    cloudinary_resource_type: row.cloudinary_resource_type || null,
+    duration_seconds: row.duration_seconds ?? null,
+    thumbnail_url: row.thumbnail_url || null,
+    text_content: row.text_content,
+    caption: row.caption,
+    background_color: row.background_color || null,
+    font_style: row.font_style || null,
+    created_at: row.created_at,
+    expires_at: row.expires_at,
+    is_expired: isStoryExpired(row.expires_at),
+    views_count: opts.viewsCount ?? 0,
+    reactions_count: opts.reactionsCount ?? 0,
+    has_viewed: Boolean(opts.hasViewed),
+    has_reacted: Boolean(opts.hasReacted),
+    user_reaction: opts.userReaction ?? null,
+    user: {
+      id: row.user_id,
+      name: authorName,
+      avatar_url: profileRow?.avatar_url,
+      department: profileRow?.department,
+    },
+  };
+}
+
+/**
+ * Fetch a single story by UUID using the authenticated Supabase client so RLS
+ * (including the updated expired-story policy for story owners & DM repliers)
+ * is strictly respected. Never filters out expired stories by timestamp.
+ */
+export async function fetchStoryById(
+  storyId: string,
+  currentUserId?: string,
+  options?: { forceRefresh?: boolean }
+): Promise<StoryByIdResult> {
+  const cleanId = String(storyId || '').trim();
+  if (!cleanId) {
+    return { status: 'unavailable', reason: 'not_found', error: 'Invalid story ID.' };
+  }
+
+  const cacheKey = `${cleanId}:${currentUserId || 'anon'}`;
+  if (!options?.forceRefresh) {
+    const cached = storyLookupCache.get(cacheKey);
+    if (cached && cached.expiresAt > Date.now()) {
+      return cached.result;
+    }
+  }
+
+  const existingFlight = inFlightStoryLookups.get(cacheKey);
+  if (existingFlight) {
+    return existingFlight;
+  }
+
+  const flightPromise = (async (): Promise<StoryByIdResult> => {
+    try {
+      let storyRow: any = null;
+      let storyErr: any = null;
+
+      const extRes = await supabase
+        .from('stories')
+        .select(`
+          id,
+          user_id,
+          media_type,
+          storage_path,
+          media_url,
+          provider,
+          cloudinary_public_id,
+          cloudinary_resource_type,
+          duration_seconds,
+          thumbnail_url,
+          text_content,
+          caption,
+          background_color,
+          font_style,
+          deleted_at,
+          created_at,
+          expires_at
+        `)
+        .eq('id', cleanId)
+        .is('deleted_at', null)
+        .maybeSingle();
+
+      if (isMissingColumnError(extRes.error)) {
+        const coreRes = await supabase
+          .from('stories')
+          .select('id, user_id, media_type, storage_path, text_content, caption, created_at, expires_at')
+          .eq('id', cleanId)
+          .maybeSingle();
+        storyRow = coreRes.data;
+        storyErr = coreRes.error;
+      } else {
+        storyRow = extRes.data;
+        storyErr = extRes.error;
+      }
+
+      if (storyErr) {
+        console.error('[Stories] fetchStoryById Supabase error:', {
+          storyId: cleanId,
+          code: storyErr.code,
+          message: storyErr.message,
+          details: storyErr.details,
+          hint: storyErr.hint,
+        });
+        const restricted = isStoryPermissionError(storyErr);
+        return {
+          status: 'unavailable',
+          reason: restricted ? 'restricted' : 'error',
+          error: restricted
+            ? 'You do not have permission to view this story.'
+            : storyErr.message || 'Unable to load this story right now.',
+        };
+      }
+
+      if (!storyRow) {
+        const res: StoryByIdResult = {
+          status: 'unavailable',
+          reason: 'not_found',
+          error: 'This story has been deleted or is no longer available.',
+        };
+        storyLookupCache.set(cacheKey, {
+          result: res,
+          expiresAt: Date.now() + 15 * 1000,
+        });
+        return res;
+      }
+
+      // Enforce client-side block filtering when viewer has blocked or been blocked by story owner
+      if (currentUserId && storyRow.user_id && storyRow.user_id !== currentUserId) {
+        const blocks = await fetchUserBlocks(currentUserId).catch(() => null);
+        if (blocks && blocks.allBlockedIds.includes(storyRow.user_id)) {
+          const res: StoryByIdResult = {
+            status: 'unavailable',
+            reason: 'restricted',
+            error: 'This story is not available due to privacy settings.',
+          };
+          storyLookupCache.set(cacheKey, {
+            result: res,
+            expiresAt: Date.now() + STORY_LOOKUP_CACHE_TTL_MS,
+          });
+          return res;
+        }
+      }
+
+      const [profileRes, myViewRes, reactionsRes, viewsRes] = await Promise.all([
+        supabase
+          .from('profiles')
+          .select('id, display_name, username, avatar_url, department, level')
+          .eq('id', storyRow.user_id)
+          .maybeSingle(),
+        currentUserId
+          ? supabase
+              .from('story_views')
+              .select('viewer_id')
+              .eq('story_id', cleanId)
+              .eq('viewer_id', currentUserId)
+              .limit(1)
+          : Promise.resolve({ data: [] as Array<{ viewer_id: string }> }),
+        supabase
+          .from('story_reactions')
+          .select('user_id, reaction')
+          .eq('story_id', cleanId),
+        currentUserId && storyRow.user_id === currentUserId
+          ? supabase
+              .from('story_views')
+              .select('viewer_id')
+              .eq('story_id', cleanId)
+          : Promise.resolve({ data: [] as Array<{ viewer_id: string }> }),
+      ]);
+
+      const reactionRows = (reactionsRes.data || []) as Array<{
+        user_id: string;
+        reaction?: string | null;
+      }>;
+      const uniqueReactors = new Set(reactionRows.map((r) => r.user_id));
+      const myReactionRow = currentUserId
+        ? reactionRows.find((r) => r.user_id === currentUserId)
+        : undefined;
+
+      const uniqueViewers = new Set(
+        ((viewsRes.data || []) as Array<{ viewer_id: string }>)
+          .map((v) => v.viewer_id)
+          .filter((vid) => vid && vid !== storyRow.user_id)
+      );
+
+      const story = await hydrateStoryRow(storyRow, profileRes.data, {
+        currentUserId,
+        viewsCount: uniqueViewers.size,
+        reactionsCount: uniqueReactors.size,
+        hasViewed: Boolean((myViewRes.data || []).length > 0),
+        hasReacted: Boolean(myReactionRow),
+        userReaction: myReactionRow ? myReactionRow.reaction || '❤️' : null,
+      });
+
+      const res: StoryByIdResult = { status: 'ok', story };
+      storyLookupCache.set(cacheKey, {
+        result: res,
+        expiresAt: Date.now() + STORY_LOOKUP_CACHE_TTL_MS,
+      });
+      return res;
+    } catch (err) {
+      console.error('[Stories] fetchStoryById unexpected error:', err);
+      return {
+        status: 'unavailable',
+        reason: 'error',
+        error: err instanceof Error ? err.message : 'Unable to load this story right now.',
+      };
+    } finally {
+      inFlightStoryLookups.delete(cacheKey);
+    }
+  })();
+
+  inFlightStoryLookups.set(cacheKey, flightPromise);
+  return flightPromise;
+}
+
 /**
  * Fetch all active (non-expired) campus stories strictly from Supabase (`stories`, `story_views`, `story_reactions`, `profiles`).
  */
@@ -152,14 +480,7 @@ export async function fetchActiveStories(currentUserId?: string): Promise<UserSt
       .is('deleted_at', null)
       .order('created_at', { ascending: true });
 
-    if (
-      extRes.error &&
-      (extRes.error.code === '42703' ||
-        extRes.error.code === 'PGRST204' ||
-        extRes.error.message?.toLowerCase().includes('schema cache') ||
-        extRes.error.message?.toLowerCase().includes('column'))
-    ) {
-      // Strictly select MPV1 baseline columns (no background_color / font_style / deleted_at)
+    if (isMissingColumnError(extRes.error)) {
       const coreRes = await supabase
         .from('stories')
         .select('id, user_id, media_type, storage_path, text_content, caption, created_at, expires_at')
@@ -187,20 +508,14 @@ export async function fetchActiveStories(currentUserId?: string): Promise<UserSt
         .from('profiles')
         .select('id, display_name, username, avatar_url, department, level')
         .in('id', userIds),
-      currentUserId
-        ? supabase
-            .from('story_views')
-            .select('story_id, viewer_id')
-            .in('story_id', storyIds)
-            .eq('viewer_id', currentUserId)
-        : Promise.resolve({ data: [] as Array<{ story_id: string; viewer_id: string }> }),
-      currentUserId
-        ? supabase
-            .from('story_reactions')
-            .select('story_id, user_id')
-            .in('story_id', storyIds)
-            .eq('user_id', currentUserId)
-        : Promise.resolve({ data: [] as Array<{ story_id: string; user_id: string }> }),
+      supabase
+        .from('story_views')
+        .select('story_id, viewer_id')
+        .in('story_id', storyIds),
+      supabase
+        .from('story_reactions')
+        .select('story_id, user_id, reaction')
+        .in('story_id', storyIds),
     ]);
 
     const profileMap = new Map<string, any>();
@@ -208,64 +523,48 @@ export async function fetchActiveStories(currentUserId?: string): Promise<UserSt
       for (const p of profilesRes.data) profileMap.set(p.id, p);
     }
 
-    const viewedStorySet = new Set<string>();
-    if (viewsRes.data) {
-      for (const v of viewsRes.data) viewedStorySet.add(v.story_id);
+    const storyOwnerById = new Map<string, string>();
+    for (const s of storiesData) {
+      storyOwnerById.set(s.id, s.user_id);
     }
 
-    const reactedStorySet = new Set<string>();
-    if (reactionsRes.data) {
-      for (const r of reactionsRes.data) reactedStorySet.add(r.story_id);
+    const viewersByStory = new Map<string, Set<string>>();
+    const viewedStorySet = new Set<string>();
+    for (const v of (viewsRes.data || []) as Array<{ story_id: string; viewer_id: string }>) {
+      if (currentUserId && v.viewer_id === currentUserId) {
+        viewedStorySet.add(v.story_id);
+      }
+      const ownerId = storyOwnerById.get(v.story_id);
+      if (ownerId && v.viewer_id === ownerId) continue;
+      if (!viewersByStory.has(v.story_id)) viewersByStory.set(v.story_id, new Set());
+      viewersByStory.get(v.story_id)!.add(v.viewer_id);
+    }
+
+    const reactorsByStory = new Map<string, Set<string>>();
+    const myReactionByStory = new Map<string, string>();
+    for (const r of (reactionsRes.data || []) as Array<{
+      story_id: string;
+      user_id: string;
+      reaction?: string | null;
+    }>) {
+      if (!reactorsByStory.has(r.story_id)) reactorsByStory.set(r.story_id, new Set());
+      reactorsByStory.get(r.story_id)!.add(r.user_id);
+      if (currentUserId && r.user_id === currentUserId) {
+        myReactionByStory.set(r.story_id, r.reaction || '❤️');
+      }
     }
 
     const resolvedStories: Story[] = await Promise.all(
-      storiesData.map(async (row) => {
-        const rawMediaRef =
-          row.media_type === 'text'
-            ? ''
-            : decodeOwnerScopedStoryRef(row.media_url || row.storage_path || '');
-        const isDirectUrl =
-          row.provider === 'cloudinary' ||
-          rawMediaRef.startsWith('https://') ||
-          rawMediaRef.startsWith('http://') ||
-          rawMediaRef.startsWith('data:');
-
-        let signedUrl = rawMediaRef;
-        if (rawMediaRef && row.media_type !== 'text' && !isDirectUrl) {
-          signedUrl = await resolveStoryMediaSignedUrl(rawMediaRef);
-        }
-
-        const author = profileMap.get(row.user_id);
-        const authorName =
-          author?.display_name || author?.username || 'ABSU Student';
-
-        return {
-          id: row.id,
-          user_id: row.user_id,
-          media_type: row.media_type as StoryMediaType,
-          storage_path: row.media_type === 'text' ? null : signedUrl,
-          media_url: row.media_type === 'text' ? null : (decodeOwnerScopedStoryRef(row.media_url) || signedUrl),
-          provider: row.provider || (signedUrl.includes('res.cloudinary.com') ? 'cloudinary' : 'supabase'),
-          cloudinary_public_id: row.cloudinary_public_id || null,
-          cloudinary_resource_type: row.cloudinary_resource_type || null,
-          duration_seconds: row.duration_seconds ?? null,
-          thumbnail_url: row.thumbnail_url || null,
-          text_content: row.text_content,
-          caption: row.caption,
-          background_color: row.background_color || null,
-          font_style: row.font_style || null,
-          created_at: row.created_at,
-          expires_at: row.expires_at,
-          has_viewed: viewedStorySet.has(row.id),
-          has_reacted: reactedStorySet.has(row.id),
-          user: {
-            id: row.user_id,
-            name: authorName,
-            avatar_url: author?.avatar_url,
-            department: author?.department,
-          },
-        };
-      })
+      storiesData.map((row) =>
+        hydrateStoryRow(row, profileMap.get(row.user_id), {
+          currentUserId,
+          viewsCount: viewersByStory.get(row.id)?.size ?? 0,
+          reactionsCount: reactorsByStory.get(row.id)?.size ?? 0,
+          hasViewed: viewedStorySet.has(row.id),
+          hasReacted: myReactionByStory.has(row.id),
+          userReaction: myReactionByStory.get(row.id) ?? null,
+        })
+      )
     );
 
     const groupMap = new Map<string, UserStoryGroup>();
@@ -488,14 +787,7 @@ export async function createStory(params: {
       .select()
       .single();
 
-    if (
-      insertError &&
-      (insertError.code === '42703' ||
-        insertError.code === 'PGRST204' ||
-        insertError.message?.toLowerCase().includes('schema cache') ||
-        insertError.message?.toLowerCase().includes('column'))
-    ) {
-      // Strictly insert MPV1 baseline columns (omit background_color / font_style / media_url if unmigrated)
+    if (isMissingColumnError(insertError)) {
       const corePayload: Record<string, any> = {
         user_id: effectiveUserId,
         media_type: mediaType,
@@ -577,10 +869,32 @@ export async function createStory(params: {
 
 /**
  * Record a view for a story idempotently in `story_views`.
+ * Strictly skips recording if the viewer is the story owner, and prevents duplicate rows.
  */
-export async function recordStoryView(storyId: string, viewerId: string): Promise<void> {
+export async function recordStoryView(
+  storyId: string,
+  viewerId: string,
+  storyOwnerId?: string | null
+): Promise<void> {
   if (!storyId || !viewerId) return;
+  if (shouldSkipStoryViewRecord(storyOwnerId, viewerId)) return;
+
   try {
+    // Verify story owner before recording when not provided
+    let resolvedOwnerId = storyOwnerId || null;
+    if (!resolvedOwnerId) {
+      const { data: storyRow } = await supabase
+        .from('stories')
+        .select('user_id')
+        .eq('id', storyId)
+        .maybeSingle();
+      resolvedOwnerId = storyRow?.user_id || null;
+    }
+
+    if (shouldSkipStoryViewRecord(resolvedOwnerId, viewerId)) {
+      return;
+    }
+
     const authHeaders = await getOptionalAuthHeaders();
     const apiRes = await fetch(`/api/stories/${encodeURIComponent(storyId)}/view`, {
       method: 'POST',
@@ -588,46 +902,104 @@ export async function recordStoryView(storyId: string, viewerId: string): Promis
       body: JSON.stringify({ viewerId }),
     }).catch(() => null);
     const json = apiRes?.ok ? await parseApiJson(apiRes) : null;
-    if (json?.success) return;
+    if (json?.success) {
+      invalidateStoryCache(storyId);
+      return;
+    }
 
-    const { error } = await supabase
+    const nowIso = new Date().toISOString();
+    let { error } = await supabase
       .from('story_views')
       .upsert(
-        { story_id: storyId, viewer_id: viewerId },
+        { story_id: storyId, viewer_id: viewerId, viewed_at: nowIso },
         { onConflict: 'story_id,viewer_id', ignoreDuplicates: true }
       );
 
-    if (error) {
-      await supabase
+    if (error && isMissingColumnError(error)) {
+      const retry = await supabase
         .from('story_views')
-        .insert({ story_id: storyId, viewer_id: viewerId });
+        .upsert(
+          { story_id: storyId, viewer_id: viewerId },
+          { onConflict: 'story_id,viewer_id', ignoreDuplicates: true }
+        );
+      error = retry.error;
     }
+
+    if (error) {
+      // Check existence first before falling back to insert so repeated opens never create duplicates
+      const { data: existingView } = await supabase
+        .from('story_views')
+        .select('viewer_id')
+        .eq('story_id', storyId)
+        .eq('viewer_id', viewerId)
+        .limit(1)
+        .maybeSingle();
+
+      if (!existingView) {
+        const ins = await supabase
+          .from('story_views')
+          .insert({ story_id: storyId, viewer_id: viewerId, viewed_at: nowIso });
+        if (ins.error && isMissingColumnError(ins.error)) {
+          await supabase
+            .from('story_views')
+            .insert({ story_id: storyId, viewer_id: viewerId });
+        }
+      }
+    }
+
+    invalidateStoryCache(storyId);
   } catch {
     // Ignore duplicate constraint conflicts safely
   }
 }
 
 /**
- * Toggle reaction (like) on a story via Express API first with Supabase fallback.
+ * Add, change, or remove a user's reaction on a story cleanly without duplicates.
+ * Pass `reaction = null` to remove the user's reaction.
  */
-export async function toggleStoryReaction(
+export async function setStoryReaction(
   storyId: string,
   userId: string,
-  currentlyLiked: boolean
-): Promise<{ success: boolean; liked: boolean; error?: string }> {
+  reaction: string | null
+): Promise<{
+  success: boolean;
+  reacted: boolean;
+  reaction: string | null;
+  error?: string;
+}> {
+  if (!storyId || !userId) {
+    return {
+      success: false,
+      reacted: false,
+      reaction: null,
+      error: 'Missing story or user ID',
+    };
+  }
+
+  const nextReaction = reaction ? reaction.trim() : null;
+
   try {
     const authHeaders = await getOptionalAuthHeaders();
     const apiRes = await fetch(`/api/stories/${encodeURIComponent(storyId)}/reaction`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', ...authHeaders },
-      body: JSON.stringify({ userId, currentlyLiked }),
+      body: JSON.stringify({
+        userId,
+        reaction: nextReaction,
+        currentlyLiked: nextReaction === null,
+      }),
     }).catch(() => null);
     const json = apiRes?.ok ? await parseApiJson(apiRes) : null;
-    if (json?.success) {
-      return { success: true, liked: Boolean(json.liked) };
+    if (json?.success && 'reaction' in json) {
+      invalidateStoryCache(storyId);
+      return {
+        success: true,
+        reacted: Boolean(json.liked ?? json.reaction),
+        reaction: json.reaction ?? null,
+      };
     }
 
-    if (currentlyLiked) {
+    if (!nextReaction) {
       const { error } = await supabase
         .from('story_reactions')
         .delete()
@@ -635,34 +1007,77 @@ export async function toggleStoryReaction(
         .eq('user_id', userId);
 
       if (error) {
-        return { success: false, liked: currentlyLiked, error: error.message };
+        return { success: false, reacted: true, reaction: null, error: error.message };
       }
-      return { success: true, liked: false };
-    } else {
-      const { error } = await supabase
-        .from('story_reactions')
-        .upsert(
-          {
-            story_id: storyId,
-            user_id: userId,
-            reaction: 'like',
-          },
-          { onConflict: 'story_id,user_id', ignoreDuplicates: true }
-        );
-
-      if (error) {
-        return { success: false, liked: currentlyLiked, error: error.message };
-      }
-      return { success: true, liked: true };
+      invalidateStoryCache(storyId);
+      return { success: true, reacted: false, reaction: null };
     }
+
+    // Attempt upsert first (updates reaction if UNIQUE(story_id, user_id) & UPDATE policy allow)
+    const { error: upsertErr } = await supabase
+      .from('story_reactions')
+      .upsert(
+        {
+          story_id: storyId,
+          user_id: userId,
+          reaction: nextReaction,
+        },
+        { onConflict: 'story_id,user_id', ignoreDuplicates: false }
+      );
+
+    if (upsertErr) {
+      // Fallback for RLS without UPDATE policy or missing unique constraint: DELETE then INSERT
+      await supabase
+        .from('story_reactions')
+        .delete()
+        .eq('story_id', storyId)
+        .eq('user_id', userId);
+
+      const { error: insertErr } = await supabase
+        .from('story_reactions')
+        .insert({
+          story_id: storyId,
+          user_id: userId,
+          reaction: nextReaction,
+        });
+
+      if (insertErr) {
+        return {
+          success: false,
+          reacted: false,
+          reaction: null,
+          error: insertErr.message,
+        };
+      }
+    }
+
+    invalidateStoryCache(storyId);
+    return { success: true, reacted: true, reaction: nextReaction };
   } catch (err: unknown) {
-    console.error('[Stories] Error toggling reaction:', err);
+    console.error('[Stories] Error updating story reaction:', err);
     return {
       success: false,
-      liked: currentlyLiked,
+      reacted: false,
+      reaction: null,
       error: err instanceof Error ? err.message : 'Failed to update story reaction',
     };
   }
+}
+
+/**
+ * Legacy boolean toggle wrapper kept compatible with existing callers.
+ */
+export async function toggleStoryReaction(
+  storyId: string,
+  userId: string,
+  currentlyLiked: boolean
+): Promise<{ success: boolean; liked: boolean; error?: string }> {
+  const res = await setStoryReaction(storyId, userId, currentlyLiked ? null : '❤️');
+  return {
+    success: res.success,
+    liked: res.reacted,
+    error: res.error,
+  };
 }
 
 /**
@@ -736,73 +1151,137 @@ export async function replyToStory(
 }
 
 /**
- * Fetch insights/viewers for a story directly from Supabase (`story_views` + `story_reactions` + `profiles`).
+ * Fetch insights (viewers & reactions with full profiles) for a story.
+ * Queries live `story_views` (`story_id, viewer_id, viewed_at`) and `story_reactions`
+ * (`story_id, user_id, reaction, created_at`), joins `profiles` by user ID,
+ * and excludes owner self-views deterministically.
  */
-export async function fetchStoryInsights(storyId: string): Promise<{
+export async function fetchStoryInsights(
+  storyId: string,
+  storyOwnerId?: string | null
+): Promise<{
   views: StoryViewItem[];
+  viewsCount: number;
+  reactions: StoryReactionItem[];
   reactionsCount: number;
 }> {
+  if (!storyId) {
+    return { views: [], viewsCount: 0, reactions: [], reactionsCount: 0 };
+  }
+
   try {
     const authHeaders = await getOptionalAuthHeaders();
     const apiRes = await fetch(`/api/stories/${encodeURIComponent(storyId)}/insights`, {
       headers: authHeaders,
     }).catch(() => null);
     const json = apiRes?.ok ? await parseApiJson(apiRes) : null;
-    if (json?.success) {
+    if (json?.success && Array.isArray(json.views) && Array.isArray(json.reactions)) {
       return {
-        views: Array.isArray(json.views) ? json.views : [],
-        reactionsCount: Number(json.reactionsCount) || 0,
+        views: json.views as StoryViewItem[],
+        viewsCount: Number(json.viewsCount ?? json.views.length) || 0,
+        reactions: json.reactions as StoryReactionItem[],
+        reactionsCount: Number(json.reactionsCount ?? json.reactions.length) || 0,
       };
     }
 
-    const [viewsRes, reactionsRes] = await Promise.all([
-      supabase
+    let resolvedOwnerId = storyOwnerId || null;
+    if (!resolvedOwnerId) {
+      const { data: storyRow } = await supabase
+        .from('stories')
+        .select('user_id')
+        .eq('id', storyId)
+        .maybeSingle();
+      resolvedOwnerId = storyRow?.user_id || null;
+    }
+
+    const fetchViews = async (): Promise<RawStoryViewRow[]> => {
+      const primary = await supabase
         .from('story_views')
-        .select(`
-          id,
-          story_id,
-          viewer_id,
-          created_at,
-          profiles:viewer_id (
-            id,
-            display_name,
-            username,
-            avatar_url,
-            department,
-            level
-          )
-        `)
+        .select('story_id, viewer_id, viewed_at')
         .eq('story_id', storyId)
-        .order('created_at', { ascending: false }),
-      supabase
-        .from('story_reactions')
-        .select('id', { count: 'exact', head: true })
-        .eq('story_id', storyId),
-    ]);
+        .order('viewed_at', { ascending: false });
 
-    const formattedViews: StoryViewItem[] = (viewsRes.data || []).map((row: any) => ({
-      id: row.id,
-      story_id: row.story_id,
-      viewer_id: row.viewer_id,
-      created_at: row.created_at,
-      viewer: row.profiles
-        ? {
-            id: row.profiles.id,
-            name: row.profiles.display_name || row.profiles.username || 'ABSU Student',
-            avatar_url: row.profiles.avatar_url,
-            department: row.profiles.department,
-            level: row.profiles.level,
-          }
-        : undefined,
-    }));
+      if (!primary.error) {
+        return (primary.data || []) as RawStoryViewRow[];
+      }
 
-    return {
-      views: formattedViews,
-      reactionsCount: reactionsRes.count || 0,
+      if (isMissingColumnError(primary.error)) {
+        const legacy = await supabase
+          .from('story_views')
+          .select('id, story_id, viewer_id, created_at')
+          .eq('story_id', storyId)
+          .order('created_at', { ascending: false });
+        if (!legacy.error) {
+          return (legacy.data || []) as RawStoryViewRow[];
+        }
+      }
+
+      console.warn('[Stories] story_views insights note:', primary.error.message);
+      return [];
     };
+
+    const fetchReactions = async (): Promise<RawStoryReactionRow[]> => {
+      const primary = await supabase
+        .from('story_reactions')
+        .select('story_id, user_id, reaction, created_at')
+        .eq('story_id', storyId)
+        .order('created_at', { ascending: false });
+
+      if (!primary.error) {
+        return (primary.data || []) as RawStoryReactionRow[];
+      }
+
+      if (isMissingColumnError(primary.error)) {
+        const legacy = await supabase
+          .from('story_reactions')
+          .select('story_id, user_id, reaction_type, created_at')
+          .eq('story_id', storyId)
+          .order('created_at', { ascending: false });
+        if (!legacy.error) {
+          return (legacy.data || []) as RawStoryReactionRow[];
+        }
+      }
+
+      console.warn('[Stories] story_reactions insights note:', primary.error.message);
+      return [];
+    };
+
+    const [viewsRows, reactionsRows] = await Promise.all([fetchViews(), fetchReactions()]);
+
+    const userIdSet = new Set<string>();
+    for (const v of viewsRows) {
+      if (v.viewer_id && (!resolvedOwnerId || v.viewer_id !== resolvedOwnerId)) {
+        userIdSet.add(v.viewer_id);
+      }
+    }
+    for (const r of reactionsRows) {
+      if (r.user_id) {
+        userIdSet.add(r.user_id);
+      }
+    }
+
+    const profilesById = new Map<string, RawProfileMiniRow>();
+    const allUserIds = Array.from(userIdSet);
+    if (allUserIds.length > 0) {
+      const { data: profileRows } = await supabase
+        .from('profiles')
+        .select('id, display_name, username, avatar_url, department, level')
+        .in('id', allUserIds);
+
+      for (const p of (profileRows || []) as RawProfileMiniRow[]) {
+        profilesById.set(p.id, p);
+      }
+    }
+
+    return normalizeStoryInsightsRows({
+      viewsRows,
+      reactionsRows,
+      profilesById,
+      storyOwnerId: resolvedOwnerId,
+    });
   } catch (err) {
     console.error('[Stories] Error fetching insights:', err);
-    return { views: [], reactionsCount: 0 };
+    return { views: [], viewsCount: 0, reactions: [], reactionsCount: 0 };
   }
 }
 
@@ -864,7 +1343,6 @@ export async function deleteStory(
     }
 
     if (isCloudinary && !cloudCleanupSucceeded) {
-      // Soft-delete immediately so story disappears from active feed and cron retries Cloudinary cleanup
       const { error: softErr } = await supabase
         .from('stories')
         .update({
@@ -874,9 +1352,9 @@ export async function deleteStory(
         .eq('id', storyId);
 
       if (!softErr) {
+        invalidateStoryCache(storyId);
         return { success: true };
       }
-      // If deleted_at column is not yet migrated, proceed with hard delete
     }
 
     const authHeaders = await getOptionalAuthHeaders();
@@ -886,6 +1364,7 @@ export async function deleteStory(
     }).catch(() => null);
     const apiDelJson = apiDelRes?.ok ? await parseApiJson(apiDelRes) : null;
     if (apiDelJson?.success) {
+      invalidateStoryCache(storyId);
       return { success: true };
     }
 
@@ -902,6 +1381,8 @@ export async function deleteStory(
     ) {
       await deleteStoryMediaFromStorage(mediaRef);
     }
+
+    invalidateStoryCache(storyId);
     return { success: true };
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : 'Failed to delete story';

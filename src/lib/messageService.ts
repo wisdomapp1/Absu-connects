@@ -26,6 +26,7 @@ import {
   getCachedMessages,
   setCachedMessages,
 } from './cacheService.ts';
+import { isStoryAttachment } from './storyUtils.ts';
 
 /**
  * Authoritative unread counts per conversation.
@@ -184,6 +185,7 @@ async function processMessageRowsWithAttachments(
       format?: string;
       kind?: string;
       asset_id: string;
+      story_id?: string | null;
       secure_url?: string;
       provider?: string;
       thumbnail_url?: string;
@@ -207,6 +209,7 @@ async function processMessageRowsWithAttachments(
           format: a.format,
           kind: (a.kind as 'image' | 'video' | 'audio' | 'pdf' | 'document') || 'document',
           asset_id: a.asset_id,
+          story_id: a.story_id ?? null,
           secure_url: a.secure_url,
           provider: a.provider || 'supabase',
           thumbnail_url: a.thumbnail_url,
@@ -224,7 +227,10 @@ async function processMessageRowsWithAttachments(
     const isSeen = isOutgoing && recipientReadTime > 0 && recipientReadTime >= msgTime;
 
     const attachments: MessageAttachment[] = (m.message_attachments || []).map((a: any) => {
-      const signedUrl = signedUrlMap.get(a.asset_id) || a.secure_url;
+      const isStoryRef = isStoryAttachment(a);
+      const signedUrl = isStoryRef
+        ? a.secure_url
+        : signedUrlMap.get(a.asset_id) || a.secure_url;
       return {
         id: a.id,
         message_id: a.message_id,
@@ -234,6 +240,7 @@ async function processMessageRowsWithAttachments(
         format: a.format,
         kind: (a.kind as 'image' | 'video' | 'audio' | 'pdf' | 'document') || 'document',
         asset_id: a.asset_id,
+        story_id: a.story_id ?? null,
         secure_url: signedUrl,
         provider: a.provider || (String(signedUrl || '').includes('res.cloudinary.com') ? 'cloudinary' : 'supabase'),
         thumbnail_url: a.thumbnail_url,
@@ -495,6 +502,71 @@ export async function fetchUserConversations(currentUserId: string): Promise<Con
   } catch (err) {
     console.warn('Unexpected error in fetchUserConversations, returning cache:', err);
     return await getCachedConversations();
+  }
+}
+
+/**
+ * Hydrate a single conversation by UUID (e.g. when opened from a notification or deep link
+ * before the inbox list finishes refreshing or when the thread isn't in the top 30 slice).
+ */
+export async function fetchConversationById(
+  conversationId: string,
+  currentUserId: string
+): Promise<Conversation | null> {
+  if (!conversationId || !currentUserId) return null;
+  try {
+    const { data: convRow, error: convErr } = await supabase
+      .from('conversations')
+      .select('*')
+      .eq('id', conversationId)
+      .maybeSingle();
+
+    if (convErr || !convRow) return null;
+
+    const { data: otherMember } = await supabase
+      .from('conversation_members')
+      .select('user_id')
+      .eq('conversation_id', conversationId)
+      .neq('user_id', currentUserId)
+      .limit(1)
+      .maybeSingle();
+
+    const partnerId = otherMember?.user_id || convRow.created_by;
+    let participantUser: User = {
+      id: partnerId || 'unknown',
+      name: convRow.title || 'Coursemate',
+      avatar: `https://api.dicebear.com/7.x/initials/svg?seed=${encodeURIComponent(partnerId || 'ABSU')}&backgroundColor=6d45d9&textColor=ffffff`,
+      handle: '@student',
+      department: 'Student',
+      faculty: 'Abia State University',
+      level: 'Undergraduate',
+      campus: 'Uturu (Main Campus)',
+      bio: '',
+      interests: [],
+      relationshipState: 'none',
+    };
+
+    if (partnerId && partnerId !== currentUserId) {
+      const { data: profileRow } = await supabase
+        .from('profiles')
+        .select('*')
+        .eq('id', partnerId)
+        .maybeSingle();
+      if (profileRow) {
+        participantUser = mapProfileRowToUser(profileRow as SupabaseProfileRow, null, 'friends');
+      }
+    }
+
+    return {
+      id: convRow.id,
+      participant: participantUser,
+      lastMessage: convRow.last_message || 'Conversation started',
+      lastMessageTime: formatTimeAgo(convRow.last_message_at || convRow.created_at),
+      unreadCount: 0,
+      messages: [],
+    };
+  } catch {
+    return null;
   }
 }
 
@@ -964,6 +1036,9 @@ export async function deleteRealMessage(
     const supabasePaths: string[] = [];
 
     for (const a of attRows) {
+      if (isStoryAttachment(a)) {
+        continue;
+      }
       const isCloudinary =
         a.provider === 'cloudinary' ||
         Boolean(a.cloudinary_public_id) ||

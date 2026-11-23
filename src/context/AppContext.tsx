@@ -43,8 +43,11 @@ import {
   declineOrCancelFriendRequest,
   removeRealFriend,
 } from '../lib/friendService.ts';
+import type { UserStoryGroup, Story } from '../types/stories.ts';
+import { fetchStoryById } from '../lib/storyService.ts';
 import {
   fetchUserConversations,
+  fetchConversationById,
   sendRealMessage,
   getOrCreateDirectConversation,
   markConversationAsRead,
@@ -243,6 +246,32 @@ export interface AppContextType {
   setSearchOpen: (open: boolean) => void;
   imageLightboxUrl: string | null;
   setImageLightboxUrl: (url: string | null) => void;
+  storyModalState: {
+    isOpen: boolean;
+    storyGroups: UserStoryGroup[];
+    initialGroupIndex: number;
+    initialStoryId: string | null;
+    initialInsightsOpen: boolean;
+    initialInsightsTab: 'viewers' | 'reactions';
+  };
+  openStoryGroups: (
+    storyGroups: UserStoryGroup[],
+    initialGroupIndex?: number,
+    options?: {
+      initialStoryId?: string | null;
+      initialInsightsOpen?: boolean;
+      initialInsightsTab?: 'viewers' | 'reactions';
+    }
+  ) => void;
+  openStoryById: (
+    storyId: string,
+    options?: {
+      fallbackStory?: Story | null;
+      initialInsightsOpen?: boolean;
+      initialInsightsTab?: 'viewers' | 'reactions';
+    }
+  ) => Promise<boolean>;
+  closeStoryModal: () => void;
 
   // Toasts
   toasts: ToastMessage[];
@@ -466,7 +495,16 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     if (typeof window !== 'undefined' && window.location.search) {
       try {
         const params = new URLSearchParams(window.location.search);
-        const view = params.get('view') as ActiveView;
+        const rawView = params.get('view');
+        const storyId = params.get('storyId') || null;
+        const storyTabParam = params.get('tab');
+        const storyTab: 'viewers' | 'reactions' | undefined =
+          storyTabParam === 'reactions'
+            ? 'reactions'
+            : storyTabParam === 'viewers'
+            ? 'viewers'
+            : undefined;
+        const view = (rawView === 'story' ? 'home' : rawView) as ActiveView;
         const convId = params.get('convId') || null;
         const userId = params.get('userId') || null;
         const communityId = params.get('communityId') || null;
@@ -495,6 +533,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
             commentId,
             parentCommentId,
             openComments,
+            storyId: rawView === 'story' ? storyId : null,
+            storyTab,
           };
         }
       } catch {}
@@ -510,6 +550,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       commentId: null,
       parentCommentId: null,
       openComments: false,
+      storyId: null as string | null,
+      storyTab: undefined as 'viewers' | 'reactions' | undefined,
     };
   })();
 
@@ -537,6 +579,21 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const [editProfileModalOpen, setEditProfileModalOpenState] = useState<boolean>(false);
   const [searchOpen, setSearchOpenState] = useState<boolean>(false);
   const [imageLightboxUrl, setImageLightboxUrlState] = useState<string | null>(null);
+  const [storyModalState, setStoryModalState] = useState<{
+    isOpen: boolean;
+    storyGroups: UserStoryGroup[];
+    initialGroupIndex: number;
+    initialStoryId: string | null;
+    initialInsightsOpen: boolean;
+    initialInsightsTab: 'viewers' | 'reactions';
+  }>({
+    isOpen: false,
+    storyGroups: [],
+    initialGroupIndex: 0,
+    initialStoryId: null,
+    initialInsightsOpen: false,
+    initialInsightsTab: 'viewers',
+  });
   const [toasts, setToasts] = useState<ToastMessage[]>([]);
 
   // Navigation & overlay tracking refs for Android Back / Popstate / Capacitor synchronization
@@ -560,6 +617,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const editProfileModalOpenRef = useRef<boolean>(false);
   const searchOpenRef = useRef<boolean>(false);
   const imageLightboxUrlRef = useRef<string | null>(null);
+  const storyModalOpenRef = useRef<boolean>(false);
   const adminViewOpenRef = useRef<boolean>(false);
   const lastBackPressRef = useRef<number>(0);
 
@@ -571,6 +629,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   useEffect(() => { editProfileModalOpenRef.current = editProfileModalOpen; }, [editProfileModalOpen]);
   useEffect(() => { searchOpenRef.current = searchOpen; }, [searchOpen]);
   useEffect(() => { imageLightboxUrlRef.current = imageLightboxUrl; }, [imageLightboxUrl]);
+  useEffect(() => { storyModalOpenRef.current = storyModalState.isOpen; }, [storyModalState.isOpen]);
   useEffect(() => { adminViewOpenRef.current = adminViewOpen; }, [adminViewOpen]);
 
   // Dismissible overlay setters that synchronize with browser history
@@ -601,6 +660,34 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       safePushState({ isOverlay: true, type: 'lightbox' }, '', window.location.pathname);
     }
   }, []);
+
+  const closeStoryModal = useCallback(() => {
+    setStoryModalState((prev) => ({ ...prev, isOpen: false }));
+  }, []);
+
+  const openStoryGroups = useCallback(
+    (
+      storyGroups: UserStoryGroup[],
+      initialGroupIndex = 0,
+      options?: {
+        initialStoryId?: string | null;
+        initialInsightsOpen?: boolean;
+        initialInsightsTab?: 'viewers' | 'reactions';
+      }
+    ) => {
+      if (!storyGroups || storyGroups.length === 0) return;
+      setStoryModalState({
+        isOpen: true,
+        storyGroups,
+        initialGroupIndex,
+        initialStoryId: options?.initialStoryId || null,
+        initialInsightsOpen: Boolean(options?.initialInsightsOpen),
+        initialInsightsTab: options?.initialInsightsTab || 'viewers',
+      });
+      safePushState({ isOverlay: true, type: 'storyViewer' }, '', window.location.pathname);
+    },
+    []
+  );
 
   const openCreatePostWithMedia = useCallback((items: AttachedMediaItem[]) => {
     setInitialPostMedia(items);
@@ -770,6 +857,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       setImageLightboxUrlState(null);
       return;
     }
+    if (storyModalOpenRef.current) {
+      setStoryModalState((prev) => ({ ...prev, isOpen: false }));
+      return;
+    }
     if (createPostModalOpenRef.current) {
       setCreatePostModalOpenState(false);
       setInitialPostMedia([]);
@@ -848,6 +939,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         setImageLightboxUrlState(null);
         return;
       }
+      if (storyModalOpenRef.current) {
+        setStoryModalState((prev) => ({ ...prev, isOpen: false }));
+        return;
+      }
       if (createPostModalOpenRef.current) {
         setCreatePostModalOpenState(false);
         setInitialPostMedia([]);
@@ -903,6 +998,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         // 1. Overlay check
         if (imageLightboxUrlRef.current) {
           setImageLightboxUrlState(null);
+          return;
+        }
+        if (storyModalOpenRef.current) {
+          setStoryModalState((prev) => ({ ...prev, isOpen: false }));
           return;
         }
         if (createPostModalOpenRef.current) {
@@ -1085,7 +1184,25 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     const navigateFromTargetUrl = (targetUrl: string) => {
       try {
         const parsed = new URL(targetUrl, window.location.origin);
-        const view = (parsed.searchParams.get('view') as ActiveView) || 'alerts';
+        const rawView = parsed.searchParams.get('view');
+        const storyIdParam = parsed.searchParams.get('storyId');
+        const storyTabParam = parsed.searchParams.get('tab');
+
+        if (rawView === 'story' && storyIdParam) {
+          const insightsTab: 'viewers' | 'reactions' | undefined =
+            storyTabParam === 'reactions'
+              ? 'reactions'
+              : storyTabParam === 'viewers'
+              ? 'viewers'
+              : undefined;
+          openStoryByIdRef.current(storyIdParam, {
+            initialInsightsOpen: Boolean(insightsTab),
+            initialInsightsTab: insightsTab,
+          });
+          return;
+        }
+
+        const view = (rawView as ActiveView) || 'alerts';
         navigateToRef.current(view, {
           userId: parsed.searchParams.get('userId') || undefined,
           convId: parsed.searchParams.get('convId') || undefined,
@@ -1188,13 +1305,76 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     }
   }, [authUserId, auth.user?.created_at, loadingUsers, friends.length]);
 
-  const addToast = (message: string, type: 'success' | 'info' | 'warning' = 'info') => {
+  const addToast = useCallback((message: string, type: 'success' | 'info' | 'warning' = 'info') => {
     const id = 'toast_' + Date.now() + Math.random().toString(36).substring(2, 6);
     setToasts((prev) => [...prev, { id, message, type }]);
     setTimeout(() => {
       setToasts((prev) => prev.filter((t) => t.id !== id));
     }, 3200);
-  };
+  }, []);
+
+  const openStoryById = useCallback(
+    async (
+      storyId: string,
+      options?: {
+        fallbackStory?: Story | null;
+        initialInsightsOpen?: boolean;
+        initialInsightsTab?: 'viewers' | 'reactions';
+      }
+    ): Promise<boolean> => {
+      if (!storyId) return false;
+      const res = await fetchStoryById(storyId, authUserId || undefined);
+      const targetStory = res.status === 'ok' ? res.story : (options?.fallbackStory || null);
+
+      if (!targetStory) {
+        const reason = res.status === 'unavailable' ? res.reason : 'not_found';
+        if (reason === 'restricted') {
+          addToast(res.status === 'unavailable' && res.error ? res.error : 'You do not have permission to view this story.', 'warning');
+        } else if (reason === 'error') {
+          addToast('Could not load this story right now. Please try again.', 'warning');
+        } else {
+          addToast('This story has been deleted or is no longer available.', 'warning');
+        }
+        return false;
+      }
+
+      const group: UserStoryGroup = {
+        user_id: targetStory.user_id,
+        user_name: targetStory.user?.name || 'Student',
+        user_avatar: targetStory.user?.avatar_url,
+        has_unviewed: !targetStory.has_viewed,
+        latest_timestamp: targetStory.created_at,
+        stories: [targetStory],
+      };
+
+      setStoryModalState({
+        isOpen: true,
+        storyGroups: [group],
+        initialGroupIndex: 0,
+        initialStoryId: targetStory.id,
+        initialInsightsOpen: Boolean(options?.initialInsightsOpen),
+        initialInsightsTab: options?.initialInsightsTab || 'viewers',
+      });
+      safePushState({ isOverlay: true, type: 'storyViewer' }, '', window.location.pathname);
+      return true;
+    },
+    [authUserId, addToast]
+  );
+
+  const openStoryByIdRef = useRef(openStoryById);
+  openStoryByIdRef.current = openStoryById;
+
+  const handledInitialStoryRef = useRef(false);
+  useEffect(() => {
+    if (!authUserId || auth.loading || handledInitialStoryRef.current) return;
+    if (initialRoute.storyId) {
+      handledInitialStoryRef.current = true;
+      openStoryByIdRef.current(initialRoute.storyId, {
+        initialInsightsOpen: Boolean(initialRoute.storyTab),
+        initialInsightsTab: initialRoute.storyTab,
+      });
+    }
+  }, [authUserId, auth.loading]);
 
   const removeToast = (id: string) => {
     setToasts((prev) => prev.filter((t) => t.id !== id));
@@ -2655,6 +2835,26 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     ? (conversations.find((c) => c.id === selectedConversationId) || null)
     : null;
 
+  // Hydrate deep-linked conversation if not present in the top-30 inbox slice
+  const attemptedConvHydrationRef = useRef<Set<string>>(new Set());
+  useEffect(() => {
+    if (!authUserId || !selectedConversationId) return;
+    if (conversations.some((c) => c.id === selectedConversationId)) return;
+    if (attemptedConvHydrationRef.current.has(selectedConversationId)) return;
+
+    attemptedConvHydrationRef.current.add(selectedConversationId);
+    let cancelled = false;
+
+    fetchConversationById(selectedConversationId, authUserId).then((conv) => {
+      if (cancelled || !conv) return;
+      setConversations((prev) => (prev.some((c) => c.id === conv.id) ? prev : [conv, ...prev]));
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [authUserId, selectedConversationId, conversations]);
+
   const markConversationRead = useCallback(
     async (convId: string) => {
       if (!convId || !auth.user) return;
@@ -2803,6 +3003,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         setSearchOpen,
         imageLightboxUrl,
         setImageLightboxUrl,
+        storyModalState,
+        openStoryGroups,
+        openStoryById,
+        closeStoryModal,
         toasts,
         addToast,
         removeToast,

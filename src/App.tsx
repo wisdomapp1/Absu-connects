@@ -30,6 +30,7 @@ import { SafetyCenterView } from './components/more/SafetyCenterView.tsx';
 import { CreatePostModal } from './components/home/CreatePostModal.tsx';
 import { EditProfileModal } from './components/profile/EditProfileModal.tsx';
 import { ImageViewerModal } from './components/common/ImageViewerModal.tsx';
+import { StoryViewerModal } from './components/stories/StoryViewerModal.tsx';
 import { ToastContainer } from './components/common/Toast.tsx';
 import { PullToRefresh } from './components/common/PullToRefresh.tsx';
 import { AdminDashboard } from './components/admin/AdminDashboard.tsx';
@@ -56,6 +57,10 @@ const AppContent: React.FC = () => {
     selectedUserId,
     selectedConversationId,
     selectedPostId,
+    currentUser,
+    storyModalState,
+    closeStoryModal,
+    addToast,
   } = useApp();
 
   const mainScrollRef = React.useRef<HTMLDivElement>(null);
@@ -291,6 +296,32 @@ const AppContent: React.FC = () => {
       <CreatePostModal />
       <EditProfileModal />
       <ImageViewerModal />
+      <StoryViewerModal
+        isOpen={storyModalState.isOpen}
+        onClose={closeStoryModal}
+        storyGroups={storyModalState.storyGroups}
+        initialGroupIndex={storyModalState.initialGroupIndex}
+        initialStoryId={storyModalState.initialStoryId}
+        initialInsightsOpen={storyModalState.initialInsightsOpen}
+        initialInsightsTab={storyModalState.initialInsightsTab}
+        currentUserId={currentUser.id}
+        onStoryViewed={(storyId) => {
+          window.dispatchEvent(new CustomEvent('absu:story-viewed', { detail: { storyId } }));
+        }}
+        onStoryDeleted={(storyId) => {
+          window.dispatchEvent(new CustomEvent('absu:story-deleted', { detail: { storyId } }));
+        }}
+        onStoryReacted={(storyId, reaction, reactionsCount) => {
+          window.dispatchEvent(
+            new CustomEvent('absu:story-reacted', {
+              detail: { storyId, reaction, reactionsCount },
+            })
+          );
+        }}
+        onShowToast={(msg, type) =>
+          addToast(msg, type === 'error' ? 'warning' : type || 'info')
+        }
+      />
       <NotificationPermissionModal
         isOpen={notificationPromptOpen}
         onClose={() => setNotificationPromptOpen(false)}

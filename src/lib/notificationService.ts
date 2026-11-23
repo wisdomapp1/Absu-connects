@@ -24,6 +24,13 @@ export function getPrivacySafeNotificationText(
   switch (type) {
     case 'message':
       return 'sent you a message.';
+    case 'story_comment':
+      return 'replied to your story.';
+    case 'story_reaction':
+    case 'story_like':
+      return 'reacted to your story.';
+    case 'story_view':
+      return 'viewed your story.';
     case 'friend_request':
       return 'sent you a friend request.';
     case 'friend_accept':
@@ -102,11 +109,23 @@ export function mapAppTypeToDbEnum(type: NotificationType): string {
  */
 export function mapDbEnumToAppType(rawType: string, entityType?: string | null): NotificationType {
   const cleanEntity = (entityType || '').toLowerCase().trim();
+  const clean = (rawType || '').toLowerCase().trim();
+
+  // Check Story notification types FIRST before generic comment/reaction checks
+  if (clean === 'story_comment' || cleanEntity === 'story_comment') return 'story_comment';
+  if (clean === 'story_reaction' || cleanEntity === 'story_reaction') return 'story_reaction';
+  if (clean === 'story_like' || cleanEntity === 'story_like') return 'story_like';
+  if (clean === 'story_view' || cleanEntity === 'story_view') return 'story_view';
+  if (cleanEntity === 'story') {
+    if (clean.includes('comment') || clean.includes('reply')) return 'story_comment';
+    if (clean.includes('react') || clean.includes('like')) return 'story_reaction';
+    if (clean.includes('view')) return 'story_view';
+  }
+
   if (cleanEntity === 'discovery_welcome') return 'welcome_discovery';
   if (cleanEntity === 'discovery_suggestion') return 'discovery_suggestion';
   if (cleanEntity === 'discovery_reminder') return 'discovery_reminder';
 
-  const clean = (rawType || '').toLowerCase().trim();
   if (clean === 'welcome_discovery') return 'welcome_discovery';
   if (clean === 'discovery_suggestion') return 'discovery_suggestion';
   if (clean === 'discovery_reminder') return 'discovery_reminder';
@@ -190,6 +209,7 @@ export async function fetchUserNotifications(
       { id: string; post_id: string; parent_comment_id: string | null }
     >();
     const messageConvMap = new Map<string, string>();
+    const storyCommentConvMap = new Map<string, string>();
     const actorProfileMap = new Map<string, SupabaseProfileRow>();
 
     if (rawRows.length === 0) {
@@ -201,6 +221,15 @@ export async function fetchUserNotifications(
           .order('created_at', { ascending: false })
           .limit(100);
 
+        if (supaErr) {
+          console.error('[Notifications] Supabase notifications fetch error:', {
+            code: supaErr.code,
+            message: supaErr.message,
+            details: supaErr.details,
+            hint: supaErr.hint,
+          });
+        }
+
         if (!supaErr && supaRows) {
           rawRows = supaRows;
 
@@ -211,7 +240,16 @@ export async function fetchUserNotifications(
           const commentIdsToResolve = Array.from(
             new Set([
               ...rawRows
-                .filter((r: any) => isValidUuid(r.comment_id))
+                .filter((r: any) => {
+                  const mapped = mapDbEnumToAppType(r.type || '', r.entity_type);
+                  return (
+                    mapped !== 'story_comment' &&
+                    mapped !== 'story_reaction' &&
+                    mapped !== 'story_view' &&
+                    mapped !== 'story_like' &&
+                    isValidUuid(r.comment_id)
+                  );
+                })
                 .map((r: any) => r.comment_id),
               ...rawRows
                 .filter((r: any) => {
@@ -231,6 +269,7 @@ export async function fetchUserNotifications(
                 .filter(
                   (r: any) =>
                     !isValidUuid(r.comment_id) &&
+                    !String(r.type || '').toLowerCase().startsWith('story_') &&
                     String(r.type || '').toLowerCase().includes('comment') &&
                     String(r.entity_type || '').toLowerCase() === 'post' &&
                     isValidUuid(r.entity_id)
@@ -251,7 +290,21 @@ export async function fetchUserNotifications(
             )
           );
 
-          const [profilesRes, commentRowsRes, legacyCommentsRes, messageRowsRes] = await Promise.all([
+          const storyCommentStoryIds = Array.from(
+            new Set(
+              rawRows
+                .filter((r: any) => {
+                  const mapped = mapDbEnumToAppType(r.type || '', r.entity_type);
+                  return (
+                    mapped === 'story_comment' &&
+                    isValidUuid(r.story_id || r.entity_id)
+                  );
+                })
+                .map((r: any) => (isValidUuid(r.story_id) ? r.story_id : r.entity_id))
+            )
+          );
+
+          const [profilesRes, commentRowsRes, legacyCommentsRes, messageRowsRes, storyCommentsRes] = await Promise.all([
             actorIds.length > 0
               ? supabase.from('profiles').select('*').in('id', actorIds)
               : Promise.resolve({ data: null }),
@@ -274,7 +327,25 @@ export async function fetchUserNotifications(
                   .select('id, conversation_id')
                   .in('id', messageIdsToResolve)
               : Promise.resolve({ data: null }),
+            storyCommentStoryIds.length > 0
+              ? supabase
+                  .from('story_comments')
+                  .select('story_id, commenter_id, story_owner_id, conversation_id, created_at')
+                  .in('story_id', storyCommentStoryIds)
+                  .order('created_at', { ascending: false })
+                  .then((r) => r, () => ({ data: null }))
+              : Promise.resolve({ data: null }),
           ]);
+
+          if ((commentRowsRes as any)?.error) {
+            console.error('[Notifications] comment lookup error:', (commentRowsRes as any).error);
+          }
+          if ((legacyCommentsRes as any)?.error) {
+            console.error('[Notifications] legacy comment lookup error:', (legacyCommentsRes as any).error);
+          }
+          if ((messageRowsRes as any)?.error) {
+            console.error('[Notifications] message lookup error:', (messageRowsRes as any).error);
+          }
 
           for (const p of (profilesRes.data || []) as SupabaseProfileRow[]) {
             actorProfileMap.set(p.id, p);
@@ -312,6 +383,21 @@ export async function fetchUserNotifications(
               messageConvMap.set(msg.id, msg.conversation_id);
             }
           }
+
+          for (const sc of ((storyCommentsRes as any)?.data || []) as Array<{
+            story_id?: string;
+            commenter_id?: string;
+            conversation_id?: string;
+          }>) {
+            if (sc.story_id && sc.conversation_id) {
+              if (sc.commenter_id && !storyCommentConvMap.has(`${sc.story_id}_${sc.commenter_id}`)) {
+                storyCommentConvMap.set(`${sc.story_id}_${sc.commenter_id}`, sc.conversation_id);
+              }
+              if (!storyCommentConvMap.has(sc.story_id)) {
+                storyCommentConvMap.set(sc.story_id, sc.conversation_id);
+              }
+            }
+          }
         }
       } catch (err) {
         console.warn('[Notifications] Supabase direct query note:', err);
@@ -323,6 +409,11 @@ export async function fetchUserNotifications(
 
     for (const row of rawRows) {
       const notifType: NotificationType = mapDbEnumToAppType(row.type || '', row.entity_type);
+      const isStoryNotif =
+        notifType === 'story_comment' ||
+        notifType === 'story_reaction' ||
+        notifType === 'story_view' ||
+        notifType === 'story_like';
       const isDiscoverySystem =
         notifType === 'welcome_discovery' ||
         notifType === 'discovery_suggestion' ||
@@ -368,8 +459,10 @@ export async function fetchUserNotifications(
       if (filter === 'archived' && !isArchived) continue;
 
       const cleanEntityType = String(row.entity_type || '').toLowerCase();
-      let convId: string | undefined = undefined;
-      if (notifType === 'message') {
+      let convId: string | undefined = isValidUuid(row.conversation_id)
+        ? row.conversation_id
+        : undefined;
+      if (!convId && notifType === 'message') {
         if (cleanEntityType === 'conversation' && row.entity_id) {
           convId = row.entity_id;
         } else if (cleanEntityType === 'message' && row.entity_id && messageConvMap.has(row.entity_id)) {
@@ -377,49 +470,68 @@ export async function fetchUserNotifications(
         }
       }
 
-      let resolvedCommentId: string | undefined = isValidUuid(row.comment_id)
-        ? row.comment_id
-        : undefined;
-      let resolvedParentCommentId: string | undefined = isValidUuid(row.parent_comment_id)
-        ? row.parent_comment_id
-        : undefined;
-      let resolvedPostId: string | undefined = isValidUuid(row.post_id) ? row.post_id : undefined;
+      let resolvedStoryId: string | undefined = undefined;
+      let resolvedCommentId: string | undefined = undefined;
+      let resolvedParentCommentId: string | undefined = undefined;
+      let resolvedPostId: string | undefined = undefined;
 
-      if (
-        !resolvedCommentId &&
-        (cleanEntityType === 'comment' ||
-          cleanEntityType === 'comment_reply' ||
-          cleanEntityType === 'comment_reaction') &&
-        isValidUuid(row.entity_id)
-      ) {
-        resolvedCommentId = row.entity_id;
-      }
-
-      if (resolvedCommentId && fallbackCommentMetaMap.has(resolvedCommentId)) {
-        const meta = fallbackCommentMetaMap.get(resolvedCommentId)!;
-        if (!resolvedPostId && isValidUuid(meta.post_id)) {
-          resolvedPostId = meta.post_id;
+      if (isStoryNotif) {
+        resolvedStoryId = isValidUuid(row.story_id)
+          ? row.story_id
+          : isValidUuid(row.entity_id)
+          ? row.entity_id
+          : undefined;
+        if (notifType === 'story_comment' && !convId && resolvedStoryId) {
+          convId =
+            (isValidUuid(row.actor_id) &&
+              storyCommentConvMap.get(`${resolvedStoryId}_${row.actor_id}`)) ||
+            storyCommentConvMap.get(resolvedStoryId);
         }
-        if (!resolvedParentCommentId && meta.parent_comment_id && isValidUuid(meta.parent_comment_id)) {
-          resolvedParentCommentId = meta.parent_comment_id;
+      } else {
+        resolvedCommentId = isValidUuid(row.comment_id) ? row.comment_id : undefined;
+        resolvedParentCommentId = isValidUuid(row.parent_comment_id)
+          ? row.parent_comment_id
+          : undefined;
+        resolvedPostId = isValidUuid(row.post_id) ? row.post_id : undefined;
+
+        if (
+          !resolvedCommentId &&
+          (cleanEntityType === 'comment' ||
+            cleanEntityType === 'comment_reply' ||
+            cleanEntityType === 'comment_reaction') &&
+          isValidUuid(row.entity_id)
+        ) {
+          if (cleanEntityType !== 'comment' || fallbackCommentMetaMap.has(row.entity_id)) {
+            resolvedCommentId = row.entity_id;
+          }
         }
-      }
 
-      if (!resolvedPostId && cleanEntityType === 'post' && isValidUuid(row.entity_id)) {
-        resolvedPostId = row.entity_id;
-      }
+        if (resolvedCommentId && fallbackCommentMetaMap.has(resolvedCommentId)) {
+          const meta = fallbackCommentMetaMap.get(resolvedCommentId)!;
+          if (!resolvedPostId && isValidUuid(meta.post_id)) {
+            resolvedPostId = meta.post_id;
+          }
+          if (!resolvedParentCommentId && meta.parent_comment_id && isValidUuid(meta.parent_comment_id)) {
+            resolvedParentCommentId = meta.parent_comment_id;
+          }
+        }
 
-      if (
-        !resolvedCommentId &&
-        notifType === 'comment' &&
-        resolvedPostId &&
-        isValidUuid(row.actor_id)
-      ) {
-        const legacyMatch = legacyPostActorCommentMap.get(`${resolvedPostId}_${row.actor_id}`);
-        if (legacyMatch) {
-          resolvedCommentId = legacyMatch.id;
-          if (!resolvedParentCommentId && legacyMatch.parent_comment_id) {
-            resolvedParentCommentId = legacyMatch.parent_comment_id;
+        if (!resolvedPostId && cleanEntityType === 'post' && isValidUuid(row.entity_id)) {
+          resolvedPostId = row.entity_id;
+        }
+
+        if (
+          !resolvedCommentId &&
+          notifType === 'comment' &&
+          resolvedPostId &&
+          isValidUuid(row.actor_id)
+        ) {
+          const legacyMatch = legacyPostActorCommentMap.get(`${resolvedPostId}_${row.actor_id}`);
+          if (legacyMatch) {
+            resolvedCommentId = legacyMatch.id;
+            if (!resolvedParentCommentId && legacyMatch.parent_comment_id) {
+              resolvedParentCommentId = legacyMatch.parent_comment_id;
+            }
           }
         }
       }
@@ -427,8 +539,10 @@ export async function fetchUserNotifications(
       rawList.push({
         id: row.id,
         type: notifType,
+        rawType: row.type || undefined,
         title: row.title || undefined,
         entityType: row.entity_type || undefined,
+        entityId: row.entity_id || undefined,
         actor: {
           id: actorUser.id,
           name: actorUser.name,
@@ -442,6 +556,7 @@ export async function fetchUserNotifications(
         targetPostId: resolvedPostId,
         targetCommentId: resolvedCommentId,
         targetParentCommentId: resolvedParentCommentId,
+        targetStoryId: resolvedStoryId,
         conversationId: convId,
       });
     }
@@ -527,6 +642,11 @@ export async function createRealNotification(params: {
     | 'comment'
     | 'comment_reply'
     | 'comment_reaction'
+    | 'story'
+    | 'story_comment'
+    | 'story_reaction'
+    | 'story_view'
+    | 'story_like'
     | 'conversation'
     | 'friend_request'
     | 'friend_accepted'

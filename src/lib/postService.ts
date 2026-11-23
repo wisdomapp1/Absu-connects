@@ -569,9 +569,31 @@ export async function hydratePostRowsFromSupabase(rows: SupabasePostRow[]): Prom
   }
 }
 
+export function isPermissionOrRlsError(error: unknown): boolean {
+  const msg =
+    typeof error === 'string'
+      ? error.toLowerCase()
+      : error && typeof error === 'object' && 'message' in error
+      ? String((error as any).message || '').toLowerCase()
+      : '';
+  const code =
+    error && typeof error === 'object' && 'code' in error
+      ? String((error as any).code || '').trim()
+      : '';
+  return (
+    code === '42501' ||
+    code === 'PGRST301' ||
+    msg.includes('row-level security') ||
+    msg.includes('permission denied') ||
+    msg.includes('insufficient_privilege') ||
+    msg.includes('not authorized') ||
+    msg.includes('jwt')
+  );
+}
+
 export async function querySupabasePostsResilient(
   applyFilters: (query: any) => any
-): Promise<{ rows: SupabasePostRow[]; error?: string }> {
+): Promise<{ rows: SupabasePostRow[]; error?: string; isPermissionError?: boolean }> {
   const richRes = await applyFilters(supabase.from('posts').select(CLIENT_RICH_SELECT));
   if (!richRes.error) {
     return { rows: (richRes.data || []) as unknown as SupabasePostRow[] };
@@ -594,7 +616,18 @@ export async function querySupabasePostsResilient(
     return { rows: hydrated };
   }
 
-  return { rows: [], error: richRes.error.message || coreRes.error.message || baseRes.error.message };
+  const finalError = baseRes.error || coreRes.error || richRes.error;
+  console.error('[PostService] Supabase post lookup error:', {
+    richError: richRes.error,
+    coreError: coreRes.error,
+    baseError: baseRes.error,
+  });
+
+  return {
+    rows: [],
+    error: finalError?.message || 'Unable to query post from database.',
+    isPermissionError: isPermissionOrRlsError(finalError),
+  };
 }
 
 export async function fetchSavedPostsWithStatus(
@@ -887,6 +920,18 @@ export async function fetchSinglePostById(
     ]);
 
     if (postsRes.error) {
+      console.error('[PostService] fetchSinglePostById lookup error:', {
+        postId,
+        error: postsRes.error,
+        isPermissionError: postsRes.isPermissionError,
+      });
+      if (postsRes.isPermissionError) {
+        return {
+          post: null,
+          status: 'restricted',
+          error: 'You do not have permission to view this post.',
+        };
+      }
       return { post: null, status: 'error', error: postsRes.error };
     }
 
@@ -895,7 +940,7 @@ export async function fetchSinglePostById(
       return {
         post: null,
         status: 'not_found',
-        error: 'This post may have been deleted or is private.',
+        error: 'This post may have been deleted.',
       };
     }
     if (row.visibility === 'hidden' || moderatedSet.has(row.id)) {

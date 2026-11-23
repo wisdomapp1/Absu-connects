@@ -3,8 +3,7 @@ import { useApp } from '../../context/AppContext.tsx';
 import { useAuth } from '../../context/AuthContext.tsx';
 import type { NotificationItem, NotificationType } from '../../types/index.ts';
 import { Avatar } from '../common/Avatar.tsx';
-import { safeStorage } from '../../utils/safeStorage.ts';
-import { checkPostHasVideo, isVideoPost } from '../../lib/reelsService.ts';
+import { executeNotificationNavigation } from '../../lib/notificationRouter.ts';
 import {
   Bell,
   Heart,
@@ -18,6 +17,7 @@ import {
   Sparkles,
   RefreshCw,
   Users,
+  Eye,
 } from 'lucide-react';
 
 export const AlertsView: React.FC = () => {
@@ -33,6 +33,7 @@ export const AlertsView: React.FC = () => {
     setFriendTab,
     openNotificationPrompt,
     startConversationWithUser,
+    openStoryById,
     addToast,
   } = useApp();
   const { user: _user } = useAuth();
@@ -69,9 +70,14 @@ export const AlertsView: React.FC = () => {
   const getEventIcon = (type: NotificationType) => {
     switch (type) {
       case 'like':
+      case 'story_reaction':
+      case 'story_like':
         return <Heart className="w-3.5 h-3.5 text-red-500 fill-current" />;
       case 'comment':
+      case 'story_comment':
         return <MessageCircle className="w-3.5 h-3.5 text-blue-500 fill-current" />;
+      case 'story_view':
+        return <Eye className="w-3.5 h-3.5 text-emerald-500" />;
       case 'friend_request':
         return <UserPlus className="w-3.5 h-3.5 text-[var(--color-primary)]" />;
       case 'friend_accept':
@@ -88,15 +94,6 @@ export const AlertsView: React.FC = () => {
     }
   };
 
-  const resolvePostAlertDestination = async (postId: string, item: NotificationItem): Promise<'reels' | 'post-detail'> => {
-    if (item.targetIsVideo === true) return 'reels';
-    const cached = posts.find((p) => p.id === postId);
-    if (cached && isVideoPost(cached)) return 'reels';
-    if (item.targetIsVideo === false) return 'post-detail';
-    const hasVideo = await checkPostHasVideo(postId).catch(() => false);
-    return hasVideo ? 'reels' : 'post-detail';
-  };
-
   const handleNotificationClick = async (item: NotificationItem) => {
     const now = Date.now();
     if (lastClickRef.current.id === item.id && now - lastClickRef.current.ts < 500) {
@@ -106,83 +103,16 @@ export const AlertsView: React.FC = () => {
 
     markNotificationAsRead(item.id);
 
-    if (
-      item.type === 'welcome_discovery' ||
-      item.type === 'discovery_suggestion' ||
-      item.type === 'discovery_reminder'
-    ) {
-      setFriendTab('discover');
-      navigateTo('friends');
-    } else if (item.type === 'message') {
-      if (item.conversationId) {
-        navigateTo('conversation', { convId: item.conversationId });
-      } else {
-        const directConv = conversations.find((c) => c.participant.id === item.actor.id);
-        if (directConv) {
-          navigateTo('conversation', { convId: directConv.id });
-        } else if (item.actor.id && item.actor.id !== 'system') {
-          startConversationWithUser({
-            id: item.actor.id,
-            name: item.actor.name,
-            avatar: item.actor.avatar,
-            handle: '@student',
-            department: 'Student',
-            faculty: 'Abia State University',
-            level: 'Undergraduate',
-            campus: 'Uturu (Main Campus)',
-            bio: '',
-            interests: [],
-            relationshipState: 'none',
-          });
-        } else {
-          navigateTo('messages');
-        }
-      }
-    } else if (item.type === 'friend_request') {
-      setFriendTab('requests');
-      navigateTo('friends');
-    } else if (item.type === 'friend_accept') {
-      navigateTo('user-profile', { userId: item.actor.id });
-    } else if (
-      item.type === 'comment' ||
-      item.type === 'like' ||
-      item.type === 'mention' ||
-      item.type === 'community_post'
-    ) {
-      if (!item.targetPostId) {
-        addToast('The post for this notification is no longer available.', 'warning');
-        return;
-      }
-
-      const entityTypeLower = (item.entityType || '').toLowerCase();
-      const shouldOpenComments =
-        item.type === 'comment' ||
-        item.type === 'mention' ||
-        entityTypeLower === 'comment' ||
-        entityTypeLower === 'comment_reply' ||
-        entityTypeLower === 'comment_reaction' ||
-        Boolean(item.targetCommentId || item.targetParentCommentId);
-
-      const targetView = await resolvePostAlertDestination(item.targetPostId, item);
-      navigateTo(targetView, {
-        postId: item.targetPostId,
-        commentId: item.targetCommentId || null,
-        parentCommentId: item.targetParentCommentId || null,
-        openComments: shouldOpenComments,
-        actorId: item.actor.id,
-      });
-    } else if (item.targetPostId) {
-      const targetView = await resolvePostAlertDestination(item.targetPostId, item);
-      navigateTo(targetView, {
-        postId: item.targetPostId,
-        commentId: item.targetCommentId || null,
-        parentCommentId: item.targetParentCommentId || null,
-        openComments: Boolean(item.targetCommentId),
-        actorId: item.actor.id,
-      });
-    } else {
-      navigateTo('home');
-    }
+    await executeNotificationNavigation(item, {
+      currentUserId: _user?.id,
+      posts,
+      conversations,
+      navigateTo,
+      setFriendTab,
+      startConversationWithUser,
+      openStoryById,
+      addToast,
+    });
   };
 
   return (

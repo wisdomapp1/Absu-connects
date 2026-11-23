@@ -9,18 +9,20 @@ export interface StoryViewerProfile {
 }
 
 export interface StoryViewItem {
-  id: string;
+  id?: string;
   story_id: string;
   viewer_id: string;
-  created_at: string;
+  viewed_at: string;
+  created_at?: string;
   viewer?: StoryViewerProfile;
 }
 
 export interface StoryReactionItem {
-  id: string;
+  id?: string;
   story_id: string;
   user_id: string;
-  reaction_type: string;
+  reaction: string;
+  reaction_type?: string;
   created_at: string;
   user?: StoryViewerProfile;
 }
@@ -42,6 +44,7 @@ export interface Story {
   font_style?: string | null;
   created_at: string;
   expires_at: string;
+  is_expired?: boolean;
   user?: {
     id: string;
     name: string;
@@ -52,6 +55,7 @@ export interface Story {
   reactions_count?: number;
   has_viewed?: boolean;
   has_reacted?: boolean;
+  user_reaction?: string | null;
   views?: StoryViewItem[];
   reactions?: StoryReactionItem[];
 }

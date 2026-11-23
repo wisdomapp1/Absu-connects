@@ -9,7 +9,6 @@ import { FeedFilters } from './FeedFilters.tsx';
 import { PostCard } from './PostCard.tsx';
 import { StoriesBar } from '../stories/StoriesBar.tsx';
 import { CreateStoryModal } from '../stories/CreateStoryModal.tsx';
-import { StoryViewerModal } from '../stories/StoryViewerModal.tsx';
 import { fetchActiveStories, sortStoryGroups } from '../../lib/storyService.ts';
 import type { UserStoryGroup } from '../../types/stories.ts';
 import { filterPosts } from '../../utils/logic.ts';
@@ -28,6 +27,7 @@ export const HomeView: React.FC = () => {
     refreshPosts,
     isRefreshingScreen,
     addToast,
+    openStoryGroups,
   } = useApp();
   const [anonIntroOpen, setAnonIntroOpen] = useState(false);
   const [anonSubmitOpen, setAnonSubmitOpen] = useState(false);
@@ -36,8 +36,6 @@ export const HomeView: React.FC = () => {
   const [storyGroups, setStoryGroups] = useState<UserStoryGroup[]>([]);
   const [loadingStories, setLoadingStories] = useState<boolean>(true);
   const [createStoryOpen, setCreateStoryOpen] = useState<boolean>(false);
-  const [storyViewerOpen, setStoryViewerOpen] = useState<boolean>(false);
-  const [selectedStoryGroupIdx, setSelectedStoryGroupIdx] = useState<number>(0);
 
   const loadStories = useCallback(async () => {
     if (!currentUser.id) {
@@ -100,6 +98,57 @@ export const HomeView: React.FC = () => {
     [currentUser.id]
   );
 
+  const handleStoryReacted = useCallback(
+    (storyId: string, reaction: string | null, reactionsCount: number) => {
+      setStoryGroups((prev) =>
+        prev.map((g) => ({
+          ...g,
+          stories: g.stories.map((s) =>
+            s.id === storyId
+              ? {
+                  ...s,
+                  user_reaction: reaction,
+                  has_reacted: Boolean(reaction),
+                  reactions_count: reactionsCount,
+                }
+              : s
+          ),
+        }))
+      );
+    },
+    []
+  );
+
+  useEffect(() => {
+    const onViewed = (e: Event) => {
+      const storyId = (e as CustomEvent<{ storyId?: string }>)?.detail?.storyId;
+      if (storyId) handleStoryViewed(storyId);
+    };
+    const onDeleted = (e: Event) => {
+      const storyId = (e as CustomEvent<{ storyId?: string }>)?.detail?.storyId;
+      if (storyId) handleStoryDeleted(storyId);
+    };
+    const onReacted = (e: Event) => {
+      const detail = (e as CustomEvent<{
+        storyId?: string;
+        reaction?: string | null;
+        reactionsCount?: number;
+      }>)?.detail;
+      if (detail?.storyId) {
+        handleStoryReacted(detail.storyId, detail.reaction ?? null, detail.reactionsCount ?? 0);
+      }
+    };
+
+    window.addEventListener('absu:story-viewed', onViewed);
+    window.addEventListener('absu:story-deleted', onDeleted);
+    window.addEventListener('absu:story-reacted', onReacted);
+    return () => {
+      window.removeEventListener('absu:story-viewed', onViewed);
+      window.removeEventListener('absu:story-deleted', onDeleted);
+      window.removeEventListener('absu:story-reacted', onReacted);
+    };
+  }, [handleStoryViewed, handleStoryDeleted, handleStoryReacted]);
+
   const displayedPosts = filterPosts(posts, feedFilter);
 
   return (
@@ -120,8 +169,7 @@ export const HomeView: React.FC = () => {
         storyGroups={storyGroups}
         loading={loadingStories}
         onSelectGroup={(idx) => {
-          setSelectedStoryGroupIdx(idx);
-          setStoryViewerOpen(true);
+          openStoryGroups(storyGroups, idx);
         }}
         onAddStory={() => setCreateStoryOpen(true)}
       />
@@ -212,19 +260,6 @@ export const HomeView: React.FC = () => {
         onClose={() => setCreateStoryOpen(false)}
         userId={currentUser.id}
         onStoryCreated={loadStories}
-        onShowToast={(msg, type) =>
-          addToast(msg, type === 'error' ? 'warning' : type || 'info')
-        }
-      />
-
-      <StoryViewerModal
-        isOpen={storyViewerOpen}
-        onClose={() => setStoryViewerOpen(false)}
-        storyGroups={storyGroups}
-        initialGroupIndex={selectedStoryGroupIdx}
-        currentUserId={currentUser.id}
-        onStoryDeleted={handleStoryDeleted}
-        onStoryViewed={handleStoryViewed}
         onShowToast={(msg, type) =>
           addToast(msg, type === 'error' ? 'warning' : type || 'info')
         }

@@ -447,6 +447,7 @@ export const ReelsView: React.FC = () => {
     selectedPostNavContext,
     toggleLike,
     toggleSave,
+    navigateTo,
     goBack,
   } = useApp();
 
@@ -470,6 +471,7 @@ export const ReelsView: React.FC = () => {
   const [searchModalOpen, setSearchModalOpen] = useState(false);
   const [searchSeedQuery, setSearchSeedQuery] = useState('');
   const [uploadModalOpen, setUploadModalOpen] = useState(false);
+  const [missingTargetPost, setMissingTargetPost] = useState(false);
 
   const getContextFeedVideos = useCallback(() => {
     return postsRef.current.filter((p) => isVideoPost(p)).map(normalizePostForReels);
@@ -478,6 +480,7 @@ export const ReelsView: React.FC = () => {
   const loadInitialReels = useCallback(
     async (focusPostId?: string | null) => {
       setLoading(true);
+      setMissingTargetPost(false);
       try {
         const page = await fetchReelsFeedPage({
           currentUserId: currentUser.id || undefined,
@@ -499,6 +502,13 @@ export const ReelsView: React.FC = () => {
               const single = await fetchSingleReelById(focusPostId, currentUser.id || undefined);
               if (single) {
                 list = [single, ...list];
+              } else {
+                setMissingTargetPost(true);
+                setReels([]);
+                setHasMore(false);
+                nextCursorRef.current = null;
+                setActiveIndex(0);
+                return;
               }
             }
           }
@@ -543,11 +553,19 @@ export const ReelsView: React.FC = () => {
     const contextVideos = posts.filter((p) => isVideoPost(p)).map(normalizePostForReels);
     if (contextVideos.length === 0) return;
 
+    if (selectedPostId && missingTargetPost) {
+      const recovered = contextVideos.find((p) => p.id === selectedPostId);
+      if (!recovered) return;
+      setMissingTargetPost(false);
+      setReels([recovered, ...contextVideos.filter((p) => p.id !== selectedPostId)]);
+      return;
+    }
+
     setReels((prev) => {
       if (prev.length === 0) {
         if (selectedPostId) {
           const focused = contextVideos.find((p) => p.id === selectedPostId);
-          return focused ? [focused, ...contextVideos.filter((p) => p.id !== selectedPostId)] : contextVideos;
+          return focused ? [focused, ...contextVideos.filter((p) => p.id !== selectedPostId)] : prev;
         }
         return contextVideos;
       }
@@ -563,7 +581,7 @@ export const ReelsView: React.FC = () => {
       }
       return merged;
     });
-  }, [posts, selectedPostId]);
+  }, [posts, selectedPostId, missingTargetPost]);
 
   // Listen to new video posts created anywhere (Home or ReelsUploadModal) and deletions
   useEffect(() => {
@@ -801,6 +819,36 @@ export const ReelsView: React.FC = () => {
           <div className="w-full h-full flex flex-col items-center justify-center gap-3 text-white">
             <Loader2 className="w-8 h-8 animate-spin text-[var(--color-primary)]" />
             <p className="text-xs font-semibold text-white/75">Loading Campus Reels...</p>
+          </div>
+        ) : missingTargetPost ? (
+          <div className="w-full h-full flex flex-col items-center justify-center gap-3 px-6 text-center text-white">
+            <div className="w-16 h-16 rounded-3xl bg-white/10 flex items-center justify-center">
+              <ReelsIcon className="w-8 h-8 text-amber-400" />
+            </div>
+            <h2 className="text-base font-extrabold">Reel Unavailable</h2>
+            <p className="text-xs text-white/70 max-w-xs">
+              This video post may have been deleted or is no longer accessible.
+            </p>
+            <div className="flex items-center gap-2.5 mt-1">
+              <button
+                type="button"
+                onClick={goBack}
+                className="min-h-[44px] px-4 py-2 rounded-full bg-white/15 hover:bg-white/25 text-white text-xs font-bold flex items-center gap-1.5"
+              >
+                <ArrowLeft className="w-4 h-4" />
+                <span>Go Back</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setMissingTargetPost(false);
+                  navigateTo('reels');
+                }}
+                className="min-h-[44px] px-5 py-2 rounded-full bg-[var(--color-primary)] hover:bg-[var(--color-primary-hover)] text-white text-xs font-bold shadow-lg"
+              >
+                Browse All Reels
+              </button>
+            </div>
           </div>
         ) : reels.length === 0 ? (
           <div className="w-full h-full flex flex-col items-center justify-center gap-3 px-6 text-center text-white">
