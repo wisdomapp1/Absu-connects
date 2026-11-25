@@ -35,8 +35,12 @@ import {
   Building2,
   AlertTriangle,
   Bookmark,
+  ArrowRightLeft,
+  X,
 } from 'lucide-react';
 import { ReelsIcon } from '../common/ReelsIcon.tsx';
+import { VerifiedBadge } from '../common/VerifiedBadge.tsx';
+import { formatPageCategoryLabel } from '../../types/pages.ts';
 
 interface ProfileViewProps {
   isAnotherUser?: boolean;
@@ -59,6 +63,8 @@ export const ProfileView: React.FC<ProfileViewProps> = ({ isAnotherUser = false 
     isSuperAdmin,
     openAdminDashboard,
     navigateTo,
+    managedPages,
+    switchIdentity,
   } = useApp();
   const { signOut } = useAuth();
 
@@ -70,6 +76,8 @@ export const ProfileView: React.FC<ProfileViewProps> = ({ isAnotherUser = false 
   const [photoModalOpen, setPhotoModalOpen] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
   const [createPageModalOpen, setCreatePageModalOpen] = useState(false);
+  const [pageSelectorOpen, setPageSelectorOpen] = useState(false);
+  const [switchingPageId, setSwitchingPageId] = useState<string | null>(null);
   const [deleteModalOpen, setDeleteModalOpen] = useState(false);
   const [deleteConfirmationText, setDeleteConfirmationText] = useState('');
   const [isDeletingAccount, setIsDeletingAccount] = useState(false);
@@ -273,6 +281,8 @@ export const ProfileView: React.FC<ProfileViewProps> = ({ isAnotherUser = false 
     ? users.filter((u) => u.relationshipState === 'friends').length
     : (profileUser.mutualFriendsCount ?? 0);
 
+  const activeManagedPages = managedPages.filter((entry) => entry.page.status === 'active');
+
   return (
     <div className="flex flex-col gap-4">
       {/* Back button if viewing another user */}
@@ -324,6 +334,17 @@ export const ProfileView: React.FC<ProfileViewProps> = ({ isAnotherUser = false 
             <div className="flex items-center gap-2 pt-2">
               {isMe ? (
                 <>
+                  {activeManagedPages.length > 0 && (
+                    <button
+                      type="button"
+                      onClick={() => setPageSelectorOpen(true)}
+                      className="px-3.5 py-2 rounded-xl bg-[var(--color-primary-subtle)] text-[var(--color-primary)] hover:bg-[var(--color-primary)] hover:text-white text-xs font-bold shadow-xs flex items-center gap-1.5 transition-all active:scale-95 whitespace-nowrap"
+                      title="Switch to one of your managed Pages"
+                    >
+                      <ArrowRightLeft className="w-3.5 h-3.5" />
+                      <span>Switch to Page</span>
+                    </button>
+                  )}
                   {isSuperAdmin && (
                     <button
                       onClick={openAdminDashboard}
@@ -719,9 +740,92 @@ export const ProfileView: React.FC<ProfileViewProps> = ({ isAnotherUser = false 
       <CreatePageModal
         isOpen={createPageModalOpen}
         onClose={() => setCreatePageModalOpen(false)}
-        userId={currentUser.id}
-        onShowToast={(msg, type) => addToast(msg, type === 'error' ? 'warning' : type)}
       />
+
+      {/* Switch to Page Selector Modal */}
+      {pageSelectorOpen && (
+        <div
+          className="fixed inset-0 z-50 bg-black/60 backdrop-blur-xs flex items-end sm:items-center justify-center p-0 sm:p-4"
+          onClick={() => setPageSelectorOpen(false)}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            className="w-full sm:max-w-md bg-[var(--color-bg-card)] border border-[var(--color-border)] rounded-t-3xl sm:rounded-2xl max-h-[80vh] flex flex-col overflow-hidden shadow-2xl"
+          >
+            <div className="px-4 py-3.5 border-b border-[var(--color-border)] flex items-center justify-between">
+              <div>
+                <h3 className="text-base font-extrabold text-[var(--color-text-primary)]">
+                  Switch to a Page
+                </h3>
+                <p className="text-[11px] text-[var(--color-text-secondary)]">
+                  Select a Page you own or administer
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setPageSelectorOpen(false)}
+                className="min-w-[44px] min-h-[44px] flex items-center justify-center rounded-xl text-[var(--color-text-secondary)] hover:bg-[var(--color-bg-main)]"
+                aria-label="Close Page selector"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <div className="flex-1 overflow-y-auto p-3 space-y-2">
+              {activeManagedPages.map(({ page, role, unreadNotificationsCount, unreadInboxCount }) => {
+                const busy = switchingPageId === page.id;
+                const badgeTotal = (unreadNotificationsCount ?? 0) + (unreadInboxCount ?? 0);
+                return (
+                  <button
+                    key={page.id}
+                    type="button"
+                    disabled={switchingPageId !== null}
+                    onClick={async () => {
+                      setSwitchingPageId(page.id);
+                      try {
+                        const ok = await switchIdentity(page.id);
+                        if (ok) {
+                          setPageSelectorOpen(false);
+                        }
+                      } finally {
+                        setSwitchingPageId(null);
+                      }
+                    }}
+                    className="w-full min-h-[60px] p-3 rounded-xl bg-[var(--color-bg-main)] hover:bg-[var(--color-primary-subtle)]/60 border border-[var(--color-border)] flex items-center justify-between gap-3 text-left transition-colors"
+                  >
+                    <div className="flex items-center gap-3 min-w-0">
+                      <Avatar src={page.avatarUrl} name={page.name} size="md" className="shrink-0" />
+                      <div className="min-w-0">
+                        <div className="flex items-center gap-1 min-w-0">
+                          <span className="text-sm font-bold text-[var(--color-text-primary)] truncate">
+                            {page.name}
+                          </span>
+                          {page.isVerified && <VerifiedBadge size={14} />}
+                        </div>
+                        <p className="text-[11px] text-[var(--color-text-secondary)] truncate">
+                          {role === 'owner' ? 'Owner' : 'Admin'} · {formatPageCategoryLabel(page.category)}
+                        </p>
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-2 shrink-0">
+                      {badgeTotal > 0 && (
+                        <span className="min-w-[20px] h-[20px] px-1.5 rounded-full bg-rose-500 text-white text-[10px] font-bold flex items-center justify-center tabular-nums">
+                          {badgeTotal > 99 ? '99+' : badgeTotal}
+                        </span>
+                      )}
+                      {busy ? (
+                        <Loader2 className="w-4 h-4 animate-spin text-[var(--color-primary)]" />
+                      ) : (
+                        <ArrowRightLeft className="w-4 h-4 text-[var(--color-primary)]" />
+                      )}
+                    </div>
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Delete Account Confirmation Modal */}
       {deleteModalOpen && (

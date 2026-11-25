@@ -31,6 +31,9 @@ export type NotificationRouteKind =
   | 'comment_reaction'
   | 'comment'
   | 'fallback_post'
+  | 'page_profile'
+  | 'page_inbox'
+  | 'page_invite'
   | 'home';
 
 export interface CommentLookupResult {
@@ -55,6 +58,7 @@ export interface NotificationRouterActions {
       communityId?: string;
       eventId?: string;
       postId?: string;
+      pageId?: string;
       commentId?: string | null;
       parentCommentId?: string | null;
       openComments?: boolean;
@@ -118,6 +122,28 @@ export function classifyNotificationEntity(item: NotificationItem): Notification
   const et = String(item.entityType || '').toLowerCase().trim();
   const raw = String(item.rawType || '').toLowerCase().trim();
 
+  if (
+    item.type === 'page_admin_invite' ||
+    item.type === 'page_follow_invite' ||
+    et === 'page_admin_invitation' ||
+    et === 'page_follow_invite' ||
+    raw === 'page_admin_invite' ||
+    raw === 'page_follow_invite'
+  ) {
+    return 'page_invite';
+  }
+  if (item.type === 'page_message' || raw === 'page_message') {
+    return 'page_inbox';
+  }
+  if (
+    item.type === 'page_follow' ||
+    item.type === 'page_verified' ||
+    item.type === 'page_status' ||
+    et === 'page'
+  ) {
+    return 'page_profile';
+  }
+
   if (item.type === 'friend_request' || et === 'friend_request' || raw === 'friend_request') {
     return 'friend_request';
   }
@@ -170,12 +196,15 @@ export function classifyNotificationEntity(item: NotificationItem): Notification
     item.type === 'comment' ||
     item.type === 'like' ||
     item.type === 'mention' ||
-    item.type === 'community_post'
+    item.type === 'community_post' ||
+    item.type === 'page_post' ||
+    item.type === 'page_like' ||
+    item.type === 'page_comment'
   ) {
     if (item.targetCommentId && !item.targetPostId) {
       return 'comment';
     }
-    return item.targetPostId ? 'post' : 'fallback_post';
+    return item.targetPostId ? 'post' : item.targetPageId ? 'page_profile' : 'fallback_post';
   }
 
   if (item.targetStoryId && !item.targetPostId) {
@@ -183,6 +212,9 @@ export function classifyNotificationEntity(item: NotificationItem): Notification
   }
   if (item.targetPostId) {
     return 'fallback_post';
+  }
+  if (item.targetPageId) {
+    return 'page_profile';
   }
 
   return 'home';
@@ -461,6 +493,29 @@ export async function executeNotificationNavigation(
     actions.setFriendTab('discover');
     actions.navigateTo('friends');
     return { kind, status: 'navigated', targetView: 'friends' };
+  }
+
+  // 1b. Page invites, Page inbox, and Page profile notifications
+  if (kind === 'page_invite') {
+    actions.navigateTo('pages');
+    return { kind, status: 'navigated', targetView: 'pages' };
+  }
+  if (kind === 'page_inbox') {
+    if (ids.conversationId) {
+      actions.navigateTo('conversation', { convId: ids.conversationId, pageId: item.targetPageId });
+      return { kind, status: 'navigated', targetView: 'conversation', resolvedConvId: ids.conversationId };
+    }
+    actions.navigateTo('page-inbox', { pageId: item.targetPageId });
+    return { kind, status: 'navigated', targetView: 'page-inbox' };
+  }
+  if (kind === 'page_profile') {
+    const pid = item.targetPageId || (isUuid(item.entityId) ? item.entityId : undefined);
+    if (pid) {
+      actions.navigateTo('page-profile', { pageId: pid });
+      return { kind, status: 'navigated', targetView: 'page-profile' };
+    }
+    actions.navigateTo('pages');
+    return { kind, status: 'navigated', targetView: 'pages' };
   }
 
   // 2. Friendship notifications

@@ -160,9 +160,29 @@ test('calculateUnreadCount counts only unread active notifications and excludes 
       isRead: false,
       isArchived: true, // Archived (>= 7 days old)
     },
+    {
+      id: 'n5',
+      type: 'page_follow',
+      actor: { id: 'u4', name: 'Chidi', avatar: '' },
+      content: 'started following your Page.',
+      timestamp: '5m ago',
+      isRead: false,
+      isArchived: false,
+      recipientPageId: 'page-123', // Isolated to Page notifications, excluded from personal count
+    },
+    {
+      id: 'n6',
+      type: 'page_message',
+      actor: { id: 'p1', name: 'Campus News', avatar: '' },
+      content: 'replied to your message.',
+      timestamp: '2m ago',
+      isRead: false,
+      isArchived: false,
+      targetPageId: 'page-123', // Reply from a Page to personal student without recipientPageId IS personal
+    },
   ];
-  // n1 (unread active) and n3 (unread active) = 2. n4 is archived so not counted!
-  assert.equal(calculateUnreadCount(notifications), 2);
+  // n1 (unread active), n3 (unread active), and n6 (personal notification from a Page) = 3.
+  assert.equal(calculateUnreadCount(notifications), 3);
 });
 
 test('validatePostSubmission validates non-empty and length restrictions', () => {
@@ -690,6 +710,317 @@ test('Notification Scenarios 10-11: Ordinary message and friend request notifica
   assert.equal(hFriend.friendTabs[0], 'requests');
   assert.equal(hFriend.navigations[0].view, 'friends');
 });
+
+test('validatePagePostAttachments enforces up to 5 images OR 1 video without mixing', async () => {
+  const { validatePagePostAttachments } = await import('./logic.ts');
+
+  assert.equal(validatePagePostAttachments([]).valid, true);
+  assert.equal(
+    validatePagePostAttachments([
+      { isVideo: false },
+      { isVideo: false },
+      { isVideo: false },
+      { isVideo: false },
+      { isVideo: false },
+    ]).valid,
+    true
+  );
+  assert.equal(validatePagePostAttachments([{ isVideo: true }]).valid, true);
+
+  assert.equal(
+    validatePagePostAttachments([
+      { isVideo: false },
+      { isVideo: false },
+      { isVideo: false },
+      { isVideo: false },
+      { isVideo: false },
+      { isVideo: false },
+    ]).valid,
+    false
+  );
+  assert.equal(validatePagePostAttachments([{ isVideo: true }, { isVideo: true }]).valid, false);
+  assert.equal(validatePagePostAttachments([{ isVideo: false }, { isVideo: true }]).valid, false);
+});
+
+test('getPageNameChangeRemainingDays enforces 30-day Page name change cooldown', async () => {
+  const { getPageNameChangeRemainingDays } = await import('./logic.ts');
+  const now = Date.UTC(2026, 10, 24, 0, 0, 0);
+
+  assert.equal(getPageNameChangeRemainingDays(null, now), 0);
+  assert.equal(getPageNameChangeRemainingDays(undefined, now), 0);
+
+  const twoDaysAgo = new Date(now - 2 * 24 * 60 * 60 * 1000).toISOString();
+  assert.equal(getPageNameChangeRemainingDays(twoDaysAgo, now), 28);
+
+  const thirtyOneDaysAgo = new Date(now - 31 * 24 * 60 * 60 * 1000).toISOString();
+  assert.equal(getPageNameChangeRemainingDays(thirtyOneDaysAgo, now), 0);
+});
+
+test('Page category mapping round-trips canonical DB identifiers and display labels safely', async () => {
+  const {
+    PAGE_CATEGORY_OPTIONS,
+    toCanonicalPageCategory,
+    formatPageCategoryLabel,
+    getPageCategoryFilterValues,
+  } = await import('../types/pages.ts');
+
+  assert.equal(toCanonicalPageCategory('Entertainment / Meme / Gist'), 'entertainment_meme_gist');
+  assert.equal(formatPageCategoryLabel('entertainment_meme_gist'), 'Entertainment / Meme / Gist');
+
+  for (const opt of PAGE_CATEGORY_OPTIONS) {
+    assert.equal(toCanonicalPageCategory(opt.label), opt.id);
+    assert.equal(toCanonicalPageCategory(opt.id), opt.id);
+    assert.equal(formatPageCategoryLabel(opt.id), opt.label);
+  }
+
+  // Legacy category compatibility
+  assert.equal(toCanonicalPageCategory('business'), 'business_vendor');
+  assert.equal(toCanonicalPageCategory('organization'), 'school_department');
+  assert.equal(toCanonicalPageCategory('creator'), 'entertainment_meme_gist');
+  assert.equal(toCanonicalPageCategory('Unmapped Custom Category'), 'other');
+
+  const filterVals = getPageCategoryFilterValues('Entertainment / Meme / Gist');
+  assert.ok(filterVals.includes('entertainment_meme_gist'));
+  assert.ok(filterVals.includes('Entertainment / Meme / Gist'));
+});
+
+test('resolvePageAvatarUrl resolves Cloudinary assets strictly from Page columns and rejects local/owner fallbacks', async () => {
+  const { resolvePageAvatarUrl, resolveCloudinaryAssetUrl } = await import('../lib/pageUtils.ts');
+
+  assert.equal(
+    resolvePageAvatarUrl({ avatar_url: 'https://res.cloudinary.com/hwxyrhlm/image/upload/v1/mr_anon.jpg' }),
+    'https://res.cloudinary.com/hwxyrhlm/image/upload/v1/mr_anon.jpg'
+  );
+  assert.equal(
+    resolvePageAvatarUrl({ avatar_path: 'absu/pages/memes_lord_avatar' }),
+    'https://res.cloudinary.com/hwxyrhlm/image/upload/f_auto,q_auto/absu/pages/memes_lord_avatar'
+  );
+  assert.equal(
+    resolvePageAvatarUrl({ avatar_asset_id: 'absu/pages/logo_v2' }),
+    'https://res.cloudinary.com/hwxyrhlm/image/upload/f_auto,q_auto/absu/pages/logo_v2'
+  );
+  // Rejects synthetic local icon path so initials fallback renders instead
+  assert.equal(resolvePageAvatarUrl({ avatar_url: '/pwa-192x192.png' }), null);
+  assert.equal(resolveCloudinaryAssetUrl(''), null);
+  assert.equal(resolvePageAvatarUrl({ avatar_url: null, avatar_path: null, avatar_asset_id: null }), null);
+});
+
+test('dedupePages and filterDiscoverPagesExcludingManaged prevent duplicate Mr Anonymous and separate My Pages vs Discover', async () => {
+  const { dedupePages, filterDiscoverPagesExcludingManaged } = await import('../lib/pageUtils.ts');
+  const makePage = (overrides: Record<string, any>) => ({
+    id: 'page-1',
+    slug: 'memes-lord',
+    name: 'Memes Lord',
+    is_verified: false,
+    isVerified: false,
+    status: 'active' as const,
+    isActive: true,
+    allow_messages: true,
+    allow_comments: true,
+    followers_count: 10,
+    followersCount: 10,
+    posts_count: 2,
+    postsCount: 2,
+    created_at: '2026-11-20T00:00:00Z',
+    createdAt: '2026-11-20T00:00:00Z',
+    ...overrides,
+  });
+
+  const mrAnonNoAvatar = makePage({
+    id: '0c3240e3-ae39-461d-bd7a-4963859b9bc7',
+    slug: 'mr-anonymous',
+    name: 'Mr Anonymous',
+    avatar_url: null,
+  });
+  const mrAnonWithAvatar = makePage({
+    id: '0c3240e3-ae39-461d-bd7a-4963859b9bc7',
+    slug: 'mr-anonymous',
+    name: 'Mr Anonymous',
+    avatar_url: 'https://res.cloudinary.com/hwxyrhlm/image/upload/v1/mr_anon.jpg',
+    is_verified: true,
+    isVerified: true,
+  });
+  const memesLord = makePage({
+    id: 'page-memes-lord',
+    slug: 'memes-lord',
+    name: 'Memes Lord',
+  });
+  const deletedPage = makePage({
+    id: 'page-deleted',
+    slug: 'old-page',
+    name: 'Old Page',
+    deleted_at: '2026-11-22T00:00:00Z',
+  });
+  const blockedPage = makePage({
+    id: 'page-blocked',
+    slug: 'blocked-page',
+    name: 'Blocked Page',
+  });
+
+  const deduped = dedupePages([mrAnonNoAvatar, mrAnonWithAvatar, memesLord]);
+  assert.equal(deduped.length, 2);
+  assert.equal(deduped[0].avatar_url, 'https://res.cloudinary.com/hwxyrhlm/image/upload/v1/mr_anon.jpg');
+
+  const discoverOnly = filterDiscoverPagesExcludingManaged(
+    [mrAnonWithAvatar, memesLord, deletedPage, blockedPage],
+    [{ page: memesLord, role: 'owner' }],
+    new Set(['page-blocked'])
+  );
+  assert.equal(discoverOnly.length, 1);
+  assert.equal(discoverOnly[0].slug, 'mr-anonymous');
+});
+
+test('computeAdminPagesStats counts active/verified/disabled accurately without double counting or counting legacy applications', async () => {
+  const { computeAdminPagesStats } = await import('../lib/pageUtils.ts');
+
+  const stats = computeAdminPagesStats(
+    [
+      { id: 'p1', status: 'active', is_active: true, is_verified: false, deleted_at: null },
+      { id: 'p2', status: 'active', is_active: true, is_verified: false, deleted_at: null },
+      // Duplicate row ID must not inflate count
+      { id: 'p2', status: 'active', is_active: true, is_verified: false, deleted_at: null },
+      // Soft-deleted row excluded from totalPages / activePages / disabledPages
+      { id: 'p3', status: 'active', is_active: true, is_verified: true, deleted_at: '2026-11-21T00:00:00Z' },
+    ],
+    1
+  );
+
+  assert.equal(stats.totalPages, 2);
+  assert.equal(stats.activePages, 2);
+  assert.equal(stats.verifiedPages, 0);
+  assert.equal(stats.disabledPages, 0);
+  assert.equal(stats.deletedPages, 1);
+  assert.equal(stats.openReports, 1);
+});
+
+test('buildPermittedPageUpdatePayload validates category, protects restricted fields, and preserves untouched images', async () => {
+  const { buildPermittedPageUpdatePayload } = await import('../lib/pageUtils.ts');
+
+  const res = buildPermittedPageUpdatePayload({
+    name: 'Memes Lord',
+    existingName: 'Memes Lord',
+    category: 'Entertainment / Meme / Gist',
+    description: 'Campus humor and trending gist',
+    avatar_url: undefined,
+    cover_url: null,
+    allow_messages: true,
+    allow_comments: true,
+  });
+
+  assert.ok(res.payload);
+  assert.equal(res.payload?.category, 'entertainment_meme_gist');
+  assert.equal('avatar_url' in (res.payload || {}), false);
+  assert.equal('cover_url' in (res.payload || {}), false);
+  assert.equal('deletion_requested_at' in (res.payload || {}), false);
+  assert.equal('deleted_at' in (res.payload || {}), false);
+  assert.equal('is_verified' in (res.payload || {}), false);
+  assert.equal('created_by' in (res.payload || {}), false);
+  assert.equal('name_changed_at' in (res.payload || {}), false);
+
+  // Cooldown enforcement on name edit
+  const cooldownBlocked = buildPermittedPageUpdatePayload({
+    name: 'Memes Lord Renamed',
+    existingName: 'Memes Lord',
+    nameChangedAt: new Date(Date.now() - 3 * 24 * 60 * 60 * 1000).toISOString(),
+  });
+  assert.match(cooldownBlocked.error || '', /30 days/);
+
+  // Explicit photo removal flags clear avatar_url / cover_url cleanly
+  const clearMediaRes = buildPermittedPageUpdatePayload({
+    removeAvatar: true,
+    removeCover: true,
+  });
+  assert.equal(clearMediaRes.payload?.avatar_url, null);
+  assert.equal(clearMediaRes.payload?.cover_url, null);
+});
+
+test('filterPublicDirectoryPages keeps active non-deleted non-blocked managed & public Pages without duplicates', async () => {
+  const { filterPublicDirectoryPages } = await import('../lib/pageUtils.ts');
+  const mkPage = (overrides: Record<string, any>) => ({
+    id: 'page-1',
+    slug: 'campus-news',
+    name: 'Campus News',
+    is_verified: true,
+    isVerified: true,
+    status: 'active' as const,
+    isActive: true,
+    allow_messages: true,
+    allow_comments: true,
+    followers_count: 50,
+    followersCount: 50,
+    posts_count: 10,
+    postsCount: 10,
+    created_at: '2026-11-20T00:00:00Z',
+    createdAt: '2026-11-20T00:00:00Z',
+    ...overrides,
+  });
+
+  const activeManaged = mkPage({ id: 'p-1', slug: 'memes-lord', managerRole: 'owner' });
+  const duplicateManaged = mkPage({ id: 'p-1', slug: 'memes-lord', managerRole: 'owner' });
+  const disabledPage = mkPage({ id: 'p-2', slug: 'disabled-page', status: 'disabled', isActive: false });
+  const deletedPage = mkPage({ id: 'p-3', slug: 'deleted-page', deleted_at: '2026-11-22T00:00:00Z' });
+  const blockedPage = mkPage({ id: 'p-4', slug: 'blocked-page', isBlocked: true });
+  const publicPage = mkPage({ id: 'p-5', slug: 'fellowship' });
+
+  const list = filterPublicDirectoryPages([
+    activeManaged,
+    duplicateManaged,
+    disabledPage,
+    deletedPage,
+    blockedPage,
+    publicPage,
+  ]);
+
+  assert.equal(list.length, 2);
+  assert.deepEqual(
+    list.map((p) => p.id),
+    ['p-1', 'p-5']
+  );
+});
+
+test('resolveIdentitySwitchRoute normalizes incompatible Personal vs Page routes deterministically', async () => {
+  const { resolveIdentitySwitchRoute } = await import('../lib/pageUtils.ts');
+  const pageIdentity = {
+    type: 'page' as const,
+    pageId: 'page-1',
+    role: 'owner' as const,
+    page: { id: 'page-1', slug: 'memes', name: 'Memes' } as any,
+  };
+  const personalIdentity = { type: 'personal' as const };
+
+  assert.equal(resolveIdentitySwitchRoute('friends', pageIdentity), 'home');
+  assert.equal(resolveIdentitySwitchRoute('messages', pageIdentity), 'home');
+  assert.equal(resolveIdentitySwitchRoute('home', pageIdentity), 'home');
+  assert.equal(resolveIdentitySwitchRoute('reels', pageIdentity), 'reels');
+  assert.equal(resolveIdentitySwitchRoute('page-inbox', personalIdentity), 'home');
+  assert.equal(resolveIdentitySwitchRoute('page-settings', personalIdentity), 'home');
+  assert.equal(resolveIdentitySwitchRoute('page-profile', personalIdentity), 'page-profile');
+  assert.equal(resolveIdentitySwitchRoute('friends', pageIdentity, 'page-profile'), 'page-profile');
+});
+
+test('resolvePageNotificationRoute routes Page alerts to Page views inside Page Mode', async () => {
+  const { resolvePageNotificationRoute } = await import('../lib/pageUtils.ts');
+
+  const msgRoute = resolvePageNotificationRoute(
+    { type: 'page_message', entityType: 'conversation', conversationId: 'conv-1', recipientPageId: 'p1' },
+    'p1'
+  );
+  assert.equal(msgRoute.view, 'page-inbox');
+  assert.equal(msgRoute.conversationId, 'conv-1');
+
+  const folRoute = resolvePageNotificationRoute(
+    { type: 'page_follow', entityType: 'page_follow', recipientPageId: 'p1' },
+    'p1'
+  );
+  assert.equal(folRoute.view, 'page-followers');
+
+  const statusRoute = resolvePageNotificationRoute(
+    { type: 'page_verified', entityType: 'page', recipientPageId: 'p1' },
+    'p1'
+  );
+  assert.equal(statusRoute.view, 'page-settings');
+});
+
 
 
 

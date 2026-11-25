@@ -8,6 +8,7 @@ import {
 } from '../../lib/reelsService.ts';
 import { buildCloudinaryVideoPosterUrl } from '../../lib/cloudinaryService.ts';
 import { Avatar } from '../common/Avatar.tsx';
+import { VerifiedBadge } from '../common/VerifiedBadge.tsx';
 import { ReelsIcon } from '../common/ReelsIcon.tsx';
 import { ArrowLeft, Heart, Play, Search, X } from 'lucide-react';
 
@@ -218,6 +219,7 @@ export const ReelsSearchModal: React.FC<ReelsSearchModalProps> = ({
                         <span className="text-[11px] font-bold text-white/90 truncate">
                           {reel.author.name}
                         </span>
+                        {(reel.pageIsVerified || reel.author.isVerified) && <VerifiedBadge size={12} />}
                       </div>
                       <span className="flex items-center gap-0.5 text-[10px] font-bold text-white/85 shrink-0">
                         <Heart className="w-3 h-3" />

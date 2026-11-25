@@ -2,10 +2,11 @@ import React, { useState, useEffect } from 'react';
 import { useApp } from '../../context/AppContext.tsx';
 import { useAuth } from '../../context/AuthContext.tsx';
 import { Avatar } from '../common/Avatar.tsx';
+import { VerifiedBadge } from '../common/VerifiedBadge.tsx';
 import { fetchMrAnonymousPage, toggleFollowPage, MR_ANONYMOUS_PAGE_ID } from '../../lib/pageService.ts';
 import { EXCLUDED_STUDENT_IDS } from '../../lib/profileService.ts';
 import type { Page } from '../../types/pages.ts';
-import { UserPlus, Check, ChevronRight, ShieldCheck, Plus } from 'lucide-react';
+import { UserPlus, Check, ChevronRight, Plus } from 'lucide-react';
 
 export const DiscoverPeopleRow: React.FC = () => {
   const { discoverUsers, sendFriendRequest, navigateTo, addToast } = useApp();
@@ -92,14 +93,14 @@ export const DiscoverPeopleRow: React.FC = () => {
             </div>
 
             <button
-              onClick={() => navigateTo('mr-anonymous')}
+              onClick={() => navigateTo('page-profile', { pageId: anonPage.id || MR_ANONYMOUS_PAGE_ID })}
               className="w-full flex flex-col items-center focus:outline-none group mt-1"
             >
-              <div className="w-16 h-16 rounded-2xl overflow-hidden mb-2 ring-2 ring-violet-500 shadow-md group-hover:scale-105 transition-transform bg-slate-900">
-                <img
-                  src={anonPage.avatarUrl || '/pwa-192x192.png'}
-                  alt="Mr Anonymous"
-                  className="w-full h-full object-cover"
+              <div className="mb-2 rounded-full ring-2 ring-violet-500 shadow-md group-hover:scale-105 transition-transform">
+                <Avatar
+                  src={anonPage.avatarUrl}
+                  name={anonPage.name}
+                  size="lg"
                 />
               </div>
 
@@ -107,7 +108,7 @@ export const DiscoverPeopleRow: React.FC = () => {
                 <p className="font-extrabold text-xs text-[var(--color-text-primary)] group-hover:text-[var(--color-primary)] transition-colors truncate">
                   {anonPage.name}
                 </p>
-                <ShieldCheck className="w-3.5 h-3.5 text-violet-500 shrink-0" />
+                {anonPage.isVerified && <VerifiedBadge size={14} />}
               </div>
 
               <p className="text-[11px] text-violet-600 dark:text-violet-400 font-semibold truncate w-full mt-0.5">

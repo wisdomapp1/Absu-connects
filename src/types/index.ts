@@ -25,7 +25,10 @@ export interface Comment {
     avatar: string;
     department: string;
     level: string;
+    isVerified?: boolean;
   };
+  authorAsPage?: boolean;
+  authorPageId?: string;
   content: string;
   createdAt: string;
   updatedAt?: string;
@@ -93,6 +96,7 @@ export interface Post {
   categoryHashtag?: '#Event' | '#CampusUpdates' | '#GeneralPost';
   audience: PostAudience;
   createdAt: string;
+  pinnedAt?: string | null;
   likesCount: number;
   isLiked: boolean;
   isSaved: boolean;
@@ -100,7 +104,15 @@ export interface Post {
   commentsCount?: number;
   isPinned?: boolean;
   pageId?: string;
+  authorPageId?: string;
+  authorAsPage?: boolean;
   isPagePost?: boolean;
+  pageIsVerified?: boolean;
+  pageSlug?: string;
+  pageCategory?: string;
+  pageStatus?: 'active' | 'disabled' | 'deleted';
+  allowComments?: boolean;
+  allowMessages?: boolean;
   communityId?: string;
   communityName?: string;
   communitySlug?: string;
@@ -137,6 +149,10 @@ export interface MessageAttachment {
 export interface Message {
   id: string;
   senderId: string;
+  senderAsPage?: boolean;
+  senderPageId?: string | null;
+  senderName?: string;
+  senderAvatar?: string;
   text: string;
   timestamp: string;
   isOutgoing: boolean;
@@ -153,6 +169,13 @@ export interface Conversation {
   lastMessageTime: string;
   unreadCount: number;
   messages: Message[];
+  isPageChat?: boolean;
+  pageId?: string;
+  pageName?: string;
+  pageAvatar?: string;
+  pageIsVerified?: boolean;
+  pageSlug?: string;
+  allowMessages?: boolean;
 }
 
 export type NotificationType =
@@ -176,7 +199,16 @@ export type NotificationType =
   | 'event_update'
   | 'welcome_discovery'
   | 'discovery_suggestion'
-  | 'discovery_reminder';
+  | 'discovery_reminder'
+  | 'page_follow'
+  | 'page_post'
+  | 'page_like'
+  | 'page_comment'
+  | 'page_admin_invite'
+  | 'page_follow_invite'
+  | 'page_message'
+  | 'page_verified'
+  | 'page_status';
 
 export interface NotificationItem {
   id: string;
@@ -200,6 +232,9 @@ export interface NotificationItem {
   targetCommentId?: string;
   targetParentCommentId?: string;
   targetStoryId?: string;
+  targetPageId?: string;
+  recipientPageId?: string;
+  targetInvitationId?: string;
   targetIsVideo?: boolean;
   conversationId?: string;
 }
@@ -228,7 +263,15 @@ export type ActiveView =
   | 'help'
   | 'about'
   | 'mr-anonymous'
-  | 'post-detail';
+  | 'post-detail'
+  | 'pages'
+  | 'page-profile'
+  | 'page-workspace'
+  | 'create-page'
+  | 'page-inbox'
+  | 'page-notifications'
+  | 'page-followers'
+  | 'page-settings';
 
 export interface ToastMessage {
   id: string;

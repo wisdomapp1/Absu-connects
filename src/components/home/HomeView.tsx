@@ -17,6 +17,7 @@ import { Loader2, Sparkles } from 'lucide-react';
 export const HomeView: React.FC = () => {
   const {
     currentUser,
+    activeIdentity,
     posts,
     loadingPosts,
     loadingMorePosts,
@@ -159,29 +160,33 @@ export const HomeView: React.FC = () => {
           <span>Refreshing feed...</span>
         </div>
       )}
-      {/* 0. Campus Stories Bar */}
-      <StoriesBar
-        currentUserId={currentUser.id || undefined}
-        currentUserProfile={{
-          name: currentUser.name,
-          avatar_url: currentUser.avatar,
-        }}
-        storyGroups={storyGroups}
-        loading={loadingStories}
-        onSelectGroup={(idx) => {
-          openStoryGroups(storyGroups, idx);
-        }}
-        onAddStory={() => setCreateStoryOpen(true)}
-      />
+      {/* 0. Campus Stories Bar (Personal Mode only) */}
+      {activeIdentity.type !== 'page' && (
+        <StoriesBar
+          currentUserId={currentUser.id || undefined}
+          currentUserProfile={{
+            name: currentUser.name,
+            avatar_url: currentUser.avatar,
+          }}
+          storyGroups={storyGroups}
+          loading={loadingStories}
+          onSelectGroup={(idx) => {
+            openStoryGroups(storyGroups, idx);
+          }}
+          onAddStory={() => setCreateStoryOpen(true)}
+        />
+      )}
 
       {/* 1. Post Composer */}
       <PostComposer onOpenAnonymous={() => setAnonIntroOpen(true)} />
 
-      {/* 1b. Post Anonymously Card (Directly below composer) */}
-      <AnonymousPostFeedCard onOpenIntro={() => setAnonIntroOpen(true)} />
-
-      {/* 2. Discover People Carousel */}
-      <DiscoverPeopleRow />
+      {/* 1b. Post Anonymously & Discover People (Personal Mode only) */}
+      {activeIdentity.type !== 'page' && (
+        <>
+          <AnonymousPostFeedCard onOpenIntro={() => setAnonIntroOpen(true)} />
+          <DiscoverPeopleRow />
+        </>
+      )}
 
       {/* 3. Feed Filters */}
       <div className="py-1">

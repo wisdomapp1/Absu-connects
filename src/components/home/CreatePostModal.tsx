@@ -2,7 +2,11 @@ import React, { useState, useRef, useEffect } from 'react';
 import { useApp } from '../../context/AppContext.tsx';
 import type { PostCategory, PostAudience, AttachedMediaItem } from '../../types/index.ts';
 import { Avatar } from '../common/Avatar.tsx';
-import { validatePostSubmission } from '../../utils/logic.ts';
+import { VerifiedBadge } from '../common/VerifiedBadge.tsx';
+import {
+  validatePostSubmission,
+  validatePagePostAttachments,
+} from '../../utils/logic.ts';
 import {
   safeReadAndPrepareImage,
   safeReadAndPrepareVideo,
@@ -85,6 +89,7 @@ export const PICTURE_CATEGORY_OPTIONS: Array<{
 export const CreatePostModal: React.FC = () => {
   const {
     currentUser,
+    activeIdentity,
     createPostModalOpen,
     setCreatePostModalOpen,
     createPost,
@@ -97,7 +102,7 @@ export const CreatePostModal: React.FC = () => {
   const [category, setCategory] = useState<PostCategory>('General');
   const [audience, setAudience] = useState<PostAudience>('Public');
 
-  // Mixed photo + video attachments (max 4)
+  // Mixed photo + video attachments for personal (max 4), or up to 5 images OR 1 video for Page
   const [attachments, setAttachments] = useState<AttachedMediaItem[]>([]);
   const [editingVideoId, setEditingVideoId] = useState<string | null>(null);
 
@@ -127,14 +132,20 @@ export const CreatePostModal: React.FC = () => {
     }
   }, [createPostModalOpen, initialPostMedia, clearInitialPostMedia]);
 
-  // Auto focus textarea when opened
+  const activePageIdentity = activeIdentity.type === 'page' ? activeIdentity.page : null;
+  const isPostingAsPage = Boolean(activePageIdentity);
+  const maxAllowedAttachments = isPostingAsPage ? 5 : MAX_POST_ATTACHMENTS;
+
   useEffect(() => {
     if (createPostModalOpen) {
+      if (activeIdentity.type === 'page') {
+        setAudience('Public');
+      }
       setTimeout(() => {
         textareaRef.current?.focus();
       }, 100);
     }
-  }, [createPostModalOpen]);
+  }, [createPostModalOpen, activeIdentity.type, activeIdentity.type === 'page' ? activeIdentity.pageId : '']);
 
   if (!createPostModalOpen) return null;
 
@@ -186,9 +197,18 @@ export const CreatePostModal: React.FC = () => {
   const processSelectedFiles = async (files: File[]) => {
     if (files.length === 0) return;
 
-    const remainingSlots = MAX_POST_ATTACHMENTS - attachments.length;
+    const currentLimit = isPostingAsPage
+      ? attachments.some((a) => a.type === 'video')
+        ? 1
+        : 5
+      : MAX_POST_ATTACHMENTS;
+    const remainingSlots = currentLimit - attachments.length;
     if (remainingSlots <= 0) {
-      const limitMsg = `Maximum ${MAX_POST_ATTACHMENTS} attachments allowed per post.`;
+      const limitMsg = isPostingAsPage
+        ? attachments.some((a) => a.type === 'video')
+          ? 'Page posts support only 1 video per post.'
+          : 'Page posts support up to 5 photos per post.'
+        : `Maximum ${MAX_POST_ATTACHMENTS} attachments allowed per post.`;
       setMediaRecovery(categorizeMediaError(new Error(limitMsg)));
       addToast(limitMsg, 'warning');
       return;
@@ -197,7 +217,7 @@ export const CreatePostModal: React.FC = () => {
     const filesToProcess = files.slice(0, remainingSlots);
     if (files.length > remainingSlots) {
       addToast(
-        `Only ${remainingSlots} more attachment${remainingSlots > 1 ? 's' : ''} added (max ${MAX_POST_ATTACHMENTS} per post).`,
+        `Only ${remainingSlots} more attachment${remainingSlots > 1 ? 's' : ''} added (max ${currentLimit} per post).`,
         'info'
       );
     }
@@ -209,6 +229,21 @@ export const CreatePostModal: React.FC = () => {
       const isVideo =
         file.type.startsWith('video/') ||
         Boolean(file.name.match(/\.(mp4|webm|mov|m4v|ogg)$/i));
+
+      if (isPostingAsPage) {
+        const candidateCheck = validatePagePostAttachments([
+          ...attachments.map((a) => ({ isVideo: a.type === 'video' })),
+          ...newItems.map((a) => ({ isVideo: a.type === 'video' })),
+          { isVideo },
+        ]);
+        if (!candidateCheck.valid) {
+          rejectedRecovery = categorizeMediaError(
+            new Error(candidateCheck.error || 'Unsupported attachment combination for Page post.'),
+            { fileName: file.name }
+          );
+          continue;
+        }
+      }
 
       if (isVideo) {
         const prepared = await safeReadAndPrepareVideo(file, {
@@ -259,7 +294,7 @@ export const CreatePostModal: React.FC = () => {
     }
 
     if (newItems.length > 0) {
-      setAttachments((prev) => [...prev, ...newItems].slice(0, MAX_POST_ATTACHMENTS));
+      setAttachments((prev) => [...prev, ...newItems].slice(0, maxAllowedAttachments));
       setShowMediaTray(false);
     }
 
@@ -285,8 +320,13 @@ export const CreatePostModal: React.FC = () => {
       return;
     }
 
-    if (attachments.length >= MAX_POST_ATTACHMENTS) {
-      addToast(`Maximum ${MAX_POST_ATTACHMENTS} attachments allowed per post.`, 'warning');
+    if (isPostingAsPage && attachments.some((a) => a.type === 'video')) {
+      addToast('Page posts cannot mix photos and video in the same post.', 'warning');
+      return;
+    }
+
+    if (attachments.length >= maxAllowedAttachments) {
+      addToast(`Maximum ${maxAllowedAttachments} attachments allowed per post.`, 'warning');
       return;
     }
 
@@ -363,6 +403,18 @@ export const CreatePostModal: React.FC = () => {
       return;
     }
 
+    if (isPostingAsPage) {
+      const pageAttachmentCheck = validatePagePostAttachments(
+        attachments.map((a) => ({ isVideo: a.type === 'video' }))
+      );
+      if (!pageAttachmentCheck.valid) {
+        setMediaRecovery(
+          categorizeMediaError(new Error(pageAttachmentCheck.error || 'Invalid Page post media.'))
+        );
+        return;
+      }
+    }
+
     const abortController = new AbortController();
     uploadAbortRef.current = abortController;
 
@@ -390,7 +442,7 @@ export const CreatePostModal: React.FC = () => {
       const success = await createPost(
         finalContent,
         mappedCategory,
-        audience,
+        isPostingAsPage ? 'Public' : audience,
         attachments.length > 0 ? attachments : undefined,
         {
           signal: abortController.signal,
@@ -513,9 +565,11 @@ export const CreatePostModal: React.FC = () => {
               >
                 <X className="w-5 h-5" />
               </button>
-              <h2 className="text-sm sm:text-base font-bold text-[var(--color-text-primary)]">
-                Create Campus Post
-              </h2>
+              <div className="min-w-0">
+                <h2 className="text-sm sm:text-base font-bold text-[var(--color-text-primary)] truncate">
+                  {activePageIdentity ? `Create Post · ${activePageIdentity.name}` : 'Create Campus Post'}
+                </h2>
+              </div>
             </div>
 
             <div className="flex items-center gap-2">
@@ -594,60 +648,80 @@ export const CreatePostModal: React.FC = () => {
 
           {/* Scrollable Content Body */}
           <div className="flex-1 overflow-y-auto p-4 sm:p-6 flex flex-col gap-4">
-            {/* Author details & audience selector */}
+            {/* Author details & audience selector (strictly bound to activeIdentity) */}
             <div className="flex items-center justify-between gap-3">
-              <div className="flex items-center gap-3">
-                <Avatar src={currentUser.avatar} name={currentUser.name} size="md" />
-                <div>
-                  <h3 className="text-xs sm:text-sm font-bold text-[var(--color-text-primary)]">
-                    {currentUser.name}
-                  </h3>
-                  <p className="text-[11px] text-[var(--color-text-secondary)]">
-                    {currentUser.level} · {currentUser.department}
+              <div className="flex items-center gap-3 min-w-0">
+                <Avatar
+                  src={activePageIdentity ? activePageIdentity.avatarUrl : currentUser.avatar}
+                  name={activePageIdentity ? activePageIdentity.name : currentUser.name}
+                  size="md"
+                />
+                <div className="min-w-0">
+                  <div className="flex items-center gap-1.5">
+                    <h3 className="text-xs sm:text-sm font-bold text-[var(--color-text-primary)] truncate">
+                      {activePageIdentity ? activePageIdentity.name : currentUser.name}
+                    </h3>
+                    {activePageIdentity?.isVerified && <VerifiedBadge size={14} />}
+                  </div>
+                  <p className="text-[11px] text-[var(--color-text-secondary)] truncate">
+                    {activePageIdentity
+                      ? `Posting as Page · ${activePageIdentity.category} · ${
+                          activePageIdentity.default_post_visibility === 'followers'
+                            ? 'Followers'
+                            : 'Public'
+                        }`
+                      : `${currentUser.level} · ${currentUser.department}`}
                   </p>
                 </div>
               </div>
 
-              <div className="flex items-center gap-1.5 bg-[var(--color-bg-main)] p-1 rounded-xl border border-[var(--color-border)]">
-                <button
-                  type="button"
-                  onClick={() => setAudience('Public')}
-                  className={`px-2.5 py-1 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition-colors ${
-                    audience === 'Public'
-                      ? 'bg-[var(--color-bg-card)] text-[var(--color-primary)] shadow-xs'
-                      : 'text-[var(--color-text-secondary)] hover:text-[var(--color-text-primary)]'
-                  }`}
-                >
-                  <Globe className="w-3.5 h-3.5" />
-                  <span className="hidden sm:inline">Public</span>
-                </button>
+              {isPostingAsPage ? (
+                <div className="px-3 py-1.5 rounded-xl bg-[var(--color-bg-main)] border border-[var(--color-border)] text-xs font-semibold text-[var(--color-text-secondary)] flex items-center gap-1.5 shrink-0">
+                  <Globe className="w-3.5 h-3.5 text-[var(--color-primary)]" />
+                  <span>Public</span>
+                </div>
+              ) : (
+                <div className="flex items-center gap-1.5 bg-[var(--color-bg-main)] p-1 rounded-xl border border-[var(--color-border)]">
+                  <button
+                    type="button"
+                    onClick={() => setAudience('Public')}
+                    className={`px-2.5 py-1 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition-colors ${
+                      audience === 'Public'
+                        ? 'bg-[var(--color-bg-card)] text-[var(--color-primary)] shadow-xs'
+                        : 'text-[var(--color-text-secondary)] hover:text-[var(--color-text-primary)]'
+                    }`}
+                  >
+                    <Globe className="w-3.5 h-3.5" />
+                    <span className="hidden sm:inline">Public</span>
+                  </button>
 
-                <button
-                  type="button"
-                  onClick={() => setAudience('Friends Only')}
-                  className={`px-2.5 py-1 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition-colors ${
-                    audience === 'Friends Only'
-                      ? 'bg-[var(--color-bg-card)] text-[var(--color-primary)] shadow-xs'
-                      : 'text-[var(--color-text-secondary)] hover:text-[var(--color-text-primary)]'
-                  }`}
-                >
-                  <Users className="w-3.5 h-3.5" />
-                  <span className="hidden sm:inline">Friends</span>
-                </button>
+                  <button
+                    type="button"
+                    onClick={() => setAudience('Friends Only')}
+                    className={`px-2.5 py-1 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition-colors ${
+                      audience === 'Friends Only'
+                        ? 'bg-[var(--color-bg-card)] text-[var(--color-primary)] shadow-xs'
+                        : 'text-[var(--color-text-secondary)] hover:text-[var(--color-text-primary)]'
+                    }`}
+                  >
+                    <Users className="w-3.5 h-3.5" />
+                    <span className="hidden sm:inline">Friends</span>
+                  </button>
 
-                <button
-                  type="button"
-                  onClick={() => setAudience('Campus Only')}
-                  className={`px-2.5 py-1 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition-colors ${
-                    audience === 'Campus Only'
-                      ? 'bg-[var(--color-bg-card)] text-[var(--color-primary)] shadow-xs'
-                      : 'text-[var(--color-text-secondary)] hover:text-[var(--color-text-primary)]'
-                  }`}
-                >
-                  <GraduationCap className="w-3.5 h-3.5" />
-                  <span className="hidden sm:inline">Campus</span>
-                </button>
-              </div>
+                  <button
+                    type="button"
+                    onClick={() => setAudience('Campus Only')}
+                    className={`px-2.5 py-1 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition-colors ${
+                      audience === 'Campus Only'
+                        ? 'bg-[var(--color-bg-card)] text-[var(--color-primary)] shadow-xs'
+                        : 'text-[var(--color-text-secondary)] hover:text-[var(--color-text-primary)]'
+                    }`}
+                  >
+                    <GraduationCap className="w-3.5 h-3.5" />
+                    <span className="hidden sm:inline">Campus</span>
+                  </button>
+                </div>
+              )}
             </div>
 
             {/* Category Selector Tabs */}
@@ -767,9 +841,11 @@ export const CreatePostModal: React.FC = () => {
               <div className="flex flex-col gap-2.5">
                 <div className="flex items-center justify-between text-xs font-bold text-[var(--color-text-secondary)]">
                   <span>
-                    Attached Media ({attachments.length}/{MAX_POST_ATTACHMENTS})
+                    Attached Media ({attachments.length}/
+                    {isPostingAsPage && attachments.some((a) => a.type === 'video') ? 1 : maxAllowedAttachments})
                   </span>
-                  {attachments.length < MAX_POST_ATTACHMENTS && (
+                  {attachments.length <
+                    (isPostingAsPage && attachments.some((a) => a.type === 'video') ? 1 : maxAllowedAttachments) && (
                     <button
                       type="button"
                       onClick={() => mediaInputRef.current?.click()}
@@ -999,7 +1075,9 @@ export const CreatePostModal: React.FC = () => {
                     <div className="p-3 rounded-xl border border-dashed border-[var(--color-border)] text-center text-[11px] text-[var(--color-text-secondary)] flex items-center justify-center gap-2">
                       <Upload className="w-3.5 h-3.5 shrink-0" />
                       <span>
-                        Attach up to 4 photos or videos (images ≤10 MB, videos ≤60s &amp; 50 MB)
+                        {isPostingAsPage
+                          ? 'Page posts: up to 5 photos OR 1 video (≤60s & 50 MB), hosted on Cloudinary'
+                          : 'Attach up to 4 photos or videos (images ≤10 MB, videos ≤60s & 50 MB)'}
                       </span>
                     </div>
                   </div>
@@ -1047,7 +1125,11 @@ export const CreatePostModal: React.FC = () => {
               <button
                 type="button"
                 onClick={() => mediaInputRef.current?.click()}
-                disabled={isSubmitting || attachments.length >= MAX_POST_ATTACHMENTS}
+                disabled={
+                  isSubmitting ||
+                  attachments.length >=
+                    (isPostingAsPage && attachments.some((a) => a.type === 'video') ? 1 : maxAllowedAttachments)
+                }
                 className="min-h-[44px] flex items-center gap-1.5 px-2.5 sm:px-3 py-1.5 rounded-xl text-xs font-semibold text-[var(--color-text-secondary)] hover:text-[var(--color-primary)] hover:bg-[var(--color-primary-subtle)] transition-colors whitespace-nowrap shrink-0 disabled:opacity-40"
                 title="Add photos or videos from gallery"
               >
@@ -1058,7 +1140,12 @@ export const CreatePostModal: React.FC = () => {
               <button
                 type="button"
                 onClick={() => videoOnlyInputRef.current?.click()}
-                disabled={isSubmitting || attachments.length >= MAX_POST_ATTACHMENTS}
+                disabled={
+                  isSubmitting ||
+                  attachments.length >=
+                    (isPostingAsPage && attachments.some((a) => a.type === 'video') ? 1 : maxAllowedAttachments) ||
+                  (isPostingAsPage && attachments.length > 0)
+                }
                 className="min-h-[44px] flex items-center gap-1.5 px-2.5 sm:px-3 py-1.5 rounded-xl text-xs font-semibold text-[var(--color-text-secondary)] hover:text-[var(--color-primary)] hover:bg-[var(--color-primary-subtle)] transition-colors whitespace-nowrap shrink-0 disabled:opacity-40"
                 title="Add short video (max 60s)"
               >

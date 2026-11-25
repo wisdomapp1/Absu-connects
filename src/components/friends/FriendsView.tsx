@@ -3,6 +3,7 @@ import { useApp } from '../../context/AppContext.tsx';
 import { useAuth } from '../../context/AuthContext.tsx';
 import type { FriendTab, User } from '../../types/index.ts';
 import { Avatar } from '../common/Avatar.tsx';
+import { VerifiedBadge } from '../common/VerifiedBadge.tsx';
 import { fetchMrAnonymousPage, toggleFollowPage, MR_ANONYMOUS_PAGE_ID } from '../../lib/pageService.ts';
 import { EXCLUDED_STUDENT_IDS, fetchDiscoverProfilesPage } from '../../lib/profileService.ts';
 import type { Page } from '../../types/pages.ts';
@@ -17,7 +18,6 @@ import {
   UserMinus,
   Sparkles,
   ArrowLeft,
-  ShieldCheck,
   Plus,
   Loader2,
 } from 'lucide-react';
@@ -396,14 +396,14 @@ export const FriendsView: React.FC = () => {
           {anonPage && (
             <div className="p-3.5 rounded-2xl bg-gradient-to-r from-violet-900/15 via-[var(--color-bg-card)] to-[var(--color-bg-card)] border-2 border-violet-500/40 shadow-xs flex items-center justify-between gap-3">
               <div
-                onClick={() => navigateTo('mr-anonymous')}
+                onClick={() => navigateTo('page-profile', { pageId: anonPage.id || MR_ANONYMOUS_PAGE_ID })}
                 className="flex items-center gap-3 min-w-0 cursor-pointer group flex-1"
               >
-                <div className="relative w-14 h-14 rounded-2xl overflow-hidden ring-2 ring-violet-500 shadow-sm shrink-0 bg-slate-900">
-                  <img
-                    src={anonPage.avatarUrl || '/pwa-192x192.png'}
-                    alt="Mr Anonymous"
-                    className="w-full h-full object-cover group-hover:scale-105 transition-transform"
+                <div className="relative shrink-0 rounded-full ring-2 ring-violet-500 shadow-sm group-hover:scale-105 transition-transform">
+                  <Avatar
+                    src={anonPage.avatarUrl}
+                    name={anonPage.name}
+                    size="lg"
                   />
                 </div>
                 <div className="min-w-0">
@@ -411,7 +411,7 @@ export const FriendsView: React.FC = () => {
                     <p className="font-extrabold text-sm sm:text-base text-[var(--color-text-primary)] group-hover:text-[var(--color-primary)] transition-colors truncate">
                       {anonPage.name}
                     </p>
-                    <ShieldCheck className="w-4 h-4 text-violet-500 shrink-0" />
+                    {anonPage.isVerified && <VerifiedBadge size={15} />}
                   </div>
                   <p className="text-xs text-violet-600 dark:text-violet-400 font-bold truncate">
                     Official Page · @{anonPage.slug}

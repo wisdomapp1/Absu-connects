@@ -16,7 +16,16 @@ export interface CloudinaryUploadResult {
   aborted?: boolean;
 }
 
-export type UploadPurpose = 'post' | 'story' | 'chat' | 'profile' | 'marketplace';
+export type UploadPurpose =
+  | 'post'
+  | 'story'
+  | 'chat'
+  | 'profile'
+  | 'marketplace'
+  | 'page'
+  | 'page-profile'
+  | 'page-cover'
+  | 'page-post';
 
 export interface CloudinaryUploadOptions {
   onProgress?: (message: string) => void;
@@ -25,6 +34,7 @@ export interface CloudinaryUploadOptions {
   customFormat?: string;
   maxBytes?: number;
   folderOverride?: string;
+  pageId?: string;
 }
 
 const DEFAULT_CLOUD_NAME = 'hwxyrhlm';
@@ -57,11 +67,10 @@ export function isCloudinaryConfigured(): boolean {
 
 /**
  * Returns the exact subfolder within `absu-connect/` using Cloudinary's `folder` upload parameter.
- * Note: `folder` is used instead of `asset_folder` because `absu_connect_unsigned`
- * respects `folder` for organising into posts/, stories/, messages/.
  */
-export function getCloudinaryFolder(purpose: UploadPurpose): string {
+export function getCloudinaryFolder(purpose: UploadPurpose, pageId?: string): string {
   const { rootFolder } = getCloudinaryConfig();
+  const safePageId = pageId ? pageId.replace(/[^a-zA-Z0-9_-]/g, '') : '';
   switch (purpose) {
     case 'post':
       return `${rootFolder}/posts`;
@@ -73,6 +82,14 @@ export function getCloudinaryFolder(purpose: UploadPurpose): string {
       return `${rootFolder}/profiles`;
     case 'marketplace':
       return `${rootFolder}/marketplace`;
+    case 'page-profile':
+      return safePageId ? `${rootFolder}/pages/${safePageId}/avatar` : `${rootFolder}/pages/avatars`;
+    case 'page-cover':
+      return safePageId ? `${rootFolder}/pages/${safePageId}/cover` : `${rootFolder}/pages/covers`;
+    case 'page-post':
+      return safePageId ? `${rootFolder}/pages/${safePageId}/posts` : `${rootFolder}/pages/posts`;
+    case 'page':
+      return safePageId ? `${rootFolder}/pages/${safePageId}` : `${rootFolder}/pages`;
     default:
       return `${rootFolder}/posts`;
   }
@@ -85,7 +102,7 @@ export async function diagnoseCloudinary(): Promise<{
   ok: boolean;
   cloudName?: string;
   uploadPreset?: string;
-  folders?: { posts: string; stories: string; messages: string };
+  folders?: { posts: string; stories: string; messages: string; pages: string };
   error?: string;
 }> {
   const cfg = getCloudinaryConfig();
@@ -100,6 +117,7 @@ export async function diagnoseCloudinary(): Promise<{
       posts: getCloudinaryFolder('post'),
       stories: getCloudinaryFolder('story'),
       messages: getCloudinaryFolder('chat'),
+      pages: getCloudinaryFolder('page'),
     },
   };
 }
@@ -175,7 +193,7 @@ export async function uploadMediaToCloudinary(
     }
   }
 
-  const targetFolder = opts.folderOverride || getCloudinaryFolder(purpose);
+  const targetFolder = opts.folderOverride || getCloudinaryFolder(purpose, opts.pageId);
   const mediaLabel = isAudio ? 'voice note' : resourceType;
 
   opts.onProgress?.(`Uploading ${mediaLabel} to Cloudinary...`);
@@ -369,6 +387,7 @@ export function buildCloudinaryVideoDeliveryUrl(
     trimEnd?: number | null;
     isMuted?: boolean | null;
     aspectRatio?: string | null;
+    max720p?: boolean;
   }
 ): string {
   if (!secureUrl || !secureUrl.includes('/video/upload/')) {
@@ -396,6 +415,9 @@ export function buildCloudinaryVideoDeliveryUrl(
       transforms.push(`c_fill,ar_${opts.aspectRatio}`);
     }
   }
+  if (opts?.max720p) {
+    transforms.push('c_limit,w_1280,h_720');
+  }
 
   transforms.push('f_auto,q_auto');
 
@@ -411,6 +433,38 @@ export function buildCloudinaryVideoDeliveryUrl(
   if (!/^v\d+$/.test(firstSegment) && firstSegment.includes(',')) {
     return secureUrl;
   }
+
+  return `${prefix}${transforms.join(',')}/${rest}`;
+}
+
+/**
+ * Injects Cloudinary image optimization transforms (`f_auto,q_auto` + optional sizing) cleanly.
+ */
+export function buildCloudinaryImageDeliveryUrl(
+  secureUrl: string,
+  opts?: { width?: number; height?: number; crop?: 'fill' | 'limit' }
+): string {
+  if (!secureUrl || !secureUrl.includes('/image/upload/')) {
+    return secureUrl;
+  }
+  const marker = '/image/upload/';
+  const idx = secureUrl.indexOf(marker);
+  if (idx === -1) return secureUrl;
+
+  const prefix = secureUrl.slice(0, idx + marker.length);
+  const rest = secureUrl.slice(idx + marker.length);
+  const firstSegment = rest.split('/')[0] || '';
+  if (!/^v\d+$/.test(firstSegment) && firstSegment.includes(',')) {
+    return secureUrl;
+  }
+
+  const transforms: string[] = [];
+  if (opts?.width && opts?.height) {
+    transforms.push(`c_${opts.crop || 'fill'},w_${opts.width},h_${opts.height}`);
+  } else if (opts?.width) {
+    transforms.push(`c_${opts.crop || 'limit'},w_${opts.width}`);
+  }
+  transforms.push('f_auto,q_auto');
 
   return `${prefix}${transforms.join(',')}/${rest}`;
 }
@@ -444,6 +498,211 @@ export function buildCloudinaryVideoPosterUrl(
       : 0;
 
   return `${prefix}so_${sec},f_jpg,q_auto/${rest}`;
+}
+
+/**
+ * Upload Page media exclusively to Cloudinary (`res.cloudinary.com`).
+ * 1. Invokes Supabase Edge Function `cloudinary-sign-upload` for a signed Page upload when available.
+ * 2. Fails closed on 401/403 authorization errors.
+ * 3. Falls back strictly to Cloudinary's unsigned upload endpoint (into `absu-connect/pages/<pageId>/...`)
+ *    only if the signing Edge Function is unavailable — NEVER uses Supabase Storage.
+ */
+export async function uploadPageMediaToCloudinary(
+  file: File | Blob,
+  purpose: 'page-profile' | 'page-cover' | 'page-post' | 'chat' = 'page-post',
+  pageId: string,
+  opts?: CloudinaryUploadOptions
+): Promise<CloudinaryUploadResult> {
+  if (!pageId) {
+    return { success: false, error: 'Page ID is required for Page media uploads.' };
+  }
+  if (opts?.signal?.aborted) {
+    return { success: false, aborted: true, error: 'Upload cancelled.' };
+  }
+
+  const mimeType = (file.type || '').toLowerCase();
+  const fileName = file instanceof File ? file.name : '';
+  const isAudio =
+    mimeType.startsWith('audio/') ||
+    Boolean(fileName.match(/\.(mp3|m4a|wav|ogg|aac)$/i)) ||
+    Boolean(fileName.match(/^(voicenote_|voice_note_).*\.webm$/i));
+  const isVideo =
+    !isAudio &&
+    (mimeType.startsWith('video/') || Boolean(fileName.match(/\.(mp4|webm|mov|m4v|ogg)$/i)));
+  const resourceType: 'image' | 'video' = isVideo || isAudio ? 'video' : 'image';
+
+  // Enforce image / video bounds cleanly
+  if (resourceType === 'image') {
+    const val = validateImageFile({ type: mimeType, size: file.size, name: fileName });
+    if (!val.valid) {
+      return { success: false, error: val.error || 'Invalid image file.' };
+    }
+  } else {
+    const maxBytes = opts?.maxBytes ?? 50 * 1024 * 1024;
+    if (file.size > maxBytes) {
+      return {
+        success: false,
+        error: `Media size (${(file.size / (1024 * 1024)).toFixed(1)} MB) exceeds ${Math.round(
+          maxBytes / (1024 * 1024)
+        )} MB limit.`,
+      };
+    }
+  }
+
+  const targetFolder =
+    purpose === 'chat'
+      ? `absu-connect/pages/${pageId.replace(/[^a-zA-Z0-9_-]/g, '')}/messages`
+      : getCloudinaryFolder(purpose, pageId);
+
+  try {
+    opts?.onProgress?.('Requesting secure Page upload signature...');
+    opts?.onPercent?.(5);
+
+    const { data: signData, error: signError } = await supabase.functions.invoke('cloudinary-sign-upload', {
+      body: {
+        purpose,
+        pageId,
+        page_id: pageId,
+        folder: targetFolder,
+        resourceType,
+        resource_type: resourceType,
+        fileName: fileName || `page_${purpose}_${Date.now()}`,
+      },
+    });
+
+    if (signError) {
+      const status = (signError as any)?.context?.status;
+      const errMsg = signError.message || '';
+      // Fail closed on explicit auth / permission errors from the Edge Function
+      if (status === 401 || status === 403 || /not authorized|unauthorized|forbidden|permission/i.test(errMsg)) {
+        return {
+          success: false,
+          error: errMsg || 'You do not have permission to upload media for this Page.',
+        };
+      }
+    } else if (signData && (signData.signature || signData.params?.signature)) {
+      const signed = signData.params && typeof signData.params === 'object' ? signData.params : signData;
+      const cloudName = String(
+        signed.cloudName || signed.cloud_name || signData.cloudName || signData.cloud_name || getCloudinaryConfig().cloudName
+      ).trim();
+      const apiKey = String(signed.apiKey || signed.api_key || signData.apiKey || signData.api_key || '').trim();
+      const signature = String(signed.signature || '').trim();
+      const timestamp = String(signed.timestamp || '').trim();
+      const folder = String(signed.folder || targetFolder).trim();
+      const publicId = signed.publicId || signed.public_id ? String(signed.publicId || signed.public_id).trim() : '';
+      const eager = signed.eager ? String(signed.eager).trim() : '';
+      const transformation = signed.transformation ? String(signed.transformation).trim() : '';
+
+      if (cloudName && apiKey && signature && timestamp) {
+        let uploadBlob: Blob = file;
+        try {
+          const buf = await file.arrayBuffer();
+          if (buf && buf.byteLength > 0) {
+            uploadBlob = new Blob([buf], { type: mimeType || undefined });
+          }
+        } catch {
+          uploadBlob = file;
+        }
+
+        const formData = new FormData();
+        formData.append('file', uploadBlob, fileName || `page_${purpose}_${Date.now()}`);
+        formData.append('api_key', apiKey);
+        formData.append('timestamp', timestamp);
+        formData.append('signature', signature);
+        if (folder) formData.append('folder', folder);
+        if (publicId) formData.append('public_id', publicId);
+        if (eager) formData.append('eager', eager);
+        if (transformation) formData.append('transformation', transformation);
+
+        const endpoint = `https://api.cloudinary.com/v1_1/${encodeURIComponent(cloudName)}/${resourceType}/upload`;
+
+        const signedRes = await new Promise<CloudinaryUploadResult>((resolve) => {
+          const xhr = new XMLHttpRequest();
+          const onAbort = () => {
+            try {
+              xhr.abort();
+            } catch {}
+          };
+          if (opts?.signal) opts.signal.addEventListener('abort', onAbort, { once: true });
+          const cleanup = () => {
+            if (opts?.signal) opts.signal.removeEventListener('abort', onAbort);
+          };
+          xhr.upload.onprogress = (evt) => {
+            if (evt.lengthComputable && evt.total > 0) {
+              const pct = Math.min(99, Math.max(8, Math.round((evt.loaded / evt.total) * 100)));
+              opts?.onPercent?.(pct);
+              opts?.onProgress?.(`Uploading Page media (${pct}%)...`);
+            }
+          };
+          xhr.onabort = () => {
+            cleanup();
+            resolve({ success: false, aborted: true, error: 'Upload cancelled.' });
+          };
+          xhr.onerror = () => {
+            cleanup();
+            resolve({ success: false, error: 'Network error uploading Page media to Cloudinary.' });
+          };
+          xhr.onload = () => {
+            cleanup();
+            if (xhr.status >= 200 && xhr.status < 300) {
+              try {
+                const cldData = JSON.parse(xhr.responseText) as Record<string, any>;
+                const rawSecureUrl = String(cldData.secure_url || cldData.url || '');
+                if (!rawSecureUrl) {
+                  resolve({ success: false, error: 'Cloudinary returned an empty URL.' });
+                  return;
+                }
+                const optimizedUrl =
+                  isVideo && rawSecureUrl.includes('/video/upload/')
+                    ? buildCloudinaryVideoDeliveryUrl(rawSecureUrl, { max720p: true })
+                    : rawSecureUrl;
+                opts?.onPercent?.(100);
+                resolve({
+                  success: true,
+                  secure_url: optimizedUrl,
+                  asset_id: (cldData.public_id || cldData.asset_id) as string | undefined,
+                  public_id: cldData.public_id as string | undefined,
+                  format: (cldData.format as string | undefined) || (isVideo ? 'mp4' : 'jpg'),
+                  bytes: (cldData.bytes as number | undefined) ?? file.size,
+                  width: cldData.width as number | undefined,
+                  height: cldData.height as number | undefined,
+                  duration: cldData.duration as number | undefined,
+                  resource_type: resourceType,
+                });
+              } catch {
+                resolve({ success: false, error: 'Unexpected response from Cloudinary.' });
+              }
+              return;
+            }
+            resolve({ success: false, error: `Cloudinary upload failed (${xhr.status}).` });
+          };
+          xhr.open('POST', endpoint, true);
+          xhr.send(formData);
+        });
+
+        if (signedRes.success || signedRes.aborted) {
+          return signedRes;
+        }
+      }
+    }
+  } catch {
+    // Ignore transport failure on sign check and fall back to unsigned Cloudinary preset below
+  }
+
+  // Upload strictly to Cloudinary unsigned preset in Pages folder (NEVER Supabase Storage)
+  const unsignedRes = await uploadMediaToCloudinary(file, purpose === 'chat' ? 'chat' : purpose, {
+    ...opts,
+    pageId,
+    folderOverride: targetFolder,
+  });
+
+  if (unsignedRes.success && unsignedRes.secure_url && isVideo) {
+    return {
+      ...unsignedRes,
+      secure_url: buildCloudinaryVideoDeliveryUrl(unsignedRes.secure_url, { max720p: true }),
+    };
+  }
+  return unsignedRes;
 }
 
 /**

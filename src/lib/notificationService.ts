@@ -55,6 +55,24 @@ export function getPrivacySafeNotificationText(
       return 'shared a new post in your community.';
     case 'event_reminder':
       return 'upcoming campus event reminder.';
+    case 'page_follow':
+      return 'started following your Page.';
+    case 'page_post':
+      return 'published a new post.';
+    case 'page_like':
+      return 'liked your Page post.';
+    case 'page_comment':
+      return 'commented on your Page post.';
+    case 'page_admin_invite':
+      return 'invited you to help manage a Page.';
+    case 'page_follow_invite':
+      return 'invited you to follow a Page.';
+    case 'page_message':
+      return 'sent a message to your Page.';
+    case 'page_verified':
+      return 'Your Page verification status was updated.';
+    case 'page_status':
+      return 'Your Page status was updated by ABSU Connect Admin.';
     default:
       return 'interacted with you on ABSU Connect.';
   }
@@ -135,6 +153,15 @@ export function mapDbEnumToAppType(rawType: string, entityType?: string | null):
   if (clean === 'community_invite') return 'community_invite';
   if (clean === 'community_approved') return 'community_approved';
   if (clean === 'community_rejected') return 'community_rejected';
+  if (clean === 'page_follow') return 'page_follow';
+  if (clean === 'page_post') return 'page_post';
+  if (clean === 'page_like') return 'page_like';
+  if (clean === 'page_comment') return 'page_comment';
+  if (clean === 'page_admin_invite' || cleanEntity === 'page_admin_invitation') return 'page_admin_invite';
+  if (clean === 'page_follow_invite' || cleanEntity === 'page_follow_invite') return 'page_follow_invite';
+  if (clean === 'page_message') return 'page_message';
+  if (clean === 'page_verified') return 'page_verified';
+  if (clean === 'page_status') return 'page_status';
   if (clean.includes('message') || clean.includes('chat') || clean.includes('dm')) {
     return 'message';
   }
@@ -214,12 +241,24 @@ export async function fetchUserNotifications(
 
     if (rawRows.length === 0) {
       try {
-        const { data: supaRows, error: supaErr } = await supabase
+        let { data: supaRows, error: supaErr } = await supabase
           .from('notifications')
           .select('*')
           .eq('recipient_id', currentUserId)
+          .is('recipient_page_id', null)
           .order('created_at', { ascending: false })
           .limit(100);
+
+        if (supaErr && (supaErr.message || '').toLowerCase().includes('recipient_page_id')) {
+          const retry = await supabase
+            .from('notifications')
+            .select('*')
+            .eq('recipient_id', currentUserId)
+            .order('created_at', { ascending: false })
+            .limit(100);
+          supaRows = retry.data;
+          supaErr = retry.error;
+        }
 
         if (supaErr) {
           console.error('[Notifications] Supabase notifications fetch error:', {
@@ -231,7 +270,7 @@ export async function fetchUserNotifications(
         }
 
         if (!supaErr && supaRows) {
-          rawRows = supaRows;
+          rawRows = supaRows.filter((r: any) => !r.recipient_page_id);
 
           const actorIds = Array.from(
             new Set(rawRows.map((r: any) => r.actor_id).filter((id: any) => isValidUuid(id)))
@@ -408,6 +447,7 @@ export async function fetchUserNotifications(
     const rawList: NotificationItem[] = [];
 
     for (const row of rawRows) {
+      if (row.recipient_page_id) continue;
       const notifType: NotificationType = mapDbEnumToAppType(row.type || '', row.entity_type);
       const isStoryNotif =
         notifType === 'story_comment' ||
@@ -557,6 +597,13 @@ export async function fetchUserNotifications(
         targetCommentId: resolvedCommentId,
         targetParentCommentId: resolvedParentCommentId,
         targetStoryId: resolvedStoryId,
+        targetPageId: isValidUuid(row.target_page_id) ? row.target_page_id : undefined,
+        recipientPageId: isValidUuid(row.recipient_page_id) ? row.recipient_page_id : undefined,
+        targetInvitationId:
+          (notifType === 'page_admin_invite' || notifType === 'page_follow_invite') &&
+          isValidUuid(row.entity_id)
+            ? row.entity_id
+            : undefined,
         conversationId: convId,
       });
     }
@@ -648,14 +695,20 @@ export async function createRealNotification(params: {
     | 'story_view'
     | 'story_like'
     | 'conversation'
+    | 'message'
     | 'friend_request'
     | 'friend_accepted'
     | 'game'
-    | 'user';
+    | 'user'
+    | 'page'
+    | 'page_admin_invitation'
+    | 'page_follow_invite';
   entityId?: string;
   postId?: string;
   commentId?: string;
   parentCommentId?: string;
+  recipientPageId?: string | null;
+  targetPageId?: string | null;
   body?: string;
   senderName?: string;
   url?: string;
@@ -691,6 +744,9 @@ export async function createRealNotification(params: {
       ? params.parentCommentId
       : null;
 
+    const validRecipientPageId = isValidUuid(params.recipientPageId) ? params.recipientPageId : null;
+    const validTargetPageId = isValidUuid(params.targetPageId) ? params.targetPageId : null;
+
     const dbType = mapAppTypeToDbEnum(params.type);
     let creationSuccess = false;
 
@@ -710,6 +766,8 @@ export async function createRealNotification(params: {
         postId: validPostId,
         commentId: validCommentId,
         parentCommentId: validParentCommentId,
+        recipientPageId: validRecipientPageId,
+        targetPageId: validTargetPageId,
         senderName: params.senderName,
         url: params.url,
       }),
@@ -751,6 +809,8 @@ export async function createRealNotification(params: {
         ...(validPostId ? { post_id: validPostId } : {}),
         ...(validCommentId ? { comment_id: validCommentId } : {}),
         ...(validParentCommentId ? { parent_comment_id: validParentCommentId } : {}),
+        ...(validRecipientPageId ? { recipient_page_id: validRecipientPageId } : {}),
+        ...(validTargetPageId ? { target_page_id: validTargetPageId } : {}),
       };
 
       let { error } = await supabase.from('notifications').insert(fullPayload);
@@ -790,12 +850,18 @@ export async function createOrUpdateConversationNotification(params: {
   conversationId: string;
   messageId?: string;
   senderName?: string;
+  recipientPageId?: string | null;
+  targetPageId?: string | null;
+  type?: 'message' | 'page_message';
 }): Promise<boolean> {
   if (params.recipientId === params.senderId) return false;
 
   try {
     const safeConvId = isValidUuid(params.conversationId) ? params.conversationId : null;
     const safeMsgId = isValidUuid(params.messageId) ? params.messageId : null;
+    const safeRecipientPageId = isValidUuid(params.recipientPageId) ? params.recipientPageId : null;
+    const safeTargetPageId = isValidUuid(params.targetPageId) ? params.targetPageId : null;
+    const resolvedType = params.type || (safeRecipientPageId ? 'page_message' : 'message');
     const entityToDispatch = safeMsgId || safeConvId;
     let serverHandled = false;
 
@@ -809,6 +875,9 @@ export async function createOrUpdateConversationNotification(params: {
           conversationId: safeConvId,
           messageId: safeMsgId,
           senderName: params.senderName,
+          recipientPageId: safeRecipientPageId,
+          targetPageId: safeTargetPageId,
+          type: resolvedType,
         }),
       });
       const ct = res.headers.get('content-type') || '';
@@ -821,20 +890,26 @@ export async function createOrUpdateConversationNotification(params: {
     // Client fallback when running on static hosting (Vercel) or native APK without Express server
     if (!serverHandled && entityToDispatch) {
       const senderDisplayName = params.senderName || 'ABSU Student';
-      await supabase
-        .from('notifications')
-        .insert({
-          recipient_id: params.recipientId,
-          actor_id: isValidUuid(params.senderId) ? params.senderId : null,
-          type: 'message',
-          title: `${senderDisplayName} sent you a message.`,
-          body: 'sent you a message.',
-          entity_type: safeMsgId ? 'message' : 'conversation',
-          entity_id: entityToDispatch,
-          created_at: new Date().toISOString(),
-          read_at: null,
-        })
-        .then(() => {});
+      const fallbackPayload: Record<string, any> = {
+        recipient_id: params.recipientId,
+        actor_id: isValidUuid(params.senderId) ? params.senderId : null,
+        type: resolvedType,
+        title: safeRecipientPageId
+          ? `New Page message from ${senderDisplayName}`
+          : `${senderDisplayName} sent you a message.`,
+        body: safeRecipientPageId ? 'sent a message to your Page.' : 'sent you a message.',
+        entity_type: safeMsgId ? 'message' : 'conversation',
+        entity_id: entityToDispatch,
+        created_at: new Date().toISOString(),
+        read_at: null,
+        ...(safeRecipientPageId ? { recipient_page_id: safeRecipientPageId } : {}),
+        ...(safeTargetPageId ? { target_page_id: safeTargetPageId } : {}),
+      };
+      const ins = await supabase.from('notifications').insert(fallbackPayload);
+      if (ins.error && (ins.error.message || '').toLowerCase().includes('recipient_page_id')) {
+        delete fallbackPayload.recipient_page_id;
+        await supabase.from('notifications').insert(fallbackPayload).then(() => {});
+      }
     }
 
     // Trigger FCM push via Supabase Edge Function ("send-android-push")
@@ -998,11 +1073,20 @@ export async function markAllRealNotificationsAsRead(
       body: JSON.stringify({ userId: currentUserId }),
     }).catch(() => {});
 
-    await supabase
+    const { error: markErr } = await supabase
       .from('notifications')
       .update({ read_at: new Date().toISOString() })
       .eq('recipient_id', currentUserId)
+      .is('recipient_page_id', null)
       .is('read_at', null);
+
+    if (markErr && (markErr.message || '').toLowerCase().includes('recipient_page_id')) {
+      await supabase
+        .from('notifications')
+        .update({ read_at: new Date().toISOString() })
+        .eq('recipient_id', currentUserId)
+        .is('read_at', null);
+    }
 
     return { success: true };
   } catch (err: unknown) {

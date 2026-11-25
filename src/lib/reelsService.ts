@@ -23,7 +23,7 @@ export interface ReelsPageResult {
 const REELS_RICH_SELECT = `
   *,
   author:profiles!posts_author_id_fkey(*),
-  page:pages(*),
+  page:pages!posts_page_id_fkey(*),
   community:communities(*),
   post_media!inner(*),
   post_reactions(*),
@@ -107,11 +107,12 @@ function isRowEligibleForReels(
   if (!row || !row.id) return false;
   if (row.visibility === 'hidden') return false;
   if (moderatedSet.has(row.id)) return false;
-  if (!row.page_id && blockedIds.has(row.author_id)) return false;
+  if (row.page && row.page.status && row.page.status !== 'active') return false;
+  if (!row.page_id && !row.author_page_id && row.author_id && blockedIds.has(row.author_id)) return false;
   if (
     row.visibility === 'friends' &&
     row.author_id !== currentUserId &&
-    !friendIds.has(row.author_id)
+    (!row.author_id || !friendIds.has(row.author_id))
   ) {
     return false;
   }
@@ -239,7 +240,73 @@ export async function fetchReelsFeedPage(options: {
       }
     }
 
-    if (sourceRows.length === 0) {
+    // 3b. Merge active `page_reels` view rows when present so Page video posts always appear in Reels
+    let pageReelPosts: Post[] = [];
+    if (!cursor) {
+      try {
+        const { data: prRows } = await supabase
+          .from('page_reels')
+          .select('*')
+          .order('created_at', { ascending: false })
+          .limit(20);
+        if (Array.isArray(prRows) && prRows.length > 0) {
+          pageReelPosts = prRows.map((pr: any) => ({
+            id: pr.post_id,
+            author: {
+              id: pr.page_id,
+              name: pr.page_name || 'ABSU Page',
+              avatar:
+                pr.page_avatar_url ||
+                `https://api.dicebear.com/7.x/initials/svg?seed=${encodeURIComponent(
+                  pr.page_name || 'Page'
+                )}&backgroundColor=6d45d9&textColor=ffffff`,
+              handle: `@${pr.page_id}`,
+              department: 'Page',
+              faculty: 'Abia State University',
+              level: pr.is_verified ? 'Verified Page' : 'Page',
+              campus: 'Uturu Campus',
+              bio: '',
+              interests: [],
+              isVerified: Boolean(pr.is_verified),
+              relationshipState: 'none' as const,
+            },
+            content: pr.caption || '',
+            mediaUrl: pr.secure_url,
+            mediaType: 'video' as const,
+            mediaItems: [
+              {
+                secure_url: pr.secure_url,
+                thumbnail_url: pr.thumbnail_url || undefined,
+                duration_seconds: pr.duration_seconds || undefined,
+                kind: 'video' as const,
+                provider: pr.secure_url?.includes('res.cloudinary.com') ? 'cloudinary' : 'supabase',
+              },
+            ],
+            category: 'General',
+            audience: 'Public',
+            createdAt: new Date(pr.created_at).toLocaleDateString('en-GB', {
+              day: 'numeric',
+              month: 'short',
+            }),
+            likesCount: 0,
+            isLiked: false,
+            isSaved: savedSet.has(pr.post_id),
+            comments: [],
+            commentsCount: 0,
+            pageId: pr.page_id,
+            authorPageId: pr.page_id,
+            authorAsPage: true,
+            isPagePost: true,
+            pageIsVerified: Boolean(pr.is_verified),
+            pageStatus: 'active',
+          }));
+        }
+      } catch {
+        // Non-blocking fallback
+      }
+    }
+
+    if (sourceRows.length === 0 && pageReelPosts.length === 0) {
       return { reels: [], hasMore: false, nextCursor: null };
     }
 
@@ -263,7 +330,7 @@ export async function fetchReelsFeedPage(options: {
       }
     }
 
-    const reels = eligibleRows
+    const mappedReels = eligibleRows
       .slice(0, limit)
       .map((row) =>
         normalizePostForReels(
@@ -272,6 +339,7 @@ export async function fetchReelsFeedPage(options: {
       )
       .filter((p) => isVideoPost(p));
 
+    const reels = mergeAndDedupeReels(mappedReels, pageReelPosts).slice(0, limit);
     const hasMore = eligibleRows.length > limit || sourceRows.length >= limit * 2;
     const nextCursor = hasMore ? sourceRows[sourceRows.length - 1]?.created_at || null : null;
 
@@ -356,16 +424,27 @@ export async function searchReelsVideos(
     const captionPattern = `%${cleaned}%`;
     const tagPattern = noHash ? `%#${noHash}%` : captionPattern;
 
-    // 1. Find matching creator profile IDs (display_name, username, department)
-    const { data: matchingProfiles } = await supabase
-      .from('profiles')
-      .select('id')
-      .or(
-        `display_name.ilike.%${noHash || cleaned}%,username.ilike.%${noHash || cleaned}%,department.ilike.%${noHash || cleaned}%`
-      )
-      .limit(30);
+    // 1. Find matching creator profile IDs AND active Page IDs
+    const [{ data: matchingProfiles }, { data: matchingPages }] = await Promise.all([
+      supabase
+        .from('profiles')
+        .select('id')
+        .or(
+          `display_name.ilike.%${noHash || cleaned}%,username.ilike.%${noHash || cleaned}%,department.ilike.%${noHash || cleaned}%`
+        )
+        .limit(30),
+      supabase
+        .from('pages')
+        .select('id')
+        .eq('status', 'active')
+        .or(`name.ilike.%${noHash || cleaned}%,slug.ilike.%${noHash || cleaned}%`)
+        .limit(20),
+    ]);
 
     const matchingAuthorIds = ((matchingProfiles || []) as Array<{ id: string }>)
+      .map((p) => p.id)
+      .filter(Boolean);
+    const matchingPageIds = ((matchingPages || []) as Array<{ id: string }>)
       .map((p) => p.id)
       .filter(Boolean);
 
@@ -375,6 +454,9 @@ export async function searchReelsVideos(
     }
     if (matchingAuthorIds.length > 0) {
       orClauses.push(`author_id.in.(${matchingAuthorIds.join(',')})`);
+    }
+    if (matchingPageIds.length > 0) {
+      orClauses.push(`page_id.in.(${matchingPageIds.join(',')})`);
     }
 
     const [postsRes, savedSet, moderatedSet, safetyCtx] = await Promise.all([

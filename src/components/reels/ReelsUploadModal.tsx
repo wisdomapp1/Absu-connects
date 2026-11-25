@@ -5,6 +5,7 @@ import { safeReadAndPrepareVideo, categorizeMediaError, type MediaRecoveryState 
 import { MediaRecoveryBanner } from '../common/MediaRecoveryBanner.tsx';
 import { VideoEditorModal } from '../home/VideoEditorModal.tsx';
 import { ReelsIcon } from '../common/ReelsIcon.tsx';
+import { VerifiedBadge } from '../common/VerifiedBadge.tsx';
 import { Globe, GraduationCap, Loader2, Scissors, Users, Video, X } from 'lucide-react';
 
 interface ReelsUploadModalProps {
@@ -20,7 +21,7 @@ export const ReelsUploadModal: React.FC<ReelsUploadModalProps> = ({
   onClose,
   onPublished,
 }) => {
-  const { createPost, addToast } = useApp();
+  const { createPost, addToast, activeIdentity } = useApp();
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const abortRef = useRef<AbortController | null>(null);
@@ -149,14 +150,22 @@ export const ReelsUploadModal: React.FC<ReelsUploadModalProps> = ({
 
     let capturedError = '';
     try {
-      const ok = await createPost(caption.trim(), 'General', audience, selectedVideo, {
-        signal: controller.signal,
-        onProgress: (step) => setProgressText(step),
-        onPercent: (pct) => setProgressPercent(pct),
-        onError: (err) => {
-          capturedError = err;
-        },
-      });
+      const targetPageId = activeIdentity.type === 'page' ? activeIdentity.pageId : undefined;
+      const ok = await createPost(
+        caption.trim(),
+        'General',
+        targetPageId ? 'Public' : audience,
+        selectedVideo,
+        {
+          pageId: targetPageId,
+          signal: controller.signal,
+          onProgress: (step) => setProgressText(step),
+          onPercent: (pct) => setProgressPercent(pct),
+          onError: (err) => {
+            capturedError = err;
+          },
+        }
+      );
 
       if (ok) {
         resetAll();
@@ -208,11 +217,14 @@ export const ReelsUploadModal: React.FC<ReelsUploadModalProps> = ({
       <div className="w-full sm:max-w-lg max-h-[92dvh] bg-[var(--color-bg-card)] border border-[var(--color-border)] rounded-t-3xl sm:rounded-3xl flex flex-col shadow-2xl overflow-hidden">
         {/* Header */}
         <div className="px-4 py-3.5 border-b border-[var(--color-border)] flex items-center justify-between shrink-0">
-          <div className="flex items-center gap-2">
-            <ReelsIcon className="w-5 h-5 text-[var(--color-primary)]" />
-            <h2 className="text-base font-extrabold text-[var(--color-text-primary)]">
-              Create Reel
-            </h2>
+          <div className="flex items-center gap-2 min-w-0">
+            <ReelsIcon className="w-5 h-5 text-[var(--color-primary)] shrink-0" />
+            <div className="min-w-0">
+              <h2 className="text-base font-extrabold text-[var(--color-text-primary)] truncate flex items-center gap-1.5">
+                <span>{activeIdentity.type === 'page' ? `Reel as ${activeIdentity.page.name}` : 'Create Reel'}</span>
+                {activeIdentity.type === 'page' && activeIdentity.page.isVerified && <VerifiedBadge size={14} />}
+              </h2>
+            </div>
           </div>
           <button
             type="button"

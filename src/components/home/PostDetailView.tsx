@@ -66,6 +66,19 @@ export const PostDetailView: React.FC = () => {
     loadPost();
   }, [selectedPostId, currentUser.id, authLoading]);
 
+  useEffect(() => {
+    const onUpdated = (evt: Event) => {
+      const detail = (evt as CustomEvent<{ postId?: string; content?: string }>).detail;
+      if (detail?.postId && typeof detail.content === 'string') {
+        setFetchedPost((prev) =>
+          prev && prev.id === detail.postId ? { ...prev, content: detail.content! } : prev
+        );
+      }
+    };
+    window.addEventListener('absu:post-updated', onUpdated);
+    return () => window.removeEventListener('absu:post-updated', onUpdated);
+  }, []);
+
   // Prefer live reactive fields from context if the post is in feed state, enriched with fetched details
   const activePost: Post | null =
     loadState === 'not_found' || loadState === 'restricted'
@@ -97,7 +110,7 @@ export const PostDetailView: React.FC = () => {
         </button>
         <div className="min-w-0">
           <h1 className="text-sm sm:text-base font-extrabold text-[var(--color-text-primary)] truncate">
-            Post
+            {activePost?.isPagePost ? 'Page Post' : 'Post'}
           </h1>
         </div>
       </div>

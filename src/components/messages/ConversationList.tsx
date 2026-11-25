@@ -2,6 +2,7 @@ import React, { useState, useRef, useEffect } from 'react';
 import { useApp } from '../../context/AppContext.tsx';
 import { useLocalCache } from '../../hooks/useLocalCache.ts';
 import { Avatar } from '../common/Avatar.tsx';
+import { VerifiedBadge } from '../common/VerifiedBadge.tsx';
 import type { Conversation } from '../../types/index.ts';
 import {
   Search,
@@ -158,15 +159,16 @@ export const ConversationList: React.FC<ConversationListProps> = ({ onSelectChat
                     src={conv.participant.avatar}
                     name={conv.participant.name}
                     size="md"
-                    showOnline={isUserOnline(conv.participant.id)}
+                    showOnline={!conv.isPageChat && isUserOnline(conv.participant.id)}
                   />
                   <div className="min-w-0 flex-1">
-                    <div className="flex items-center gap-2">
+                    <div className="flex items-center gap-1.5">
                       <p className="font-bold text-sm text-[var(--color-text-primary)] group-hover:text-[var(--color-primary)] transition-colors truncate">
                         {conv.participant.name}
                       </p>
+                      {conv.isPageChat && conv.pageIsVerified && <VerifiedBadge size={14} />}
                       <span className="text-[11px] text-[var(--color-text-secondary)] truncate">
-                        {conv.participant.department}
+                        {conv.isPageChat ? 'Page' : conv.participant.department}
                       </span>
                       {isMuted && (
                         <span title="Muted" className="shrink-0 flex items-center">

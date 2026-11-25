@@ -45,8 +45,10 @@ export const AlertsView: React.FC = () => {
 
   const isPushActive = typeof Notification !== 'undefined' && Notification.permission === 'granted';
 
-  const recentList = notifications.filter((n) => !n.isArchived);
-  const archivedList = notifications.filter((n) => n.isArchived);
+  // Keep personal Alerts strictly isolated from Page-targeted notifications (`recipientPageId`)
+  const personalNotifications = notifications.filter((n) => !n.recipientPageId);
+  const recentList = personalNotifications.filter((n) => !n.isArchived);
+  const archivedList = personalNotifications.filter((n) => n.isArchived);
 
   const currentList = destination === 'recent' ? recentList : archivedList;
 

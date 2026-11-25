@@ -9,6 +9,7 @@ import {
 } from './storageService.ts';
 import {
   uploadMediaToCloudinary,
+  uploadPageMediaToCloudinary,
   deleteCloudinaryAssets,
   buildCloudinaryVideoPosterUrl,
   extractCloudinaryPublicId,
@@ -40,25 +41,65 @@ export async function fetchMyUnreadCounts(currentUserId?: string): Promise<Recor
       currentUserId || (await supabase.auth.getSession()).data.session?.user?.id;
     if (!effectiveUserId) return counts;
 
-    // 1. Fetch current user's conversation memberships and their last_read_at timestamps
-    const { data: memberRows, error: mErr } = await supabase
-      .from('conversation_members')
-      .select('conversation_id, last_read_at')
-      .eq('user_id', effectiveUserId);
+    // 1. Fetch user conversation memberships, conversation Page metadata, and managed Pages concurrently
+    const [membersRes, managedRes] = await Promise.all([
+      supabase
+        .from('conversation_members')
+        .select('conversation_id, last_read_at')
+        .eq('user_id', effectiveUserId),
+      supabase
+        .from('page_managers')
+        .select('page_id')
+        .eq('user_id', effectiveUserId),
+    ]);
 
-    if (mErr || !memberRows || memberRows.length === 0) {
+    const memberRows = membersRes.data;
+    if (membersRes.error || !memberRows || memberRows.length === 0) {
       return counts;
     }
 
-    const convIds = memberRows.map((r) => r.conversation_id).filter(Boolean);
-    if (convIds.length === 0) return counts;
+    const managedPageIds = new Set<string>(
+      ((managedRes.data || []) as Array<{ page_id?: string | null }>)
+        .map((r) => r.page_id)
+        .filter((id): id is string => Boolean(id))
+    );
 
-    // Build map of conversationId -> last_read_at and initialize count to 0
+    const rawConvIds = memberRows.map((r) => r.conversation_id).filter(Boolean);
+    if (rawConvIds.length === 0) return counts;
+
+    const excludedInboundPageConvIds = new Set<string>();
+    if (managedPageIds.size > 0) {
+      const { data: convRows } = await supabase
+        .from('conversations')
+        .select('id, is_page_chat, page_id, created_by')
+        .in('id', rawConvIds);
+      for (const c of (convRows || []) as Array<{
+        id: string;
+        is_page_chat?: boolean | null;
+        page_id?: string | null;
+        created_by?: string | null;
+      }>) {
+        if (
+          c.is_page_chat &&
+          c.page_id &&
+          managedPageIds.has(c.page_id) &&
+          c.created_by !== effectiveUserId
+        ) {
+          excludedInboundPageConvIds.add(c.id);
+        }
+      }
+    }
+
+    // Build map of personal conversationId -> last_read_at and initialize count to 0
     const memberMap = new Map<string, string | null>();
+    const convIds: string[] = [];
     for (const m of memberRows) {
+      if (!m.conversation_id || excludedInboundPageConvIds.has(m.conversation_id)) continue;
+      convIds.push(m.conversation_id);
       memberMap.set(m.conversation_id, m.last_read_at);
       counts[m.conversation_id] = 0;
     }
+    if (convIds.length === 0) return counts;
 
     // 2. Fetch all incoming messages for these conversations (sender != effectiveUserId and deleted_at is null)
     const { data: messages, error: msgErr } = await supabase
@@ -174,6 +215,8 @@ async function processMessageRowsWithAttachments(
   rawMessages: Array<{
     id: string;
     sender_id: string;
+    sender_as_page?: boolean;
+    sender_page_id?: string | null;
     body: string;
     created_at: string;
     message_attachments?: Array<{
@@ -193,11 +236,16 @@ async function processMessageRowsWithAttachments(
     }>;
   }>,
   currentUserId: string,
-  recipientReadTime: number
+  recipientReadTime: number,
+  asPageId?: string
 ): Promise<Message[]> {
   // Collect all attachments to batch-resolve signed URLs
   const allAttachments: MessageAttachment[] = [];
+  const pageIdsToHydrate = new Set<string>();
   for (const m of rawMessages) {
+    if (m.sender_as_page && m.sender_page_id) {
+      pageIdsToHydrate.add(m.sender_page_id);
+    }
     if (m.message_attachments && Array.isArray(m.message_attachments)) {
       for (const a of m.message_attachments) {
         allAttachments.push({
@@ -219,12 +267,30 @@ async function processMessageRowsWithAttachments(
     }
   }
 
+  const pageMetaMap = new Map<string, { name: string; avatar_url?: string }>();
+  if (pageIdsToHydrate.size > 0) {
+    try {
+      const { data: pages } = await supabase
+        .from('pages')
+        .select('id, name, avatar_url')
+        .in('id', Array.from(pageIdsToHydrate));
+      for (const pg of pages || []) {
+        pageMetaMap.set(pg.id, pg);
+      }
+    } catch {
+      // Non-blocking fallback
+    }
+  }
+
   const signedUrlMap = await batchResolveChatAttachmentSignedUrls(allAttachments);
 
   return rawMessages.map((m) => {
-    const isOutgoing = m.sender_id === currentUserId;
+    const isOutgoing = asPageId
+      ? Boolean(m.sender_as_page && m.sender_page_id === asPageId)
+      : m.sender_id === currentUserId && !m.sender_as_page;
     const msgTime = new Date(m.created_at).getTime();
     const isSeen = isOutgoing && recipientReadTime > 0 && recipientReadTime >= msgTime;
+    const pageMeta = m.sender_as_page && m.sender_page_id ? pageMetaMap.get(m.sender_page_id) : undefined;
 
     const attachments: MessageAttachment[] = (m.message_attachments || []).map((a: any) => {
       const isStoryRef = isStoryAttachment(a);
@@ -254,6 +320,10 @@ async function processMessageRowsWithAttachments(
     return {
       id: m.id,
       senderId: m.sender_id,
+      senderAsPage: Boolean(m.sender_as_page),
+      senderPageId: m.sender_page_id ?? null,
+      senderName: pageMeta?.name,
+      senderAvatar: pageMeta?.avatar_url,
       text: m.body || '',
       timestamp: formatTimeAgo(m.created_at),
       createdAtRaw: m.created_at,
@@ -362,31 +432,61 @@ export async function fetchUserConversations(currentUserId: string): Promise<Con
 
     const convIds = Array.from(new Set(memberRows.map((r) => r.conversation_id)));
 
-    // 3. Fetch unread counts
-    const unreadMap = await fetchMyUnreadCounts(currentUserId);
+    // 3 & 4. Fetch unread counts, conversations, and pages managed by current user in parallel
+    const [unreadMap, convRes, managedRes] = await Promise.all([
+      fetchMyUnreadCounts(currentUserId),
+      supabase
+        .from('conversations')
+        .select('*')
+        .in('id', convIds)
+        .order('last_message_at', { ascending: false })
+        .limit(40),
+      supabase
+        .from('page_managers')
+        .select('page_id')
+        .eq('user_id', currentUserId),
+    ]);
 
-    // 4. Fetch conversation rows ordered by last_message_at, limited to recent 30
-    const { data: convRows, error: cErr } = await supabase
-      .from('conversations')
-      .select('*')
-      .in('id', convIds)
-      .order('last_message_at', { ascending: false })
-      .limit(30);
-
+    const cErr = convRes.error;
+    const convRows = convRes.data;
     if (cErr || !convRows) {
       return cached.length > 0 ? cached : [];
     }
 
+    const managedPageIds = new Set((managedRes.data || []).map((m: any) => m.page_id).filter(Boolean));
     const hiddenIds = getHiddenConversationIds(currentUserId);
-    const validConvRows = convRows.filter((c) => !hiddenIds.has(c.id));
+    const validConvRows = convRows.filter((c: any) => {
+      if (hiddenIds.has(c.id)) return false;
+      // Keep Page manager inbound chats strictly isolated in Page Inbox rather than Personal Messages
+      if (c.is_page_chat && c.page_id && managedPageIds.has(c.page_id) && c.created_by !== currentUserId) {
+        return false;
+      }
+      return true;
+    });
 
-    // 5. Batch-fetch other members for all valid conversations
-    const validConvIds = validConvRows.map((c) => c.id);
-    const { data: allOtherMembers } = await supabase
-      .from('conversation_members')
-      .select('conversation_id, user_id, last_read_at')
-      .in('conversation_id', validConvIds)
-      .neq('user_id', currentUserId);
+    if (validConvRows.length === 0) return [];
+
+    // 5. Batch-fetch other members and referenced Pages for Page chats
+    const validConvIds = validConvRows.map((c: any) => c.id);
+    const chatPageIds = Array.from(
+      new Set(validConvRows.filter((c: any) => c.is_page_chat && c.page_id).map((c: any) => c.page_id))
+    );
+    const [{ data: allOtherMembers }, { data: chatPages }] = await Promise.all([
+      supabase
+        .from('conversation_members')
+        .select('conversation_id, user_id, last_read_at')
+        .in('conversation_id', validConvIds)
+        .neq('user_id', currentUserId),
+      chatPageIds.length > 0
+        ? supabase
+            .from('pages')
+            .select('id, slug, name, category, avatar_url, is_verified, allow_messages')
+            .in('id', chatPageIds)
+        : Promise.resolve({ data: [] }),
+    ]);
+
+    const chatPageMap = new Map<string, any>();
+    for (const pg of (chatPages || []) as any[]) chatPageMap.set(pg.id, pg);
 
     const otherMemberByConv = new Map<string, { user_id: string; last_read_at?: string }>();
     const partnerUserIds = new Set<string>();
@@ -444,27 +544,48 @@ export async function fetchUserConversations(currentUserId: string): Promise<Con
     // 8. Build lightweight conversation summaries without downloading deep message trees
     const rawResults: Conversation[] = [];
 
-    for (const c of validConvRows) {
+    for (const c of validConvRows as any[]) {
+      const pageRow = c.is_page_chat && c.page_id ? chatPageMap.get(c.page_id) : null;
       const other = otherMemberByConv.get(c.id);
       const partnerId = other ? other.user_id : c.created_by;
 
-      const participantUser: User =
-        (partnerId && profileMap.get(partnerId)) || {
-          id: partnerId || 'unknown',
-          name: c.title || 'Coursemate',
-          avatar: `https://api.dicebear.com/7.x/initials/svg?seed=${encodeURIComponent(partnerId || 'ABSU')}&backgroundColor=6d45d9&textColor=ffffff`,
-          handle: '@student',
-          department: 'Student',
-          faculty: 'Abia State University',
-          level: 'Undergraduate',
-          campus: 'Uturu (Main Campus)',
-          bio: '',
-          interests: [],
-          relationshipState: 'none',
-        };
+      const participantUser: User = pageRow
+        ? {
+            id: pageRow.id,
+            name: pageRow.name || 'ABSU Page',
+            avatar:
+              pageRow.avatar_url ||
+              `https://api.dicebear.com/7.x/initials/svg?seed=${encodeURIComponent(
+                pageRow.name || 'Page'
+              )}&backgroundColor=6d45d9&textColor=ffffff`,
+            handle: `@${pageRow.slug || pageRow.id}`,
+            department: pageRow.category || 'Page',
+            faculty: 'Abia State University',
+            level: pageRow.is_verified ? 'Verified Page' : 'Page',
+            campus: 'Uturu Campus',
+            bio: '',
+            interests: [],
+            isVerified: Boolean(pageRow.is_verified),
+            relationshipState: 'none',
+          }
+        : (partnerId && profileMap.get(partnerId)) || {
+            id: partnerId || 'unknown',
+            name: c.title || 'Coursemate',
+            avatar: `https://api.dicebear.com/7.x/initials/svg?seed=${encodeURIComponent(
+              partnerId || 'ABSU'
+            )}&backgroundColor=6d45d9&textColor=ffffff`,
+            handle: '@student',
+            department: 'Student',
+            faculty: 'Abia State University',
+            level: 'Undergraduate',
+            campus: 'Uturu (Main Campus)',
+            bio: '',
+            interests: [],
+            relationshipState: 'none',
+          };
 
       const latestMsgInfo = latestMessageByConv.get(c.id);
-      const lastMessageText = latestMsgInfo ? latestMsgInfo.text : (c.last_message || 'Conversation started');
+      const lastMessageText = latestMsgInfo ? latestMsgInfo.text : c.last_message || 'Conversation started';
       const lastMessageTime = latestMsgInfo ? latestMsgInfo.time : formatTimeAgo(c.last_message_at || c.created_at);
       const unreadCount = unreadMap[c.id] ?? 0;
 
@@ -474,14 +595,21 @@ export async function fetchUserConversations(currentUserId: string): Promise<Con
         lastMessage: lastMessageText,
         lastMessageTime,
         unreadCount,
-        messages: [], // Populated on-demand when chat is opened
+        messages: [],
+        isPageChat: Boolean(c.is_page_chat),
+        pageId: c.page_id || undefined,
+        pageName: pageRow?.name,
+        pageAvatar: pageRow?.avatar_url,
+        pageIsVerified: Boolean(pageRow?.is_verified),
+        pageSlug: pageRow?.slug,
+        allowMessages: pageRow ? pageRow.allow_messages !== false : true,
       });
     }
 
-    // Deduplicate direct conversations by participant ID
+    // Deduplicate conversations carefully (keep Page chats keyed by page+conv id)
     const directMap = new Map<string, Conversation>();
     for (const conv of rawResults) {
-      const pid = conv.participant.id;
+      const pid = conv.isPageChat ? `page_${conv.pageId}_${conv.id}` : conv.participant.id;
       if (!directMap.has(pid)) {
         directMap.set(pid, conv);
       } else {
@@ -506,8 +634,7 @@ export async function fetchUserConversations(currentUserId: string): Promise<Con
 }
 
 /**
- * Hydrate a single conversation by UUID (e.g. when opened from a notification or deep link
- * before the inbox list finishes refreshing or when the thread isn't in the top 30 slice).
+ * Hydrate a single conversation by UUID (supports both User-to-User DMs and User-to-Page chats).
  */
 export async function fetchConversationById(
   conversationId: string,
@@ -522,6 +649,49 @@ export async function fetchConversationById(
       .maybeSingle();
 
     if (convErr || !convRow) return null;
+
+    if (convRow.is_page_chat && convRow.page_id) {
+      const { data: pg } = await supabase
+        .from('pages')
+        .select('id, slug, name, category, avatar_url, is_verified, allow_messages')
+        .eq('id', convRow.page_id)
+        .maybeSingle();
+
+      const pageUser: User = {
+        id: pg?.id || convRow.page_id,
+        name: pg?.name || convRow.title || 'ABSU Page',
+        avatar:
+          pg?.avatar_url ||
+          `https://api.dicebear.com/7.x/initials/svg?seed=${encodeURIComponent(
+            pg?.name || 'Page'
+          )}&backgroundColor=6d45d9&textColor=ffffff`,
+        handle: `@${pg?.slug || convRow.page_id}`,
+        department: pg?.category || 'Page',
+        faculty: 'Abia State University',
+        level: pg?.is_verified ? 'Verified Page' : 'Page',
+        campus: 'Uturu Campus',
+        bio: '',
+        interests: [],
+        isVerified: Boolean(pg?.is_verified),
+        relationshipState: 'none',
+      };
+
+      return {
+        id: convRow.id,
+        participant: pageUser,
+        lastMessage: convRow.last_message || 'Page conversation',
+        lastMessageTime: formatTimeAgo(convRow.last_message_at || convRow.created_at),
+        unreadCount: 0,
+        messages: [],
+        isPageChat: true,
+        pageId: convRow.page_id,
+        pageName: pg?.name,
+        pageAvatar: pg?.avatar_url,
+        pageIsVerified: Boolean(pg?.is_verified),
+        pageSlug: pg?.slug,
+        allowMessages: pg ? pg.allow_messages !== false : true,
+      };
+    }
 
     const { data: otherMember } = await supabase
       .from('conversation_members')
@@ -572,14 +742,14 @@ export async function fetchConversationById(
 
 /**
  * Fetch paginated messages for a specific conversation (default latest 50).
- * If beforeTimestamp is provided, fetches 50 older messages before that timestamp.
- * Saves messages to IndexedDB (localForage) for instant offline viewing.
+ * Supports `asPageId` when opened from Page Inbox so Page replies appear outgoing.
  */
 export async function fetchConversationMessages(
   conversationId: string,
   limit = 50,
   beforeTimestamp?: string,
-  afterTimestamp?: string
+  afterTimestamp?: string,
+  asPageId?: string
 ): Promise<Message[]> {
   if (!conversationId) return [];
   try {
@@ -588,7 +758,7 @@ export async function fetchConversationMessages(
 
     // Fetch recipient last_read_at for read receipts
     let recipientReadTime = 0;
-    if (currentUserId) {
+    if (currentUserId && !asPageId) {
       const lastRead = await fetchRecipientLastReadAt(conversationId, currentUserId);
       if (lastRead) {
         recipientReadTime = new Date(lastRead).getTime();
@@ -617,25 +787,26 @@ export async function fetchConversationMessages(
 
     if (error) {
       console.warn('fetchConversationMessages error, falling back to cache:', error.message);
-      return isDeltaAfter || beforeTimestamp ? [] : await getCachedMessages(conversationId);
+      return isDeltaAfter || beforeTimestamp || asPageId ? [] : await getCachedMessages(conversationId);
     }
 
     if (!rawRows || rawRows.length === 0) {
-      return isDeltaAfter || beforeTimestamp ? [] : await getCachedMessages(conversationId);
+      return isDeltaAfter || beforeTimestamp || asPageId ? [] : await getCachedMessages(conversationId);
     }
 
     // Process attachments and signed URLs
     const processed = await processMessageRowsWithAttachments(
       rawRows as any,
       currentUserId,
-      recipientReadTime
+      recipientReadTime,
+      asPageId
     );
 
     // Reverse only when fetched descending for initial/older pagination
     return isDeltaAfter ? processed : processed.reverse();
   } catch (err) {
     console.warn('fetchConversationMessages unexpected error:', err);
-    return afterTimestamp || beforeTimestamp ? [] : await getCachedMessages(conversationId);
+    return afterTimestamp || beforeTimestamp || asPageId ? [] : await getCachedMessages(conversationId);
   }
 }
 
@@ -681,6 +852,8 @@ export async function sendRealMessage(params: {
   text?: string;
   files?: File[];
   senderName?: string;
+  senderAsPage?: boolean;
+  senderPageId?: string;
   onUploadProgress?: (percent: number) => void;
   signal?: AbortSignal;
 }): Promise<{ success: boolean; message?: Message; error?: string; aborted?: boolean }> {
@@ -694,6 +867,7 @@ export async function sendRealMessage(params: {
 
     unhideConversationForUser(params.senderId, params.conversationId);
 
+    const isPageReply = Boolean(params.senderAsPage && params.senderPageId);
     const rawFiles = params.files || [];
     const uploadedAttachments: Array<{
       asset_id: string;
@@ -748,6 +922,13 @@ export async function sendRealMessage(params: {
       }
 
       if (kind === 'pdf' || kind === 'document') {
+        if (isPageReply) {
+          await cleanupDmRollbackAssets(uploadedSupabasePaths, uploadedCloudinaryAssets);
+          return {
+            success: false,
+            error: 'Pages can send images, videos, and voice notes cleanly via Cloudinary.',
+          };
+        }
         const upRes = await uploadChatAttachmentToStorage(params.senderId, f);
         if (upRes.success && upRes.attachment) {
           uploadedSupabasePaths.push(upRes.attachment.asset_id);
@@ -783,14 +964,23 @@ export async function sendRealMessage(params: {
         fileToUpload = comp.file;
       }
 
-      const cldRes = await uploadMediaToCloudinary(fileToUpload, 'chat', {
-        signal: params.signal,
-        maxBytes: 25 * 1024 * 1024,
-        onPercent: (pct) => {
-          const overall = Math.round(((i + pct / 100) / rawFiles.length) * 100);
-          params.onUploadProgress?.(overall);
-        },
-      });
+      const cldRes = isPageReply && params.senderPageId
+        ? await uploadPageMediaToCloudinary(fileToUpload, 'chat', params.senderPageId, {
+            signal: params.signal,
+            maxBytes: 25 * 1024 * 1024,
+            onPercent: (pct) => {
+              const overall = Math.round(((i + pct / 100) / rawFiles.length) * 100);
+              params.onUploadProgress?.(overall);
+            },
+          })
+        : await uploadMediaToCloudinary(fileToUpload, 'chat', {
+            signal: params.signal,
+            maxBytes: 25 * 1024 * 1024,
+            onPercent: (pct) => {
+              const overall = Math.round(((i + pct / 100) / rawFiles.length) * 100);
+              params.onUploadProgress?.(overall);
+            },
+          });
 
       if (cldRes.aborted) {
         await cleanupDmRollbackAssets(uploadedSupabasePaths, uploadedCloudinaryAssets);
@@ -824,8 +1014,15 @@ export async function sendRealMessage(params: {
           cloudinary_resource_type: resourceType,
           duration_seconds: videoDuration ?? cldRes.duration,
         });
+      } else if (isPageReply) {
+        // Never use Supabase Storage for Page media!
+        await cleanupDmRollbackAssets(uploadedSupabasePaths, uploadedCloudinaryAssets);
+        return {
+          success: false,
+          error: cldRes.error || `Failed to upload Page media "${f.name}" to Cloudinary.`,
+        };
       } else {
-        // Fallback to private Supabase chat-attachments if Cloudinary fails transiently
+        // Fallback to private Supabase chat-attachments for personal DMs only
         console.warn('[Chat Cloudinary Fallback Notice]', cldRes.error);
         const upRes = await uploadChatAttachmentToStorage(params.senderId, f);
         if (upRes.success && upRes.attachment) {
@@ -854,12 +1051,16 @@ export async function sendRealMessage(params: {
           : `📎 ${uploadedAttachments.length} attachments`;
     }
 
-    const msgPayload = {
+    const msgPayload: Record<string, any> = {
       conversation_id: params.conversationId,
       sender_id: params.senderId,
       body: bodyText,
       created_at: nowIso,
     };
+    if (isPageReply && params.senderPageId) {
+      msgPayload.sender_as_page = true;
+      msgPayload.sender_page_id = params.senderPageId;
+    }
 
     const { data: msgData, error: msgError } = await supabase
       .from('messages')
@@ -959,20 +1160,141 @@ export async function sendRealMessage(params: {
       .update({ last_message_at: nowIso })
       .eq('id', params.conversationId);
 
-    await supabase
-      .from('conversation_members')
-      .update({ last_read_at: nowIso })
-      .eq('conversation_id', params.conversationId)
-      .eq('user_id', params.senderId);
+    if (isPageReply && params.senderPageId) {
+      supabase.rpc('mark_page_conversation_read', {
+        p_conversation_id: params.conversationId,
+        p_page_id: params.senderPageId,
+      }).then(() => {}, () => {});
+    } else {
+      await supabase
+        .from('conversation_members')
+        .update({ last_read_at: nowIso })
+        .eq('conversation_id', params.conversationId)
+        .eq('user_id', params.senderId);
+    }
 
     try {
-      const { data: recipientMembers } = await supabase
-        .from('conversation_members')
-        .select('user_id')
-        .eq('conversation_id', params.conversationId)
-        .neq('user_id', params.senderId);
+      const [{ data: convMeta }, { data: recipientMembers }] = await Promise.all([
+        supabase
+          .from('conversations')
+          .select('id, is_page_chat, page_id, created_by')
+          .eq('id', params.conversationId)
+          .maybeSingle(),
+        supabase
+          .from('conversation_members')
+          .select('user_id')
+          .eq('conversation_id', params.conversationId)
+          .neq('user_id', params.senderId),
+      ]);
 
-      if (recipientMembers && recipientMembers.length > 0) {
+      const convRow = convMeta as {
+        id?: string;
+        is_page_chat?: boolean | null;
+        page_id?: string | null;
+        created_by?: string | null;
+      } | null;
+
+      if (convRow?.is_page_chat && convRow.page_id && !isPageReply) {
+        // Student sending inquiry to a Page: route alert strictly to Page's isolated inbox notifications
+        const [{ data: pageMgrs }, { data: prefRows }, { data: pageAutoCfg }] = await Promise.all([
+          supabase
+            .from('page_managers')
+            .select('user_id')
+            .eq('page_id', convRow.page_id),
+          supabase
+            .from('page_notification_preferences')
+            .select('user_id, notify_messages')
+            .eq('page_id', convRow.page_id)
+            .then((r) => r, () => ({ data: null })),
+          supabase
+            .from('pages')
+            .select('id, created_by, welcome_message, away_mode_enabled, away_message')
+            .eq('id', convRow.page_id)
+            .maybeSingle()
+            .then((r) => r, () => ({ data: null })),
+        ]);
+
+        const mutedMsgUserIds = new Set<string>(
+          ((prefRows || []) as Array<{ user_id: string; notify_messages?: boolean }>)
+            .filter((p) => p.notify_messages === false)
+            .map((p) => p.user_id)
+        );
+
+        const managerIds = Array.from(
+          new Set(
+            ((pageMgrs || []) as Array<{ user_id: string }>)
+              .map((m) => m.user_id)
+              .filter((uid) => uid && uid !== params.senderId && !mutedMsgUserIds.has(uid))
+          )
+        );
+
+        for (const mgrUserId of managerIds) {
+          createOrUpdateConversationNotification({
+            recipientId: mgrUserId,
+            senderId: params.senderId,
+            conversationId: params.conversationId,
+            messageId: msgData.id,
+            senderName: params.senderName,
+            recipientPageId: convRow.page_id,
+            targetPageId: convRow.page_id,
+            type: 'page_message',
+          }).catch(() => {});
+        }
+
+        // Automated Away / Welcome reply when configured on the Page
+        const cfg = pageAutoCfg as {
+          created_by?: string | null;
+          welcome_message?: string | null;
+          away_mode_enabled?: boolean | null;
+          away_message?: string | null;
+        } | null;
+        const autoReplyText =
+          cfg?.away_mode_enabled && cfg.away_message?.trim()
+            ? cfg.away_message.trim()
+            : cfg?.welcome_message?.trim() || '';
+
+        if (autoReplyText) {
+          (async () => {
+            try {
+              const { data: recentPageMsgs } = await supabase
+                .from('messages')
+                .select('id, created_at')
+                .eq('conversation_id', params.conversationId)
+                .eq('sender_as_page', true)
+                .is('deleted_at', null)
+                .order('created_at', { ascending: false })
+                .limit(1);
+
+              const lastPageReplyAt = recentPageMsgs?.[0]?.created_at
+                ? new Date(recentPageMsgs[0].created_at).getTime()
+                : 0;
+              const twelveHoursMs = 12 * 60 * 60 * 1000;
+              const shouldSendAutoReply = cfg?.away_mode_enabled
+                ? Date.now() - lastPageReplyAt > twelveHoursMs
+                : !recentPageMsgs || recentPageMsgs.length === 0;
+
+              if (shouldSendAutoReply) {
+                const autoTs = new Date(Date.now() + 250).toISOString();
+                await supabase.from('messages').insert({
+                  conversation_id: params.conversationId,
+                  sender_id: cfg?.created_by || params.senderId,
+                  sender_as_page: true,
+                  sender_page_id: convRow.page_id,
+                  body: autoReplyText,
+                  created_at: autoTs,
+                });
+                await supabase
+                  .from('conversations')
+                  .update({ last_message_at: autoTs })
+                  .eq('id', params.conversationId);
+              }
+            } catch {
+              // Non-blocking auto-reply
+            }
+          })();
+        }
+      } else if (recipientMembers && recipientMembers.length > 0) {
+        // Standard personal DM or Page replying back to a student
         for (const r of recipientMembers) {
           if (r.user_id) {
             createOrUpdateConversationNotification({
@@ -981,6 +1303,9 @@ export async function sendRealMessage(params: {
               conversationId: params.conversationId,
               messageId: msgData.id,
               senderName: params.senderName,
+              recipientPageId: undefined,
+              targetPageId: isPageReply && params.senderPageId ? params.senderPageId : undefined,
+              type: 'message',
             }).catch(() => {});
           }
         }
@@ -992,6 +1317,9 @@ export async function sendRealMessage(params: {
     const message: Message = {
       id: msgData.id,
       senderId: msgData.sender_id,
+      senderAsPage: Boolean(msgData.sender_as_page),
+      senderPageId: msgData.sender_page_id ?? null,
+      senderName: isPageReply ? params.senderName : undefined,
       text: msgData.body,
       timestamp: 'Just now',
       createdAtRaw: msgData.created_at,

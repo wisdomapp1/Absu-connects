@@ -24,12 +24,28 @@ import {
   fetchFeedPostsPage,
   fetchSinglePostById,
   createRealPost,
+  updateRealPost,
   deleteRealPost,
   toggleRealPostReaction,
   toggleSavePostInDb,
   createRealComment,
   PostMediaAttachment,
 } from '../lib/postService.ts';
+import type { ActiveIdentity, ManagedPageEntry } from '../types/pages.ts';
+import {
+  MR_ANONYMOUS_PAGE_ID,
+  fetchManagedPages,
+  fetchPageNotifications,
+  markAllPageNotificationsRead as markAllPageNotificationsReadService,
+  verifyUserManagesPage,
+  pinPagePost as pinPagePostService,
+} from '../lib/pageService.ts';
+import {
+  containsHiddenKeyword,
+  getPageRoleCapabilities,
+  resolveIdentitySwitchRoute,
+} from '../lib/pageUtils.ts';
+import { validatePagePostAttachments } from '../utils/logic.ts';
 import { checkPostHasVideo, isVideoPost } from '../lib/reelsService.ts';
 import {
   fetchDiscoverProfilesPage,
@@ -76,6 +92,7 @@ import {
 } from '../lib/moderationService.ts';
 import {
   uploadMediaToCloudinary,
+  uploadPageMediaToCloudinary,
   deleteCloudinaryAssets,
   buildCloudinaryVideoPosterUrl,
   type DeleteCloudinaryAssetInput,
@@ -90,7 +107,6 @@ import {
   playNotificationChime,
   getPushPermissionStatus,
 } from '../lib/pushService.ts';
-import { MR_ANONYMOUS_PAGE_ID } from '../lib/pageService.ts';
 import { initAllPushChannels, isNativeAndroidApp } from '../lib/nativePushService.ts';
 
 export interface AppContextType {
@@ -123,6 +139,9 @@ export interface AppContextType {
       convId?: string;
       communityId?: string;
       eventId?: string;
+      pageId?: string;
+      pageTab?: string;
+      pageConvId?: string | null;
       postId?: string;
       commentId?: string | null;
       parentCommentId?: string | null;
@@ -131,6 +150,27 @@ export interface AppContextType {
     }
   ) => void;
   goBack: () => void;
+
+  // Pages & Account Identity Switcher
+  activeIdentity: ActiveIdentity;
+  managedPages: ManagedPageEntry[];
+  loadingManagedPages: boolean;
+  refreshManagedPages: () => Promise<void>;
+  switchIdentity: (target: 'personal' | string, options?: { targetView?: ActiveView }) => Promise<boolean>;
+  selectedPageId: string | null;
+  selectedPageTab: string | null;
+  setSelectedPageTab: (tab: string | null) => void;
+  selectedPageInboxConvId: string | null;
+  setSelectedPageInboxConvId: (convId: string | null) => void;
+  activePageNotifications: NotificationItem[];
+  loadingPageNotifications: boolean;
+  refreshPageNotifications: () => Promise<void>;
+  markPageNotificationAsRead: (id: string) => Promise<void>;
+  markAllPageNotificationsRead: () => Promise<void>;
+  activePageInboxUnreadCount: number;
+  activePageNotifsUnreadCount: number;
+  createPageModalOpen: boolean;
+  setCreatePageModalOpen: (open: boolean) => void;
 
   // Selected Community, Event & Post Deep-Link Context
   selectedCommunityId: string | null;
@@ -171,8 +211,11 @@ export interface AppContextType {
       onPercent?: (percent: number) => void;
       onError?: (error: string) => void;
       signal?: AbortSignal;
+      pageId?: string;
     }
   ) => Promise<boolean>;
+  editPost: (postId: string, newContent: string) => Promise<boolean>;
+  pinPagePost: (pageId: string, postId: string | null) => Promise<boolean>;
   toggleLike: (postId: string) => Promise<void>;
   toggleSave: (postId: string, explicitWasSaved?: boolean) => Promise<boolean>;
   addComment: (postId: string, text: string, parentId?: string | null) => Promise<void>;
@@ -292,6 +335,8 @@ export interface NavigationEntry {
   convId?: string | null;
   communityId?: string | null;
   eventId?: string | null;
+  pageId?: string | null;
+  pageTab?: string | null;
   postId?: string | null;
   commentId?: string | null;
   parentCommentId?: string | null;
@@ -509,6 +554,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         const userId = params.get('userId') || null;
         const communityId = params.get('communityId') || null;
         const eventId = params.get('eventId') || null;
+        const pageId = params.get('pageId') || null;
+        const pageTab = params.get('tab') || null;
         const postId = params.get('postId') || null;
         const commentId = params.get('commentId') || null;
         const parentCommentId = params.get('parentCommentId') || null;
@@ -521,6 +568,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
             ? 'messages'
             : view === 'user-profile'
             ? 'friends'
+            : view === 'pages' || view === 'page-profile' || view === 'page-workspace' || view === 'page-inbox' || view === 'page-notifications'
+            ? 'more'
             : 'home';
           return {
             view,
@@ -529,6 +578,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
             userId,
             communityId,
             eventId,
+            pageId,
+            pageTab,
             postId,
             commentId,
             parentCommentId,
@@ -546,6 +597,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       userId: null,
       communityId: null,
       eventId: null,
+      pageId: null as string | null,
+      pageTab: null as string | null,
       postId: null,
       commentId: null,
       parentCommentId: null,
@@ -566,6 +619,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       convId: initialRoute.convId,
       communityId: initialRoute.communityId,
       eventId: initialRoute.eventId,
+      pageId: initialRoute.pageId,
+      pageTab: initialRoute.pageTab,
       postId: initialRoute.postId,
       commentId: initialRoute.commentId,
       parentCommentId: initialRoute.parentCommentId,
@@ -575,6 +630,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
   // Modals & Overlays
   const [createPostModalOpen, setCreatePostModalOpenState] = useState<boolean>(false);
+  const [createPageModalOpen, setCreatePageModalOpenState] = useState<boolean>(false);
   const [initialPostMedia, setInitialPostMedia] = useState<AttachedMediaItem[]>([]);
   const [editProfileModalOpen, setEditProfileModalOpenState] = useState<boolean>(false);
   const [searchOpen, setSearchOpenState] = useState<boolean>(false);
@@ -607,6 +663,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       convId: initialRoute.convId,
       communityId: initialRoute.communityId,
       eventId: initialRoute.eventId,
+      pageId: initialRoute.pageId,
+      pageTab: initialRoute.pageTab,
       postId: initialRoute.postId,
       commentId: initialRoute.commentId,
       parentCommentId: initialRoute.parentCommentId,
@@ -614,6 +672,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     },
   ]);
   const createPostModalOpenRef = useRef<boolean>(false);
+  const createPageModalOpenRef = useRef<boolean>(false);
   const editProfileModalOpenRef = useRef<boolean>(false);
   const searchOpenRef = useRef<boolean>(false);
   const imageLightboxUrlRef = useRef<string | null>(null);
@@ -626,6 +685,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   useEffect(() => { activeTabRef.current = activeTab; }, [activeTab]);
   useEffect(() => { navHistoryRef.current = navHistory; }, [navHistory]);
   useEffect(() => { createPostModalOpenRef.current = createPostModalOpen; }, [createPostModalOpen]);
+  useEffect(() => { createPageModalOpenRef.current = createPageModalOpen; }, [createPageModalOpen]);
   useEffect(() => { editProfileModalOpenRef.current = editProfileModalOpen; }, [editProfileModalOpen]);
   useEffect(() => { searchOpenRef.current = searchOpen; }, [searchOpen]);
   useEffect(() => { imageLightboxUrlRef.current = imageLightboxUrl; }, [imageLightboxUrl]);
@@ -637,6 +697,13 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     setCreatePostModalOpenState(open);
     if (open) {
       safePushState({ isOverlay: true, type: 'createPost' }, '', window.location.pathname);
+    }
+  }, []);
+
+  const setCreatePageModalOpen = useCallback((open: boolean) => {
+    setCreatePageModalOpenState(open);
+    if (open) {
+      safePushState({ isOverlay: true, type: 'createPage' }, '', window.location.pathname);
     }
   }, []);
 
@@ -754,6 +821,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       convId?: string;
       communityId?: string;
       eventId?: string;
+      pageId?: string;
+      pageTab?: string;
+      pageConvId?: string | null;
       postId?: string;
       commentId?: string | null;
       parentCommentId?: string | null;
@@ -762,15 +832,43 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     }
   ) => {
     let targetView = view;
+    if (view === 'create-page') {
+      setCreatePageModalOpen(true);
+      return;
+    }
     if (view === 'user-profile' && options?.userId) {
       if (
-        options.userId === '0c3240e3-ae39-461d-bd7a-4963859b9bc7' ||
+        options.userId === MR_ANONYMOUS_PAGE_ID ||
         options.userId === 'b4f38505-fce6-44be-8727-8ebf04eb2ceb'
       ) {
-        targetView = 'mr-anonymous';
+        targetView = 'page-profile';
+        setSelectedPageId(MR_ANONYMOUS_PAGE_ID);
       } else {
         setSelectedUserId(options.userId);
       }
+    }
+    if (
+      (view === 'page-profile' ||
+        view === 'page-workspace' ||
+        view === 'page-inbox' ||
+        view === 'page-notifications' ||
+        view === 'page-followers' ||
+        view === 'page-settings') &&
+      options?.pageId
+    ) {
+      setSelectedPageId(options.pageId);
+    }
+    if (options?.pageConvId !== undefined) {
+      setSelectedPageInboxConvId(options.pageConvId);
+    }
+    if (options?.pageTab !== undefined) {
+      setSelectedPageTab(options.pageTab);
+    } else if (
+      view === 'page-profile' ||
+      view === 'page-workspace' ||
+      !view.startsWith('page-')
+    ) {
+      setSelectedPageTab(null);
     }
     if (options?.communityId) {
       setSelectedCommunityId(options.communityId);
@@ -819,6 +917,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       });
     }
 
+    if (searchOpenRef.current) {
+      setSearchOpenState(false);
+    }
+
     const mainTabs: MainNavTab[] = ['home', 'reels', 'friends', 'messages', 'alerts', 'more'];
     const nextTab: MainNavTab = mainTabs.includes(targetView as MainNavTab)
       ? (targetView as MainNavTab)
@@ -836,6 +938,17 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       convId: options?.convId || (targetView === 'conversation' ? options?.convId || null : null),
       communityId: options?.communityId || (targetView === 'community-detail' ? options?.communityId || null : null),
       eventId: options?.eventId || (targetView === 'event-detail' ? options?.eventId || null : null),
+      pageId:
+        options?.pageId ||
+        (targetView === 'page-profile' ||
+        targetView === 'page-workspace' ||
+        targetView === 'page-inbox' ||
+        targetView === 'page-notifications' ||
+        targetView === 'page-followers' ||
+        targetView === 'page-settings'
+          ? selectedPageId
+          : null),
+      pageTab: options?.pageTab || null,
       postId: options?.postId || (targetView === 'post-detail' || targetView === 'reels' ? options?.postId || null : null),
       commentId: options?.commentId || null,
       parentCommentId: options?.parentCommentId || null,
@@ -859,6 +972,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     }
     if (storyModalOpenRef.current) {
       setStoryModalState((prev) => ({ ...prev, isOpen: false }));
+      return;
+    }
+    if (createPageModalOpenRef.current) {
+      setCreatePageModalOpenState(false);
       return;
     }
     if (createPostModalOpenRef.current) {
@@ -898,6 +1015,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       setSelectedConversationId(prevEntry.convId ?? null);
       setSelectedCommunityId(prevEntry.communityId ?? null);
       setSelectedEventId(prevEntry.eventId ?? null);
+      setSelectedPageId(prevEntry.pageId ?? null);
+      setSelectedPageTab(prevEntry.pageTab ?? null);
       setSelectedPostId(prevEntry.postId ?? null);
       setSelectedPostNavContext(
         prevEntry.postId
@@ -921,6 +1040,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       setSelectedConversationId(null);
       setSelectedCommunityId(null);
       setSelectedEventId(null);
+      setSelectedPageId(null);
+      setSelectedPageTab(null);
       setSelectedPostId(null);
       setSelectedPostNavContext(null);
     }
@@ -941,6 +1062,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       }
       if (storyModalOpenRef.current) {
         setStoryModalState((prev) => ({ ...prev, isOpen: false }));
+        return;
+      }
+      if (createPageModalOpenRef.current) {
+        setCreatePageModalOpenState(false);
         return;
       }
       if (createPostModalOpenRef.current) {
@@ -1002,6 +1127,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         }
         if (storyModalOpenRef.current) {
           setStoryModalState((prev) => ({ ...prev, isOpen: false }));
+          return;
+        }
+        if (createPageModalOpenRef.current) {
+          setCreatePageModalOpenState(false);
           return;
         }
         if (createPostModalOpenRef.current) {
@@ -1091,6 +1220,17 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const [selectedUserId, setSelectedUserId] = useState<string | null>(initialRoute.userId);
   const [selectedCommunityId, setSelectedCommunityId] = useState<string | null>(initialRoute.communityId);
   const [selectedEventId, setSelectedEventId] = useState<string | null>(initialRoute.eventId);
+  const [selectedPageId, setSelectedPageId] = useState<string | null>(initialRoute.pageId);
+  const [selectedPageTab, setSelectedPageTab] = useState<string | null>(initialRoute.pageTab);
+  const [selectedPageInboxConvId, setSelectedPageInboxConvId] = useState<string | null>(null);
+  const [activeIdentity, setActiveIdentity] = useState<ActiveIdentity>({ type: 'personal' });
+  const activeIdentityRef = useRef<ActiveIdentity>({ type: 'personal' });
+  activeIdentityRef.current = activeIdentity;
+  const identitySwitchSeqRef = useRef<number>(0);
+  const [managedPages, setManagedPages] = useState<ManagedPageEntry[]>([]);
+  const [loadingManagedPages, setLoadingManagedPages] = useState<boolean>(false);
+  const [activePageNotifications, setActivePageNotifications] = useState<NotificationItem[]>([]);
+  const [loadingPageNotifications, setLoadingPageNotifications] = useState<boolean>(false);
   const [selectedPostId, setSelectedPostId] = useState<string | null>(initialRoute.postId);
   const [selectedPostNavContext, setSelectedPostNavContext] = useState<{
     commentId?: string | null;
@@ -1208,6 +1348,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           convId: parsed.searchParams.get('convId') || undefined,
           communityId: parsed.searchParams.get('communityId') || undefined,
           eventId: parsed.searchParams.get('eventId') || undefined,
+          pageId: parsed.searchParams.get('pageId') || undefined,
+          pageTab: parsed.searchParams.get('tab') || undefined,
           postId: parsed.searchParams.get('postId') || undefined,
           commentId: parsed.searchParams.get('commentId'),
           parentCommentId: parsed.searchParams.get('parentCommentId'),
@@ -1543,6 +1685,233 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     }
   }, [authUserId]);
 
+  const managedPagesInFlightRef = useRef<Promise<void> | null>(null);
+  const hasLoadedManagedPagesRef = useRef(false);
+
+  const loadManagedPages = useCallback(async () => {
+    if (!authUserId) {
+      setManagedPages((prev) => (prev.length === 0 ? prev : []));
+      setActiveIdentity((prev) => (prev.type === 'personal' ? prev : { type: 'personal' }));
+      hasLoadedManagedPagesRef.current = false;
+      return;
+    }
+    if (managedPagesInFlightRef.current) {
+      return managedPagesInFlightRef.current;
+    }
+
+    const run = (async () => {
+      if (!hasLoadedManagedPagesRef.current) {
+        setLoadingManagedPages(true);
+      }
+      try {
+        const entries = await fetchManagedPages(authUserId);
+        setManagedPages((prev) => {
+          const prevSig = JSON.stringify(
+            prev.map((e) => [
+              e.page.id,
+              e.page.name,
+              e.page.avatar_url,
+              e.page.isVerified,
+              e.page.status,
+              e.page.updated_at,
+              e.role,
+              e.unreadNotificationsCount || 0,
+              e.unreadInboxCount || 0,
+            ])
+          );
+          const nextSig = JSON.stringify(
+            entries.map((e) => [
+              e.page.id,
+              e.page.name,
+              e.page.avatar_url,
+              e.page.isVerified,
+              e.page.status,
+              e.page.updated_at,
+              e.role,
+              e.unreadNotificationsCount || 0,
+              e.unreadInboxCount || 0,
+            ])
+          );
+          return prevSig === nextSig ? prev : entries;
+        });
+
+        // Re-validate persisted identity strictly against live active page_managers rows (fail closed)
+        const savedPageId = safeStorage.getItem(`absu_active_identity_${authUserId}`);
+        if (savedPageId && savedPageId !== 'personal') {
+          const verification = await verifyUserManagesPage(savedPageId, authUserId);
+          if (verification.manages && verification.page && verification.role) {
+            const nextPage = verification.page;
+            const nextRole = verification.role;
+            setActiveIdentity((prev) => {
+              if (
+                prev.type === 'page' &&
+                prev.pageId === nextPage.id &&
+                prev.role === nextRole &&
+                prev.page.name === nextPage.name &&
+                prev.page.avatar_url === nextPage.avatar_url &&
+                prev.page.cover_url === nextPage.cover_url &&
+                prev.page.isVerified === nextPage.isVerified &&
+                prev.page.status === nextPage.status &&
+                prev.page.updated_at === nextPage.updated_at
+              ) {
+                return prev;
+              }
+              return {
+                type: 'page',
+                pageId: nextPage.id,
+                role: nextRole,
+                page: nextPage,
+              };
+            });
+          } else {
+            safeStorage.removeItem(`absu_active_identity_${authUserId}`);
+            setActiveIdentity((prev) => (prev.type === 'personal' ? prev : { type: 'personal' }));
+          }
+        } else {
+          setActiveIdentity((prev) => (prev.type === 'personal' ? prev : { type: 'personal' }));
+        }
+        hasLoadedManagedPagesRef.current = true;
+      } catch {
+        // Fail closed to personal identity on error
+        setActiveIdentity((prev) => (prev.type === 'personal' ? prev : { type: 'personal' }));
+      } finally {
+        setLoadingManagedPages(false);
+        managedPagesInFlightRef.current = null;
+      }
+    })();
+
+    managedPagesInFlightRef.current = run;
+    return run;
+  }, [authUserId]);
+
+  const loadActivePageNotifications = useCallback(
+    async (explicitPageId?: string) => {
+      const targetPageId =
+        explicitPageId ||
+        (activeIdentityRef.current.type === 'page' ? activeIdentityRef.current.pageId : '');
+      if (!authUserId || !targetPageId) {
+        setActivePageNotifications([]);
+        return;
+      }
+      setLoadingPageNotifications(true);
+      try {
+        const items = await fetchPageNotifications(targetPageId, authUserId);
+        // Only apply if this Page is still active
+        if (
+          activeIdentityRef.current.type === 'page' &&
+          activeIdentityRef.current.pageId === targetPageId
+        ) {
+          setActivePageNotifications(items);
+        }
+      } finally {
+        setLoadingPageNotifications(false);
+      }
+    },
+    [authUserId]
+  );
+
+  useEffect(() => {
+    if (activeIdentity.type === 'page') {
+      loadActivePageNotifications(activeIdentity.pageId);
+    } else {
+      setActivePageNotifications([]);
+    }
+  }, [
+    activeIdentity.type,
+    activeIdentity.type === 'page' ? activeIdentity.pageId : null,
+    loadActivePageNotifications,
+  ]);
+
+  const switchIdentity = useCallback(
+    async (
+      target: 'personal' | string,
+      options?: { targetView?: ActiveView }
+    ): Promise<boolean> => {
+      if (!authUserId) return false;
+      const switchSeq = ++identitySwitchSeqRef.current;
+
+      // Clear identity-scoped selections before transitioning shells
+      setSelectedConversationId(null);
+      setSelectedPageInboxConvId(null);
+      setSelectedPageTab(null);
+      setSelectedPostId(null);
+      setSelectedPostNavContext(null);
+      setSearchOpenState(false);
+
+      if (target === 'personal') {
+        const nextIdentity: ActiveIdentity = { type: 'personal' };
+        setActivePageNotifications([]);
+        setActiveIdentity(nextIdentity);
+        activeIdentityRef.current = nextIdentity;
+        safeStorage.removeItem(`absu_active_identity_${authUserId}`);
+
+        const nextView = resolveIdentitySwitchRoute(
+          activeViewRef.current,
+          nextIdentity,
+          options?.targetView || null
+        );
+        setActiveView(nextView);
+        if (['home', 'reels', 'friends', 'messages', 'alerts', 'more'].includes(nextView)) {
+          setActiveTabState(nextView as MainNavTab);
+        } else {
+          setActiveTabState('home');
+        }
+        addToast('Switched back to your Personal Profile.', 'info');
+        loadNotifications();
+        return true;
+      }
+
+      const verification = await verifyUserManagesPage(target, authUserId);
+      if (switchSeq !== identitySwitchSeqRef.current) {
+        return false;
+      }
+
+      if (!verification.manages || !verification.page || !verification.role) {
+        addToast(
+          verification.page && verification.page.status !== 'active'
+            ? 'This Page is disabled or unavailable.'
+            : 'You do not have active manager permissions for this Page.',
+          'warning'
+        );
+        const fallbackIdentity: ActiveIdentity = { type: 'personal' };
+        setActivePageNotifications([]);
+        setActiveIdentity(fallbackIdentity);
+        activeIdentityRef.current = fallbackIdentity;
+        safeStorage.removeItem(`absu_active_identity_${authUserId}`);
+        return false;
+      }
+
+      const nextIdentity: ActiveIdentity = {
+        type: 'page',
+        pageId: verification.page.id,
+        role: verification.role,
+        page: verification.page,
+      };
+      setActivePageNotifications([]);
+      setSelectedPageId(verification.page.id);
+      setActiveIdentity(nextIdentity);
+      activeIdentityRef.current = nextIdentity;
+      safeStorage.setItem(`absu_active_identity_${authUserId}`, verification.page.id);
+
+      const nextView = resolveIdentitySwitchRoute(
+        activeViewRef.current,
+        nextIdentity,
+        options?.targetView || null
+      );
+      setActiveView(nextView);
+      if (['home', 'reels'].includes(nextView)) {
+        setActiveTabState(nextView as MainNavTab);
+      } else {
+        setActiveTabState('home');
+      }
+
+      addToast(`Switched to ${verification.page.name}`, 'success');
+      void loadActivePageNotifications(verification.page.id);
+      return true;
+    },
+    [authUserId, addToast, loadNotifications, loadActivePageNotifications]
+  );
+
   // Initial fetch when authenticated user ID changes
   useEffect(() => {
     if (authUserId) {
@@ -1554,6 +1923,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       loadUsersAndFriends();
       loadConversations();
       loadNotifications();
+      loadManagedPages();
     } else {
       hasLoadedPostsRef.current = false;
       hasLoadedUsersRef.current = false;
@@ -1566,12 +1936,14 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       setFriendRequests([]);
       setConversations([]);
       setNotifications([]);
+      setManagedPages([]);
+      setActiveIdentity({ type: 'personal' });
       setLoadingPosts(false);
       setLoadingUsers(false);
       setLoadingConversations(false);
       setLoadingNotifications(false);
     }
-  }, [authUserId, loadPosts, loadUsersAndFriends, loadConversations, loadNotifications]);
+  }, [authUserId, loadPosts, loadUsersAndFriends, loadConversations, loadNotifications, loadManagedPages]);
 
   // Refresh posts cleanly when a new user finishes onboarding/profile setup into the app
   const prevAuthViewRef = useRef(auth.authView);
@@ -1647,7 +2019,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       )
       .subscribe();
 
-    // 4. Notifications table changes (INSERT, UPDATE, DELETE for live real-time sync across devices)
+    // 4. Notifications table changes (isolated between Personal alerts and Page-mode alerts)
     const notifChannel = supabase
       .channel(`public:notifications:${authUserId}`)
       .on(
@@ -1659,9 +2031,31 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           filter: `recipient_id=eq.${authUserId}`,
         },
         (payload) => {
+          const rec = (payload.new || payload.old) as any;
+          const isPageScoped = Boolean(rec?.recipient_page_id);
+
+          if (isPageScoped) {
+            triggerDebouncedManagedPages();
+            if (
+              activeIdentityRef.current.type === 'page' &&
+              rec.recipient_page_id === activeIdentityRef.current.pageId
+            ) {
+              if (payload.eventType === 'INSERT') {
+                playNotificationChime();
+                if (rec?.title || rec?.body) {
+                  addToast(
+                    `🔔 ${rec.title || activeIdentityRef.current.page.name}: ${rec.body || 'New Page update'}`,
+                    'info'
+                  );
+                }
+              }
+              loadActivePageNotifications(rec.recipient_page_id);
+            }
+            return;
+          }
+
           if (payload.eventType === 'INSERT') {
             playNotificationChime();
-            const rec = payload.new as any;
             if (rec?.title || rec?.body) {
               addToast(`🔔 ${rec.title || 'ABSU Connect'}: ${rec.body}`, 'info');
             }
@@ -1671,7 +2065,42 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       )
       .subscribe();
 
-    // 5. Visibility and Window Focus Sync (throttled to prevent bursts on dialog/iframe clicks)
+    // 5. Pages realtime updates (debounced & coalesced to eliminate refresh loops)
+    let pageRealtimeTimer: ReturnType<typeof setTimeout> | null = null;
+    let managedPagesReloadTimer: ReturnType<typeof setTimeout> | null = null;
+    const dispatchPageRealtime = (table: string, payload?: any) => {
+      if (typeof window === 'undefined') return;
+      if (pageRealtimeTimer) clearTimeout(pageRealtimeTimer);
+      pageRealtimeTimer = setTimeout(() => {
+        window.dispatchEvent(new CustomEvent('absu:page-realtime', { detail: { table, payload } }));
+      }, 450);
+    };
+    const triggerDebouncedManagedPages = () => {
+      if (managedPagesReloadTimer) clearTimeout(managedPagesReloadTimer);
+      managedPagesReloadTimer = setTimeout(() => {
+        loadManagedPages();
+      }, 650);
+    };
+
+    const pagesChannel = supabase
+      .channel(`public:pages:${authUserId}`)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'pages' }, (payload) => {
+        dispatchPageRealtime('pages', payload);
+        triggerDebouncedManagedPages();
+      })
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'page_followers' }, (payload) => {
+        dispatchPageRealtime('page_followers', payload);
+      })
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'page_managers' }, (payload) => {
+        dispatchPageRealtime('page_managers', payload);
+        triggerDebouncedManagedPages();
+      })
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'page_conversation_reads' }, (payload) => {
+        dispatchPageRealtime('page_conversation_reads', payload);
+      })
+      .subscribe();
+
+    // 6. Visibility and Window Focus Sync (throttled to prevent bursts on dialog/iframe clicks)
     const onWindowFocusOrVisible = () => {
       if (document.visibilityState !== 'visible') return;
       const now = Date.now();
@@ -1683,7 +2112,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     window.addEventListener('visibilitychange', onWindowFocusOrVisible);
     window.addEventListener('focus', onWindowFocusOrVisible);
 
-    // 6. Resilient Polling: refresh notifications every 20s when tab is active
+    // 7. Resilient Polling: refresh notifications every 20s when tab is active
     const intervalId = setInterval(() => {
       if (document.visibilityState === 'visible') {
         loadNotifications();
@@ -1693,15 +2122,25 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     return () => {
       if (postDebounceTimer) clearTimeout(postDebounceTimer);
       if (convDebounceTimer) clearTimeout(convDebounceTimer);
+      if (pageRealtimeTimer) clearTimeout(pageRealtimeTimer);
+      if (managedPagesReloadTimer) clearTimeout(managedPagesReloadTimer);
       supabase.removeChannel(postChannel);
       supabase.removeChannel(msgChannel);
       supabase.removeChannel(cmChannel);
       supabase.removeChannel(notifChannel);
+      supabase.removeChannel(pagesChannel);
       window.removeEventListener('visibilitychange', onWindowFocusOrVisible);
       window.removeEventListener('focus', onWindowFocusOrVisible);
       clearInterval(intervalId);
     };
-  }, [authUserId, loadPosts, loadConversations, loadNotifications]);
+  }, [
+    authUserId,
+    loadPosts,
+    loadConversations,
+    loadNotifications,
+    loadManagedPages,
+    loadActivePageNotifications,
+  ]);
 
   // Tracking ref for deduplicating presence peer queries
   const lastPresenceFetchedKeyRef = useRef<string>('');
@@ -1829,6 +2268,26 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       } else if (currentView === 'user-profile') {
         await Promise.all([loadUsersAndFriends(), loadPosts()]);
         return { success: true, message: 'Student profile updated' };
+      } else if (
+        currentView === 'pages' ||
+        currentView === 'page-profile' ||
+        currentView === 'page-workspace' ||
+        currentView === 'page-inbox' ||
+        currentView === 'page-notifications' ||
+        currentView === 'page-followers' ||
+        currentView === 'page-settings'
+      ) {
+        if (typeof window !== 'undefined') {
+          window.dispatchEvent(new CustomEvent('absu:page-realtime', { detail: { table: 'manual_refresh' } }));
+        }
+        await Promise.all([
+          loadManagedPages(),
+          loadPosts(),
+          activeIdentityRef.current.type === 'page'
+            ? loadActivePageNotifications(activeIdentityRef.current.pageId)
+            : Promise.resolve(),
+        ]);
+        return { success: true, message: 'Pages updated' };
       } else {
         await Promise.all([loadPosts(), loadNotifications()]);
         return { success: true, message: 'Data refreshed' };
@@ -1840,9 +2299,16 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       isRefreshingScreenRef.current = false;
       setIsRefreshingScreen(false);
     }
-  }, [loadPosts, loadUsersAndFriends, loadConversations, loadNotifications]);
+  }, [
+    loadPosts,
+    loadUsersAndFriends,
+    loadConversations,
+    loadNotifications,
+    loadManagedPages,
+    loadActivePageNotifications,
+  ]);
 
-  // Post Actions (Connected to Cloudinary `absu-connect/posts` & Real Supabase Backend)
+  // Post Actions (Connected to Cloudinary `absu-connect/posts` & `absu-connect/pages/<pageId>/posts` + Real Supabase Backend)
   const createPost = async (
     content: string,
     category: PostCategory,
@@ -1853,6 +2319,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       onPercent?: (percent: number) => void;
       onError?: (error: string) => void;
       signal?: AbortSignal;
+      pageId?: string;
     }
   ): Promise<boolean> => {
     if (!auth.user) {
@@ -1877,13 +2344,86 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       return false;
     }
 
+    const currentIdentity = activeIdentityRef.current;
+    const targetPageId = currentIdentity.type === 'page' ? currentIdentity.pageId : undefined;
+    let verifiedPageName: string | undefined;
+    let verifiedPageDefaultVisibility: 'public' | 'followers' = 'public';
+
+    if (targetPageId) {
+      const mgrCheck = await verifyUserManagesPage(targetPageId, auth.user.id);
+      if (!mgrCheck.manages || !mgrCheck.page || !mgrCheck.role) {
+        const msg =
+          mgrCheck.page && mgrCheck.page.status !== 'active'
+            ? 'This Page is disabled or pending deletion and cannot publish posts.'
+            : 'You do not have active permission to post as this Page.';
+        callbacks?.onError?.(msg);
+        addToast(msg, 'warning');
+        return false;
+      }
+
+      const caps = getPageRoleCapabilities(mgrCheck.role);
+      const pubRule = mgrCheck.page.publishing_permission || 'admins_editors';
+      const allowedByPubRule =
+        mgrCheck.role === 'owner' ||
+        (pubRule === 'admins_only' && mgrCheck.role === 'admin') ||
+        (pubRule === 'admins_editors' && caps.canPublishPosts);
+
+      if (!caps.canPublishPosts || !allowedByPubRule) {
+        const msg =
+          pubRule === 'owner_only'
+            ? 'Only the Page Owner can publish posts according to this Page’s Content settings.'
+            : pubRule === 'admins_only'
+            ? 'Only Owners and Admins can publish posts for this Page.'
+            : 'Your Moderator role can moderate posts and comments, but cannot publish new posts.';
+        callbacks?.onError?.(msg);
+        addToast(msg, 'warning');
+        return false;
+      }
+
+      const blockedWord = containsHiddenKeyword(content, mgrCheck.page.hidden_words);
+      if (blockedWord) {
+        const msg = `Post contains blocked keyword "${blockedWord}" configured in Page moderation settings.`;
+        callbacks?.onError?.(msg);
+        addToast(msg, 'warning');
+        return false;
+      }
+
+      verifiedPageName = mgrCheck.page.name;
+      verifiedPageDefaultVisibility =
+        mgrCheck.page.default_post_visibility === 'followers' ? 'followers' : 'public';
+    }
+
     const rawInputItems: Array<File | string | AttachedMediaItem> = Array.isArray(mediaFileOrUrl)
       ? mediaFileOrUrl
       : mediaFileOrUrl
       ? [mediaFileOrUrl]
       : [];
 
-    if (rawInputItems.length > 4) {
+    if (targetPageId) {
+      const classified = rawInputItems.map((rawItem) => {
+        if (rawItem instanceof File) {
+          const isVid =
+            rawItem.type.startsWith('video/') ||
+            Boolean(rawItem.name.match(/\.(mp4|webm|mov|m4v|ogg)$/i));
+          return { isVideo: isVid };
+        }
+        if (rawItem && typeof rawItem === 'object') {
+          const isVid =
+            rawItem.type === 'video' ||
+            Boolean(rawItem.file?.type?.startsWith('video/')) ||
+            Boolean(rawItem.name?.match(/\.(mp4|webm|mov|m4v|ogg)$/i));
+          return { isVideo: isVid };
+        }
+        return { isVideo: false };
+      });
+      const pageLimitCheck = validatePagePostAttachments(classified);
+      if (!pageLimitCheck.valid) {
+        const msg = pageLimitCheck.error || 'Invalid Page post attachments.';
+        callbacks?.onError?.(msg);
+        addToast(msg, 'warning');
+        return false;
+      }
+    } else if (rawInputItems.length > 4) {
       const msg = 'You can attach up to 4 photos or videos per post.';
       callbacks?.onError?.(msg);
       addToast(msg, 'warning');
@@ -1997,15 +2537,31 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       const label = isVideo ? 'video' : 'photo';
       callbacks?.onProgress?.(`Uploading ${label} (${i + 1}/${rawInputItems.length})...`);
 
-      const cldRes = await uploadMediaToCloudinary(fileToUpload, 'post', {
-        signal: callbacks?.signal,
-        maxBytes: 50 * 1024 * 1024,
-        onProgress: (status) => callbacks?.onProgress?.(`${status} (${i + 1}/${rawInputItems.length})`),
-        onPercent: (itemPct) => {
-          const overallPct = Math.min(95, Math.round(((i + itemPct / 100) / rawInputItems.length) * 90));
-          callbacks?.onPercent?.(overallPct);
-        },
-      });
+      // STRICT CLOUDINARY-ONLY PATH FOR PAGES (absu-connect/pages/<pageId>/posts)
+      const cldRes = targetPageId
+        ? await uploadPageMediaToCloudinary(
+            fileToUpload,
+            'page-post',
+            targetPageId,
+            {
+              signal: callbacks?.signal,
+              maxBytes: 50 * 1024 * 1024,
+              onProgress: (status) => callbacks?.onProgress?.(`${status} (${i + 1}/${rawInputItems.length})`),
+              onPercent: (itemPct) => {
+                const overallPct = Math.min(95, Math.round(((i + itemPct / 100) / rawInputItems.length) * 90));
+                callbacks?.onPercent?.(overallPct);
+              },
+            }
+          )
+        : await uploadMediaToCloudinary(fileToUpload, 'post', {
+            signal: callbacks?.signal,
+            maxBytes: 50 * 1024 * 1024,
+            onProgress: (status) => callbacks?.onProgress?.(`${status} (${i + 1}/${rawInputItems.length})`),
+            onPercent: (itemPct) => {
+              const overallPct = Math.min(95, Math.round(((i + itemPct / 100) / rawInputItems.length) * 90));
+              callbacks?.onPercent?.(overallPct);
+            },
+          });
 
       if (!cldRes.success || !cldRes.secure_url) {
         await rollbackCloudinary();
@@ -2042,9 +2598,13 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           const posterFile = new File([posterBlob], `poster_${i + 1}.jpg`, {
             type: posterBlob.type || 'image/jpeg',
           });
-          const posterCld = await uploadMediaToCloudinary(posterFile, 'post', {
-            signal: callbacks?.signal,
-          });
+          const posterCld = targetPageId
+            ? await uploadPageMediaToCloudinary(posterFile, 'page-post', targetPageId, {
+                signal: callbacks?.signal,
+              })
+            : await uploadMediaToCloudinary(posterFile, 'post', {
+                signal: callbacks?.signal,
+              });
           if (posterCld.success && posterCld.secure_url) {
             thumbnailUrl = posterCld.secure_url;
             if (posterCld.public_id) {
@@ -2094,12 +2654,21 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     callbacks?.onProgress?.('Saving post...');
     callbacks?.onPercent?.(97);
 
-    const visibility = audience === 'Friends Only' ? 'friends' : audience === 'Campus Only' ? 'campus' : 'public';
+    const visibility = targetPageId
+      ? verifiedPageDefaultVisibility
+      : audience === 'Friends Only'
+      ? 'friends'
+      : audience === 'Campus Only'
+      ? 'campus'
+      : 'public';
+
     const res = await createRealPost({
       authorId: auth.user.id,
       body: content,
       visibility,
       media: mediaList,
+      pageId: targetPageId,
+      authorAsPage: Boolean(targetPageId),
     });
 
     if (res.success && res.post) {
@@ -2110,7 +2679,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           new CustomEvent('absu:post-created', { detail: { post: res.post } })
         );
       }
-      addToast('Post published to campus feed!', 'success');
+      addToast(
+        verifiedPageName ? `Posted as ${verifiedPageName}!` : 'Post published to campus feed!',
+        'success'
+      );
       loadPosts();
       return true;
     } else {
@@ -2120,6 +2692,49 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       addToast(errMsg, 'warning');
       return false;
     }
+  };
+
+  const editPost = async (postId: string, newContent: string): Promise<boolean> => {
+    if (!auth.user) return false;
+    const res = await updateRealPost(postId, newContent);
+    if (res.success) {
+      setPosts((prev) =>
+        prev.map((p) => (p.id === postId ? { ...p, content: newContent.trim() } : p))
+      );
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(
+          new CustomEvent('absu:post-updated', { detail: { postId, content: newContent.trim() } })
+        );
+      }
+      addToast('Post updated.', 'success');
+      return true;
+    }
+    addToast(res.error || 'Could not update post.', 'warning');
+    return false;
+  };
+
+  const pinPagePost = async (pageId: string, postId: string | null): Promise<boolean> => {
+    if (!auth.user) return false;
+    const res = await pinPagePostService(pageId, postId);
+    if (res.success) {
+      setPosts((prev) =>
+        prev.map((p) => {
+          if (p.pageId === pageId) {
+            return { ...p, isPinned: postId ? p.id === postId : false };
+          }
+          return p;
+        })
+      );
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(
+          new CustomEvent('absu:page-realtime', { detail: { table: 'pin_post', pageId, postId } })
+        );
+      }
+      addToast(postId ? 'Post pinned to Page top.' : 'Post unpinned.', 'info');
+      return true;
+    }
+    addToast(res.error || 'Failed to update pinned post.', 'warning');
+    return false;
   };
 
   const toggleLike = async (postId: string) => {
@@ -2276,11 +2891,84 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       return;
     }
 
+    const cachedTargetPost = posts.find((p) => p.id === postId);
+    const targetPageIdForPost = cachedTargetPost?.pageId || null;
+
+    if (targetPageIdForPost && activeIdentity.type !== 'page') {
+      if (cachedTargetPost?.allowComments === false) {
+        addToast('Comments are turned off for this Page.', 'warning');
+        return;
+      }
+      try {
+        const { data: pgRule } = await supabase
+          .from('pages')
+          .select('allow_comments, comment_permission, follower_interaction_mode, hidden_words')
+          .eq('id', targetPageIdForPost)
+          .maybeSingle();
+
+        if (pgRule) {
+          const perm =
+            pgRule.comment_permission ||
+            (pgRule.follower_interaction_mode === 'followers_only_comments'
+              ? 'followers'
+              : pgRule.allow_comments === false
+              ? 'disabled'
+              : 'everyone');
+          if (perm === 'disabled' || pgRule.allow_comments === false) {
+            addToast('Comments are disabled for this Page.', 'warning');
+            return;
+          }
+          const matchedWord = containsHiddenKeyword(text, pgRule.hidden_words);
+          if (matchedWord) {
+            addToast(`Comment contains a keyword blocked by this Page ("${matchedWord}").`, 'warning');
+            return;
+          }
+          const [{ data: restrictedRow }, { data: followRow }] = await Promise.all([
+            supabase
+              .from('page_restricted_users')
+              .select('user_id')
+              .eq('page_id', targetPageIdForPost)
+              .eq('user_id', auth.user.id)
+              .maybeSingle(),
+            perm === 'followers'
+              ? supabase
+                  .from('page_followers')
+                  .select('user_id')
+                  .eq('page_id', targetPageIdForPost)
+                  .eq('user_id', auth.user.id)
+                  .maybeSingle()
+              : Promise.resolve({ data: { user_id: auth.user.id } }),
+          ]);
+          if (restrictedRow) {
+            addToast('You are restricted from commenting on this Page.', 'warning');
+            return;
+          }
+          if (perm === 'followers' && !followRow) {
+            addToast('Only followers can comment on posts from this Page.', 'warning');
+            return;
+          }
+        }
+      } catch {
+        // Non-blocking fallback when optional columns aren't present
+      }
+    }
+
+    const commentAsPageId = activeIdentity.type === 'page' ? activeIdentity.pageId : undefined;
+    if (commentAsPageId && activeIdentity.type === 'page') {
+      const matchedSelfWord = containsHiddenKeyword(text, activeIdentity.page.hidden_words);
+      if (matchedSelfWord) {
+        addToast(`Comment contains a blocked keyword ("${matchedSelfWord}").`, 'warning');
+        return;
+      }
+    }
+
     const res = await createRealComment({
       postId,
       authorId: auth.user.id,
       body: text,
       parentId,
+      authorAsPage: Boolean(commentAsPageId),
+      authorPageId: commentAsPageId,
     });
 
     if (res.success && res.comment) {
@@ -2804,9 +3492,37 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     addToast('All notifications marked as read', 'info');
   };
 
+  const markPageNotificationAsRead = useCallback(async (id: string) => {
+    setActivePageNotifications((prev) =>
+      prev.map((n) => (n.id === id ? { ...n, isRead: true } : n))
+    );
+    await markRealNotificationAsRead(id);
+    loadManagedPages();
+  }, [loadManagedPages]);
+
+  const markAllPageNotificationsRead = useCallback(async () => {
+    if (!auth.user || activeIdentityRef.current.type !== 'page') return;
+    const pid = activeIdentityRef.current.pageId;
+    setActivePageNotifications((prev) => prev.map((n) => ({ ...n, isRead: true })));
+    await markAllPageNotificationsReadService(pid, auth.user.id);
+    addToast('Page notifications marked as read', 'info');
+    loadManagedPages();
+  }, [auth.user, addToast, loadManagedPages]);
+
   // Derived values
   const unreadNotificationsCount = calculateUnreadCount(notifications);
   const unreadMessagesCount = conversations.reduce((acc, c) => acc + c.unreadCount, 0);
+  const activeManagedEntry =
+    activeIdentity.type === 'page'
+      ? managedPages.find((e) => e.page.id === activeIdentity.pageId)
+      : undefined;
+  const activePageInboxUnreadCount = activeManagedEntry?.unreadInboxCount ?? 0;
+  const activePageNotifsUnreadCount =
+    activeIdentity.type === 'page'
+      ? activePageNotifications.length > 0
+        ? activePageNotifications.filter((n) => !n.isRead).length
+        : activeManagedEntry?.unreadNotificationsCount ?? 0
+      : 0;
 
   const selectedUser = selectedUserId
     ? (users.find((u) => u.id === selectedUserId) ||
@@ -2921,6 +3637,25 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         setActiveTab,
         navigateTo,
         goBack,
+        activeIdentity,
+        managedPages,
+        loadingManagedPages,
+        refreshManagedPages: loadManagedPages,
+        switchIdentity,
+        selectedPageId,
+        selectedPageTab,
+        setSelectedPageTab,
+        selectedPageInboxConvId,
+        setSelectedPageInboxConvId,
+        activePageNotifications,
+        loadingPageNotifications,
+        refreshPageNotifications: loadActivePageNotifications,
+        markPageNotificationAsRead,
+        markAllPageNotificationsRead,
+        activePageInboxUnreadCount,
+        activePageNotifsUnreadCount,
+        createPageModalOpen,
+        setCreatePageModalOpen,
         currentUser,
         updateCurrentUser,
         selectedUserId,
@@ -2940,6 +3675,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         feedFilter,
         setFeedFilter,
         createPost,
+        editPost,
+        pinPagePost,
         toggleLike,
         toggleSave,
         addComment,

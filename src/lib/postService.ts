@@ -12,17 +12,30 @@ import {
   extractCloudinaryPublicId,
   type DeleteCloudinaryAssetInput,
 } from './cloudinaryService.ts';
+import { resolvePageAvatarUrl } from './pageUtils.ts';
+import { formatPageCategoryLabel } from '../types/pages.ts';
 
 export interface SupabasePostRow {
   id: string;
-  author_id: string;
+  author_id: string | null;
   page_id?: string | null;
+  author_page_id?: string | null;
+  author_as_page?: boolean;
+  is_pinned?: boolean;
+  pinned_at?: string | null;
   page?: {
     id: string;
     slug: string;
     name: string;
+    category?: string;
     description?: string;
     avatar_url?: string;
+    avatar_path?: string;
+    avatar_asset_id?: string;
+    is_verified?: boolean;
+    status?: 'active' | 'disabled' | 'deleted';
+    allow_comments?: boolean;
+    allow_messages?: boolean;
   } | null;
   body: string;
   visibility: string;
@@ -57,7 +70,6 @@ export interface SupabasePostRow {
   comments?: Array<{
     id: string;
   }>;
-  is_pinned?: boolean;
   community_id?: string;
   community?: {
     id: string;
@@ -87,8 +99,11 @@ export function formatTimeAgo(isoString: string): string {
   }
 }
 
+const MR_ANON_ID = '0c3240e3-ae39-461d-bd7a-4963859b9bc7';
+const MR_ANON_DUMMY_ID = 'b4f38505-fce6-44be-8727-8ebf04eb2ceb';
+
 /**
- * Maps Supabase post row + author profile + reactions to frontend Post model
+ * Maps Supabase post row + author profile + page + reactions to frontend Post model
  */
 export function mapSupabasePostToFrontend(
   row: SupabasePostRow,
@@ -97,26 +112,39 @@ export function mapSupabasePostToFrontend(
   friendIds?: Set<string>
 ): Post {
   let author: User;
-  const isPagePost = Boolean(row.page_id);
+  const isLegacyMrAnonDummy = row.author_id === MR_ANON_DUMMY_ID;
+  const resolvedPageId =
+    row.page_id || row.author_page_id || row.page?.id || (isLegacyMrAnonDummy ? MR_ANON_ID : undefined);
+  const isPagePost = Boolean(resolvedPageId || row.author_as_page);
+  const isMrAnon =
+    resolvedPageId === MR_ANON_ID || row.page?.slug === 'mr-anonymous' || isLegacyMrAnonDummy;
 
-  if (row.page_id) {
-    const pageName = row.page?.name || 'Mr Anonymous';
-    const pageSlug = row.page?.slug || 'mr-anonymous';
-    const pageAvatar =
-      row.page?.avatar_url ||
-      'https://aqzolewmhpmrcvkrvchn.supabase.co/storage/v1/object/public/profile-avatars/b4f38505-fce6-44be-8727-8ebf04eb2ceb/1793258674588_ysurzh_avatar.jpg';
+  if (isPagePost) {
+    const pageName =
+      row.page?.name || (isMrAnon ? 'Mr Anonymous' : 'ABSU Page');
+    const pageSlug =
+      row.page?.slug || (isMrAnon ? 'mr-anonymous' : resolvedPageId || 'page');
+    const pageAvatar = (row.page ? resolvePageAvatarUrl(row.page) : null) || '';
+    const formattedCategory = row.page?.category
+      ? formatPageCategoryLabel(row.page.category)
+      : isMrAnon
+      ? 'Official Campus Page'
+      : 'Page';
 
     author = {
-      id: row.page?.id || row.page_id,
+      id: row.page?.id || resolvedPageId || 'page',
       name: pageName,
       avatar: pageAvatar,
       handle: `@${pageSlug}`,
-      department: 'Official Campus Page',
+      department: formattedCategory,
       faculty: 'Abia State University',
-      level: 'Community',
-      campus: 'ABSU Campus',
-      bio: row.page?.description || 'Moderated ABSU anonymous confessions, experiences & campus gist.',
-      interests: ['#Anonymous', '#Confessions', '#Gist'],
+      level: row.page?.is_verified ? 'Verified Page' : 'Page',
+      campus: 'Uturu Campus',
+      bio:
+        row.page?.description ||
+        (isMrAnon ? 'Moderated ABSU anonymous confessions, experiences & campus gist.' : ''),
+      interests: [],
+      isVerified: Boolean(row.page?.is_verified),
       relationshipState: 'none' as const,
     };
   } else if (row.author) {
@@ -128,16 +156,17 @@ export function mapSupabasePostToFrontend(
         : 'none';
     author = mapProfileRowToUser(row.author, null, relState);
   } else {
+    const fallbackId = row.author_id || 'student';
     const relState: User['relationshipState'] =
-      row.author_id === currentUserId
+      fallbackId === currentUserId
         ? 'self'
-        : friendIds?.has(row.author_id)
+        : friendIds?.has(fallbackId)
         ? 'friends'
         : 'none';
     author = {
-      id: row.author_id,
+      id: fallbackId,
       name: 'ABSU Student',
-      avatar: `https://api.dicebear.com/7.x/initials/svg?seed=${row.author_id}&backgroundColor=6d45d9&textColor=ffffff`,
+      avatar: `https://api.dicebear.com/7.x/initials/svg?seed=${fallbackId}&backgroundColor=6d45d9&textColor=ffffff`,
       handle: '@student',
       department: 'Student',
       faculty: 'Abia State University',
@@ -253,14 +282,23 @@ export function mapSupabasePostToFrontend(
     categoryHashtag,
     audience,
     createdAt: formatTimeAgo(row.created_at),
+    pinnedAt: row.pinned_at || null,
     likesCount: reactions.length,
     isLiked: isLikedByMe,
     isSaved: Boolean(savedPostIds?.has(row.id)),
     commentsCount: Array.isArray(row.comments) ? row.comments.length : 0,
     comments: [],
     isPinned: Boolean(row.is_pinned),
-    pageId: row.page_id || undefined,
+    pageId: resolvedPageId,
+    authorPageId: row.author_page_id || resolvedPageId,
+    authorAsPage: Boolean(row.author_as_page || resolvedPageId),
     isPagePost,
+    pageIsVerified: Boolean(row.page?.is_verified),
+    pageSlug: row.page?.slug,
+    pageCategory: row.page?.category ? formatPageCategoryLabel(row.page.category) : undefined,
+    pageStatus: row.page?.status,
+    allowComments: row.page?.allow_comments !== false,
+    allowMessages: row.page?.allow_messages !== false,
     communityId,
     communityName,
     communitySlug,
@@ -472,7 +510,7 @@ export async function getDirectSafetyContext(currentUserId?: string): Promise<{
 const CLIENT_RICH_SELECT = `
   *,
   author:profiles!posts_author_id_fkey(*),
-  page:pages(*),
+  page:pages!posts_page_id_fkey(*),
   community:communities(*),
   post_media(*),
   post_reactions(*),
@@ -491,10 +529,18 @@ export async function hydratePostRowsFromSupabase(rows: SupabasePostRow[]): Prom
   if (rows.length === 0) return rows;
 
   const missingAuthorIds = Array.from(
-    new Set(rows.filter((r) => !r.page_id && !r.author && r.author_id).map((r) => r.author_id))
+    new Set(
+      rows
+        .filter((r) => !r.page_id && !r.author_page_id && !r.author && r.author_id)
+        .map((r) => r.author_id as string)
+    )
   );
   const missingPageIds = Array.from(
-    new Set(rows.filter((r) => r.page_id && !r.page).map((r) => r.page_id as string))
+    new Set(
+      rows
+        .filter((r) => (r.page_id || r.author_page_id) && !r.page)
+        .map((r) => (r.page_id || r.author_page_id) as string)
+    )
   );
   const missingCommunityIds = Array.from(
     new Set(rows.filter((r) => r.community_id && !r.community).map((r) => r.community_id as string))
@@ -509,7 +555,11 @@ export async function hydratePostRowsFromSupabase(rows: SupabasePostRow[]): Prom
         ? supabase.from('profiles').select('*').in('id', missingAuthorIds)
         : Promise.resolve({ data: null }),
       missingPageIds.length > 0
-        ? supabase.from('pages').select('id, slug, name, description, avatar_url').in('id', missingPageIds)
+        ? supabase
+            .from('pages')
+            .select('id, slug, name, category, description, avatar_url, is_verified, status, allow_comments, allow_messages')
+            .in('id', missingPageIds)
+            .then((r) => (r.error ? { data: null } : r))
         : Promise.resolve({ data: null }),
       missingCommunityIds.length > 0
         ? supabase.from('communities').select('id, name, slug, image_url').in('id', missingCommunityIds)
@@ -555,15 +605,18 @@ export async function hydratePostRowsFromSupabase(rows: SupabasePostRow[]): Prom
       commentsByPost.set(c.post_id, list);
     }
 
-    return rows.map((row) => ({
-      ...row,
-      author: row.author || (!row.page_id ? profileMap.get(row.author_id) : undefined),
-      page: row.page || (row.page_id ? pageMap.get(row.page_id) : undefined),
-      community: row.community || (row.community_id ? communityMap.get(row.community_id) : undefined),
-      post_media: Array.isArray(row.post_media) ? row.post_media : mediaByPost.get(row.id) || [],
-      post_reactions: Array.isArray(row.post_reactions) ? row.post_reactions : reactionsByPost.get(row.id) || [],
-      comments: Array.isArray(row.comments) ? row.comments : commentsByPost.get(row.id) || [],
-    }));
+    return rows.map((row) => {
+      const resolvedPageId = row.page_id || row.author_page_id;
+      return {
+        ...row,
+        author: row.author || (!resolvedPageId && row.author_id ? profileMap.get(row.author_id) : undefined),
+        page: row.page || (resolvedPageId ? pageMap.get(resolvedPageId) : undefined),
+        community: row.community || (row.community_id ? communityMap.get(row.community_id) : undefined),
+        post_media: Array.isArray(row.post_media) ? row.post_media : mediaByPost.get(row.id) || [],
+        post_reactions: Array.isArray(row.post_reactions) ? row.post_reactions : reactionsByPost.get(row.id) || [],
+        comments: Array.isArray(row.comments) ? row.comments : commentsByPost.get(row.id) || [],
+      };
+    });
   } catch {
     return rows;
   }
@@ -690,7 +743,7 @@ export async function fetchSavedPostsWithStatus(
     const savedSet = new Set<string>(postIds);
     const byId = new Map<string, Post>();
     for (const row of postRows) {
-      if (row.visibility !== 'hidden' && (row.page_id || !safetyCtx.blockedIds.has(row.author_id))) {
+      if (row.visibility !== 'hidden' && (row.page_id || !row.author_id || !safetyCtx.blockedIds.has(row.author_id))) {
         byId.set(row.id, mapSupabasePostToFrontend(row, userId, savedSet, safetyCtx.friendIds));
       }
     }
@@ -750,7 +803,7 @@ export async function fetchCommunityPostsFromSupabase(
         (r) =>
           r.visibility !== 'hidden' &&
           !moderatedSet.has(r.id) &&
-          (r.page_id || !safetyCtx.blockedIds.has(r.author_id))
+          (r.page_id || !r.author_id || !safetyCtx.blockedIds.has(r.author_id))
       )
       .sort((a, b) => Number(Boolean(b.is_pinned)) - Number(Boolean(a.is_pinned)))
       .map((row) => mapSupabasePostToFrontend(row, currentUserId, savedSet, safetyCtx.friendIds));
@@ -822,7 +875,9 @@ export async function fetchFeedPostsPage(
       (r) =>
         r.visibility !== 'hidden' &&
         !moderatedSet.has(r.id) &&
-        (r.page_id || !safetyCtx.blockedIds.has(r.author_id))
+        (!r.page || r.page.status === 'active') &&
+        (Boolean(r.page_id || r.author_page_id) ||
+          (r.author_id ? !safetyCtx.blockedIds.has(r.author_id) : true))
     );
     const hasMore = postRows.length >= limit;
     const nextCursor = hasMore ? postRows[postRows.length - 1]?.created_at || null : null;
@@ -946,7 +1001,10 @@ export async function fetchSinglePostById(
     if (row.visibility === 'hidden' || moderatedSet.has(row.id)) {
       return { post: null, status: 'not_found', error: 'This post is no longer available.' };
     }
-    if (!row.page_id && safetyCtx.blockedIds.has(row.author_id)) {
+    if (row.page && row.page.status && row.page.status !== 'active') {
+      return { post: null, status: 'not_found', error: 'This Page is currently unavailable.' };
+    }
+    if (!row.page_id && !row.author_page_id && row.author_id && safetyCtx.blockedIds.has(row.author_id)) {
       return {
         post: null,
         status: 'restricted',
@@ -1011,7 +1069,7 @@ export async function fetchUserPosts(targetUserId: string, currentUserId?: strin
       (r) =>
         r.visibility !== 'hidden' &&
         !moderatedSet.has(r.id) &&
-        !safetyCtx.blockedIds.has(r.author_id)
+        (!r.author_id || !safetyCtx.blockedIds.has(r.author_id))
     );
     return visibleRows.map((row) =>
       mapSupabasePostToFrontend(row, currentUserId, savedSet, safetyCtx.friendIds)
@@ -1093,7 +1151,7 @@ async function cleanupUploadedPostMedia(mediaList: PostMediaAttachment[]): Promi
 }
 
 /**
- * Create a real post in Supabase with optional multiple media items (Cloudinary MPV2 + Supabase Storage compatibility).
+ * Create a real post in Supabase (Personal Profile OR Page identity) with optional multiple media items.
  * Cleans up orphaned files and posts on any failure.
  */
 export async function createRealPost(params: {
@@ -1103,6 +1161,8 @@ export async function createRealPost(params: {
   media?: PostMediaAttachment | PostMediaAttachment[];
   communityId?: string;
   categoryHashtag?: '#Event' | '#CampusUpdates' | '#GeneralPost';
+  pageId?: string;
+  authorAsPage?: boolean;
 }): Promise<{ success: boolean; post?: Post; error?: string }> {
   const mediaList: PostMediaAttachment[] = Array.isArray(params.media)
     ? params.media
@@ -1111,14 +1171,27 @@ export async function createRealPost(params: {
     : [];
 
   try {
-    const postPayload: Record<string, any> = {
-      author_id: params.authorId,
-      body: params.body.trim(),
-      visibility: params.visibility || 'public',
-      created_at: new Date().toISOString(),
-      updated_at: new Date().toISOString(),
-    };
-    if (params.communityId) {
+    const isPagePost = Boolean(params.pageId || params.authorAsPage);
+    const nowIso = new Date().toISOString();
+    const postPayload: Record<string, any> = isPagePost
+      ? {
+          author_id: null,
+          page_id: params.pageId,
+          author_as_page: true,
+          author_page_id: params.pageId,
+          body: params.body.trim(),
+          visibility: 'public',
+          created_at: nowIso,
+          updated_at: nowIso,
+        }
+      : {
+          author_id: params.authorId,
+          body: params.body.trim(),
+          visibility: params.visibility || 'public',
+          created_at: nowIso,
+          updated_at: nowIso,
+        };
+    if (params.communityId && !isPagePost) {
       postPayload.community_id = params.communityId;
     }
 
@@ -1128,6 +1201,7 @@ export async function createRealPost(params: {
       .select(`
         *,
         author:profiles!posts_author_id_fkey(*),
+        page:pages!posts_page_id_fkey(*),
         community:communities(*)
       `)
       .single();
@@ -1139,7 +1213,6 @@ export async function createRealPost(params: {
     }
 
     if (mediaList.length > 0) {
-      const nowIso = new Date().toISOString();
 
       const buildMediaRow = (m: PostMediaAttachment, idx: number, includeExtended: boolean) => {
         const mediaKind: 'image' | 'video' =
@@ -1262,15 +1335,55 @@ export async function createRealPost(params: {
   }
 }
 
+export async function updateRealPost(
+  postId: string,
+  body: string
+): Promise<{ success: boolean; error?: string }> {
+  const trimmed = body.trim();
+  if (!trimmed) return { success: false, error: 'Post caption cannot be empty.' };
+  try {
+    const { error } = await supabase
+      .from('posts')
+      .update({ body: trimmed, updated_at: new Date().toISOString() })
+      .eq('id', postId);
+    if (error) return { success: false, error: error.message };
+    return { success: true };
+  } catch (err: unknown) {
+    return { success: false, error: err instanceof Error ? err.message : 'Failed to update post.' };
+  }
+}
+
 /**
- * Delete a post from Supabase and remove associated Cloudinary and/or Storage media
+ * Delete a personal OR Page post from Supabase and remove associated Cloudinary and/or Storage media
  */
 export async function deleteRealPost(
   postId: string,
   userId: string
 ): Promise<{ success: boolean; error?: string }> {
   try {
-    // 1. Verify ownership and fetch attached media before DB delete
+    // 0. Check whether this is a personal post or Page post
+    const { data: postRow } = await supabase
+      .from('posts')
+      .select('id, author_id, page_id, author_page_id')
+      .eq('id', postId)
+      .maybeSingle();
+
+    const postPageId = postRow?.page_id || postRow?.author_page_id || null;
+    if (postPageId) {
+      const { data: mgrRow } = await supabase
+        .from('page_managers')
+        .select('role')
+        .eq('page_id', postPageId)
+        .eq('user_id', userId)
+        .maybeSingle();
+      if (!mgrRow) {
+        return { success: false, error: 'Only Page Owners or Admins can delete Page posts.' };
+      }
+    } else if (postRow?.author_id && postRow.author_id !== userId) {
+      return { success: false, error: 'You can only delete your own posts.' };
+    }
+
+    // 1. Fetch attached media before DB delete
     let mediaRows: Array<Record<string, any>> | null = null;
     const { data: extRows, error: extErr } = await supabase
       .from('post_media')
@@ -1328,11 +1441,12 @@ export async function deleteRealPost(
       }
     }
 
-    // 3. Delete post row (cascades or deletes post_media/reactions)
-    const { error } = await supabase
-      .from('posts')
-      .delete()
-      .match({ id: postId, author_id: userId });
+    // 3. Delete post row cleanly (by id after ownership/manager check so author_id = null Page posts work!)
+    const deleteQuery = postPageId
+      ? supabase.from('posts').delete().eq('id', postId)
+      : supabase.from('posts').delete().match({ id: postId, author_id: userId });
+
+    const { error } = await deleteQuery;
 
     if (error) {
       console.warn('Supabase deletePost error:', error.message);
@@ -1447,42 +1561,68 @@ export async function fetchPostComments(
     if (rows.length === 0) return [];
 
     const commentIds = rows.map((r: any) => r.id);
+    const authorPageIds = Array.from(
+      new Set(rows.filter((r: any) => r.author_as_page && r.author_page_id).map((r: any) => r.author_page_id))
+    );
     const likesCountMap = new Map<string, number>();
     const likedByMeSet = new Set<string>();
+    const pageMap = new Map<string, any>();
 
     try {
-      const { data: reactionsData, error: reactionsErr } = await supabase
-        .from('comment_reactions')
-        .select('comment_id, user_id')
-        .in('comment_id', commentIds);
+      const [reactionsRes, pagesRes] = await Promise.all([
+        supabase.from('comment_reactions').select('comment_id, user_id').in('comment_id', commentIds),
+        authorPageIds.length > 0
+          ? supabase
+              .from('pages')
+              .select('id, name, slug, avatar_url, category, is_verified')
+              .in('id', authorPageIds)
+          : Promise.resolve({ data: null }),
+      ]);
 
-      if (!reactionsErr && reactionsData) {
-        for (const r of reactionsData as Array<{ comment_id: string; user_id: string }>) {
+      if (!reactionsRes.error && reactionsRes.data) {
+        for (const r of reactionsRes.data as Array<{ comment_id: string; user_id: string }>) {
           likesCountMap.set(r.comment_id, (likesCountMap.get(r.comment_id) || 0) + 1);
           if (currentUserId && r.user_id === currentUserId) {
             likedByMeSet.add(r.comment_id);
           }
         }
       }
+      if (pagesRes.data) {
+        for (const p of pagesRes.data as any[]) pageMap.set(p.id, p);
+      }
     } catch {
-      // Safe fallback if comment_reactions table is not yet migrated
+      // Safe fallback
     }
 
     const flatComments: Comment[] = rows.map((row: any) => {
-      const author = row.author
-        ? mapProfileRowToUser(row.author, null, row.author.id === currentUserId ? 'self' : 'none')
+      const pageAuthor = row.author_as_page && row.author_page_id ? pageMap.get(row.author_page_id) : null;
+      const author = pageAuthor
+        ? {
+            id: pageAuthor.id,
+            name: pageAuthor.name,
+            avatar: resolvePageAvatarUrl(pageAuthor) || '',
+            department: pageAuthor.category ? formatPageCategoryLabel(pageAuthor.category) : 'Page',
+            level: pageAuthor.is_verified ? 'Verified Page' : 'Page',
+            isVerified: Boolean(pageAuthor.is_verified),
+          }
+        : row.author
+        ? (() => {
+            const u = mapProfileRowToUser(row.author, null, row.author.id === currentUserId ? 'self' : 'none');
+            return {
+              id: u.id,
+              name: u.name,
+              avatar: u.avatar,
+              department: u.department,
+              level: u.level,
+              isVerified: u.isVerified,
+            };
+          })()
         : {
-            id: row.author_id,
+            id: row.author_id || row.author_page_id || 'student',
             name: 'ABSU Student',
-            avatar: `https://api.dicebear.com/7.x/initials/svg?seed=${row.author_id}&backgroundColor=6d45d9&textColor=ffffff`,
-            handle: '@student',
+            avatar: `https://api.dicebear.com/7.x/initials/svg?seed=${row.author_id || 'ABSU'}&backgroundColor=6d45d9&textColor=ffffff`,
             department: 'Student',
-            faculty: 'Abia State University',
             level: 'Undergraduate',
-            campus: 'Uturu (Main Campus)',
-            bio: '',
-            interests: [],
-            relationshipState: 'none' as const,
           };
 
       const isEdited = Boolean(
@@ -1495,13 +1635,9 @@ export async function fetchPostComments(
         id: row.id,
         postId: row.post_id,
         parentId: row.parent_comment_id || null,
-        author: {
-          id: author.id,
-          name: author.name,
-          avatar: author.avatar,
-          department: author.department,
-          level: author.level,
-        },
+        author,
+        authorAsPage: Boolean(row.author_as_page),
+        authorPageId: row.author_page_id || undefined,
         content: row.body || '',
         createdAt: formatTimeAgo(row.created_at),
         updatedAt: row.updated_at,
@@ -1512,7 +1648,7 @@ export async function fetchPostComments(
       };
     });
 
-    // Assemble parent -> replies hierarchy cleanly (supports deep replies collapsed onto top-level root or direct parent)
+    // Assemble parent -> replies hierarchy cleanly
     const commentById = new Map<string, Comment>();
     for (const c of flatComments) {
       commentById.set(c.id, c);
@@ -1537,13 +1673,15 @@ export async function fetchPostComments(
 }
 
 /**
- * Add a top-level comment or threaded reply to a post in Supabase comments table
+ * Add a top-level comment or threaded reply (Personal or Page identity) in Supabase comments table
  */
 export async function createRealComment(params: {
   postId: string;
   authorId: string;
   body: string;
   parentId?: string | null;
+  authorAsPage?: boolean;
+  authorPageId?: string | null;
 }): Promise<{ success: boolean; comment?: Comment; error?: string }> {
   try {
     const nowIso = new Date().toISOString();
@@ -1557,6 +1695,10 @@ export async function createRealComment(params: {
 
     if (params.parentId) {
       payload.parent_comment_id = params.parentId;
+    }
+    if (params.authorAsPage && params.authorPageId) {
+      payload.author_as_page = true;
+      payload.author_page_id = params.authorPageId;
     }
 
     const { data, error } = await supabase
@@ -1572,33 +1714,51 @@ export async function createRealComment(params: {
       return { success: false, error: error?.message || 'Failed to post comment.' };
     }
 
-    const author = data.author
-      ? mapProfileRowToUser(data.author, null, 'self')
+    let commentAuthor = data.author
+      ? (() => {
+          const u = mapProfileRowToUser(data.author, null, 'self');
+          return {
+            id: u.id,
+            name: u.name,
+            avatar: u.avatar,
+            department: u.department,
+            level: u.level,
+            isVerified: u.isVerified,
+          };
+        })()
       : {
           id: params.authorId,
           name: 'You',
           avatar: '',
-          handle: '@you',
           department: 'Student',
-          faculty: 'Abia State University',
           level: 'Undergraduate',
-          campus: 'Uturu (Main Campus)',
-          bio: '',
-          interests: [],
-          relationshipState: 'self' as const,
         };
+
+    if (params.authorAsPage && params.authorPageId) {
+      const { data: pg } = await supabase
+        .from('pages')
+        .select('id, name, avatar_url, category, is_verified')
+        .eq('id', params.authorPageId)
+        .maybeSingle();
+      if (pg) {
+        commentAuthor = {
+          id: pg.id,
+          name: pg.name,
+          avatar: resolvePageAvatarUrl(pg) || '',
+          department: pg.category ? formatPageCategoryLabel(pg.category) : 'Page',
+          level: pg.is_verified ? 'Verified Page' : 'Page',
+          isVerified: Boolean(pg.is_verified),
+        };
+      }
+    }
 
     const comment: Comment = {
       id: data.id,
       postId: data.post_id,
       parentId: data.parent_comment_id || null,
-      author: {
-        id: author.id,
-        name: author.name,
-        avatar: author.avatar,
-        department: author.department,
-        level: author.level,
-      },
+      author: commentAuthor,
+      authorAsPage: Boolean(data.author_as_page),
+      authorPageId: data.author_page_id || undefined,
       content: data.body,
       createdAt: 'Just now',
       updatedAt: data.updated_at,

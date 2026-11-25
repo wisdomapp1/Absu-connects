@@ -1,6 +1,7 @@
 import React, { useState, useRef, useEffect, useCallback, useMemo } from 'react';
 import { useApp } from '../../context/AppContext.tsx';
 import { Avatar } from '../common/Avatar.tsx';
+import { VerifiedBadge } from '../common/VerifiedBadge.tsx';
 import { useChat } from '../../hooks/useChat.ts';
 import type { Message } from '../../types/index.ts';
 import {
@@ -256,7 +257,9 @@ export const ConversationView: React.FC = () => {
   }
 
   const { participant } = selectedConversation;
-  const isOnline = isUserOnline(participant.id);
+  const isPageChat = Boolean(selectedConversation.isPageChat && selectedConversation.pageId);
+  const allowPageMessages = !isPageChat || selectedConversation.allowMessages !== false;
+  const isOnline = !isPageChat && isUserOnline(participant.id);
 
   const processSelectedFiles = async (files: File[]) => {
     if (files.length === 0) return;
@@ -636,9 +639,13 @@ export const ConversationView: React.FC = () => {
             <ArrowLeft className="w-5 h-5" />
           </button>
 
-          {/* Tapping header opens Contact Info screen */}
+          {/* Tapping header opens Page profile on Page chats, or Contact Info screen */}
           <button
-            onClick={() => navigateTo('contact-info')}
+            onClick={() =>
+              isPageChat && selectedConversation.pageId
+                ? navigateTo('page-profile', { pageId: selectedConversation.pageId })
+                : navigateTo('contact-info')
+            }
             className="flex items-center gap-2.5 min-w-0 text-left group"
           >
             <Avatar
@@ -648,14 +655,19 @@ export const ConversationView: React.FC = () => {
               showOnline={isOnline}
             />
             <div className="min-w-0">
-              <h2 className="text-xs sm:text-sm font-bold text-[var(--color-text-primary)] group-hover:text-[var(--color-primary)] transition-colors truncate">
-                {participant.name}
-              </h2>
+              <div className="flex items-center gap-1.5">
+                <h2 className="text-xs sm:text-sm font-bold text-[var(--color-text-primary)] group-hover:text-[var(--color-primary)] transition-colors truncate">
+                  {participant.name}
+                </h2>
+                {isPageChat && selectedConversation.pageIsVerified && <VerifiedBadge size={14} />}
+              </div>
               <p className="text-[10px] text-[var(--color-text-secondary)] truncate">
                 {isPartnerTyping ? (
                   <span className="text-[var(--color-primary)] font-bold animate-pulse">
                     typing...
                   </span>
+                ) : isPageChat ? (
+                  <span>Page · Direct Messages</span>
                 ) : (
                   <>
                     {participant.department} · {isOnline ? 'Active now' : 'Offline'}
@@ -666,51 +678,59 @@ export const ConversationView: React.FC = () => {
           </button>
         </div>
 
-        {/* Action icons: Voice Call, Video Call, Contact Info */}
+        {/* Action icons: Voice Call, Video Call (hidden on Page chats), Info */}
         <div className="flex items-center gap-1">
-          <button
-            onClick={() =>
-              startCall(
-                {
-                  id: participant.id,
-                  name: participant.name,
-                  avatar: participant.avatar,
-                  department: participant.department,
-                },
-                'audio'
-              )
-            }
-            className="w-9 h-9 rounded-full flex items-center justify-center text-[var(--color-text-secondary)] hover:bg-[var(--color-primary-subtle)] hover:text-[var(--color-primary)] transition-colors"
-            aria-label="Start Voice Call"
-            title="Start Voice Call (Low Data)"
-          >
-            <Phone className="w-4.5 h-4.5" />
-          </button>
+          {!isPageChat && (
+            <>
+              <button
+                onClick={() =>
+                  startCall(
+                    {
+                      id: participant.id,
+                      name: participant.name,
+                      avatar: participant.avatar,
+                      department: participant.department,
+                    },
+                    'audio'
+                  )
+                }
+                className="w-9 h-9 rounded-full flex items-center justify-center text-[var(--color-text-secondary)] hover:bg-[var(--color-primary-subtle)] hover:text-[var(--color-primary)] transition-colors"
+                aria-label="Start Voice Call"
+                title="Start Voice Call (Low Data)"
+              >
+                <Phone className="w-4.5 h-4.5" />
+              </button>
+
+              <button
+                onClick={() =>
+                  startCall(
+                    {
+                      id: participant.id,
+                      name: participant.name,
+                      avatar: participant.avatar,
+                      department: participant.department,
+                    },
+                    'video'
+                  )
+                }
+                className="w-9 h-9 rounded-full flex items-center justify-center text-[var(--color-text-secondary)] hover:bg-[var(--color-primary-subtle)] hover:text-[var(--color-primary)] transition-colors"
+                aria-label="Start Video Call"
+                title="Start Video Call"
+              >
+                <Video className="w-4.5 h-4.5" />
+              </button>
+            </>
+          )}
 
           <button
             onClick={() =>
-              startCall(
-                {
-                  id: participant.id,
-                  name: participant.name,
-                  avatar: participant.avatar,
-                  department: participant.department,
-                },
-                'video'
-              )
+              isPageChat && selectedConversation.pageId
+                ? navigateTo('page-profile', { pageId: selectedConversation.pageId })
+                : navigateTo('contact-info')
             }
-            className="w-9 h-9 rounded-full flex items-center justify-center text-[var(--color-text-secondary)] hover:bg-[var(--color-primary-subtle)] hover:text-[var(--color-primary)] transition-colors"
-            aria-label="Start Video Call"
-            title="Start Video Call"
-          >
-            <Video className="w-4.5 h-4.5" />
-          </button>
-
-          <button
-            onClick={() => navigateTo('contact-info')}
             className="w-9 h-9 rounded-full flex items-center justify-center text-[var(--color-text-secondary)] hover:bg-[var(--color-bg-main)] hover:text-[var(--color-text-primary)] transition-colors"
-            aria-label="View Contact Info"
-            title="Contact details and options"
+            aria-label={isPageChat ? 'View Page Profile' : 'View Contact Info'}
+            title={isPageChat ? 'View Page Profile' : 'Contact details and options'}
           >
             <Info className="w-5 h-5" />
           </button>
@@ -743,7 +763,9 @@ export const ConversationView: React.FC = () => {
 
         {/* Campus Connection Notice */}
         <div className="p-2.5 rounded-xl bg-[var(--color-primary-subtle)] text-[var(--color-primary)] text-center text-[11px] font-medium mx-auto max-w-sm">
-          You are chatting with {participant.name} ({participant.level}, {participant.department}).
+          {isPageChat
+            ? `You are messaging ${participant.name}. Replies come directly from the Page team.`
+            : `You are chatting with ${participant.name} (${participant.level}, ${participant.department}).`}
         </div>
 
         {loadingChat && visibleMessages.length === 0 ? (
@@ -1118,7 +1140,12 @@ export const ConversationView: React.FC = () => {
         </div>
       )}
 
-      {/* 3. Composer (Pinned to Bottom) — [Games] [Sticker/Emoji | Message input | Camera/Gallery Picker] [Send / Mic] */}
+      {/* 3. Composer (Pinned to Bottom) — disabled cleanly when Page turns off messaging */}
+      {!allowPageMessages ? (
+        <div className="shrink-0 sticky bottom-0 px-4 py-3.5 border-t border-[var(--color-border)] bg-[var(--color-bg-card)] text-center text-xs text-[var(--color-text-secondary)] pb-[max(0.75rem,env(safe-area-inset-bottom,0px))]">
+          This Page is not accepting direct messages right now.
+        </div>
+      ) : (
       <form
         onSubmit={handleSend}
         className="shrink-0 sticky bottom-0 p-2.5 sm:p-3 border-t border-[var(--color-border)] bg-[var(--color-bg-card)] flex items-center gap-2 z-30 pb-[max(0.75rem,env(safe-area-inset-bottom,0px))]"
@@ -1223,6 +1250,7 @@ export const ConversationView: React.FC = () => {
           </button>
         ) : null}
       </form>
+      )}
 
       {/* Campus Games Modal */}
       {gamesModalOpen && (

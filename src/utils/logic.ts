@@ -77,10 +77,56 @@ export function searchEntities(
 }
 
 /**
- * Calculate total unread active notifications count (excludes archived >= 7 days)
+ * Calculate total unread active personal notifications count (excludes archived >= 7 days and Page-scoped notifications)
  */
 export function calculateUnreadCount(notifications: NotificationItem[]): number {
-  return notifications.filter((n) => !n.isRead && !n.isArchived).length;
+  return notifications.filter((n) => !n.isRead && !n.isArchived && !n.recipientPageId).length;
+}
+
+/**
+ * Validate Page post attachments: up to 5 images OR 1 video, never mixing images & videos.
+ */
+export function validatePagePostAttachments(
+  items: Array<{ isVideo: boolean }>
+): { valid: boolean; error?: string } {
+  if (!items || items.length === 0) return { valid: true };
+  const videoCount = items.filter((i) => i.isVideo).length;
+  const imageCount = items.filter((i) => !i.isVideo).length;
+
+  if (videoCount > 0 && imageCount > 0) {
+    return {
+      valid: false,
+      error: 'Page posts can include up to 5 photos OR 1 video — you cannot mix photos and videos in the same post.',
+    };
+  }
+  if (videoCount > 1) {
+    return {
+      valid: false,
+      error: 'Page posts support only 1 video (up to 60 seconds) per post.',
+    };
+  }
+  if (imageCount > 5) {
+    return {
+      valid: false,
+      error: 'Page posts support up to 5 photos per post.',
+    };
+  }
+  return { valid: true };
+}
+
+/**
+ * Check remaining cooldown days (out of 30) before a Page name can be changed again.
+ */
+export function getPageNameChangeRemainingDays(
+  nameChangedAt?: string | null,
+  nowMs: number = Date.now()
+): number {
+  if (!nameChangedAt) return 0;
+  const changedTs = new Date(nameChangedAt).getTime();
+  if (!Number.isFinite(changedTs)) return 0;
+  const elapsedDays = (nowMs - changedTs) / (1000 * 60 * 60 * 24);
+  if (elapsedDays >= 30) return 0;
+  return Math.max(1, Math.ceil(30 - elapsedDays));
 }
 
 /**

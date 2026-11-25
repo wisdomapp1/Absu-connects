@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 
 interface AvatarProps {
   src?: string;
@@ -24,6 +24,10 @@ export const Avatar: React.FC<AvatarProps> = ({
   showOnline = false,
 }) => {
   const [imageError, setImageError] = useState(false);
+
+  useEffect(() => {
+    setImageError(false);
+  }, [src]);
 
   // Compute initials
   const initials = name

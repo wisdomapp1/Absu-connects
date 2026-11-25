@@ -2,7 +2,7 @@ import React, { useRef, useState } from 'react';
 import { useApp } from '../../context/AppContext.tsx';
 import { Avatar } from '../common/Avatar.tsx';
 import { MediaRecoveryBanner } from '../common/MediaRecoveryBanner.tsx';
-import { Image, Video, Sparkles, EyeOff } from 'lucide-react';
+import { Image, Video, Sparkles, EyeOff, Flag } from 'lucide-react';
 import {
   safeReadAndPrepareImage,
   safeReadAndPrepareVideo,
@@ -17,11 +17,19 @@ interface PostComposerProps {
 const MAX_POST_ATTACHMENTS = 4;
 
 export const PostComposer: React.FC<PostComposerProps> = ({ onOpenAnonymous }) => {
-  const { currentUser, setCreatePostModalOpen, openCreatePostWithMedia, addToast } = useApp();
+  const {
+    currentUser,
+    activeIdentity,
+    setCreatePostModalOpen,
+    setCreatePageModalOpen,
+    openCreatePostWithMedia,
+    addToast,
+  } = useApp();
   const photoInputRef = useRef<HTMLInputElement>(null);
   const videoInputRef = useRef<HTMLInputElement>(null);
   const [mediaRecovery, setMediaRecovery] = useState<MediaRecoveryState | null>(null);
   const [lastPickerKind, setLastPickerKind] = useState<'photo' | 'video'>('photo');
+  const maxAttachments = activeIdentity.type === 'page' ? 5 : MAX_POST_ATTACHMENTS;
 
   const handleMediaSelect = async (
     e: React.ChangeEvent<HTMLInputElement>,
@@ -32,9 +40,9 @@ export const PostComposer: React.FC<PostComposerProps> = ({ onOpenAnonymous }) =
     if (rawFiles.length === 0) return;
     setLastPickerKind(kind);
 
-    const files = rawFiles.slice(0, MAX_POST_ATTACHMENTS);
-    if (rawFiles.length > MAX_POST_ATTACHMENTS) {
-      addToast(`Up to ${MAX_POST_ATTACHMENTS} photos or videos can be attached per post.`, 'info');
+    const files = rawFiles.slice(0, maxAttachments);
+    if (rawFiles.length > maxAttachments) {
+      addToast(`Up to ${maxAttachments} attachments can be attached per post.`, 'info');
     }
 
     const mediaItems: AttachedMediaItem[] = [];
@@ -143,7 +151,11 @@ export const PostComposer: React.FC<PostComposerProps> = ({ onOpenAnonymous }) =
       )}
 
       <div className="flex items-center gap-3">
-        <Avatar src={currentUser.avatar} name={currentUser.name} size="md" />
+        <Avatar
+          src={activeIdentity.type === 'page' ? activeIdentity.page.avatarUrl : currentUser.avatar}
+          name={activeIdentity.type === 'page' ? activeIdentity.page.name : currentUser.name}
+          size="md"
+        />
 
         <button
           type="button"
@@ -151,7 +163,9 @@ export const PostComposer: React.FC<PostComposerProps> = ({ onOpenAnonymous }) =
           className="flex-1 min-h-[44px] bg-[var(--color-bg-main)] hover:bg-[var(--color-primary-subtle)]/50 text-[var(--color-text-secondary)] hover:text-[var(--color-text-primary)] px-4 py-2.5 rounded-xl text-left text-xs sm:text-sm font-medium transition-colors border border-[var(--color-border)] truncate"
           aria-label="What is happening on campus?"
         >
-          What&apos;s happening on campus, {currentUser.name.split(' ')[0]}?
+          {activeIdentity.type === 'page'
+            ? `Posting as ${activeIdentity.page.name}...`
+            : `What's happening on campus, ${currentUser.name.split(' ')[0]}?`}
         </button>
       </div>
 
@@ -186,7 +200,19 @@ export const PostComposer: React.FC<PostComposerProps> = ({ onOpenAnonymous }) =
             <span className="hidden sm:inline">Update</span>
           </button>
 
-          {onOpenAnonymous && (
+          {activeIdentity.type === 'personal' && (
+            <button
+              type="button"
+              onClick={() => setCreatePageModalOpen(true)}
+              className="min-h-[44px] flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl text-[#1877F2] hover:bg-[#1877F2]/10 transition-colors whitespace-nowrap shrink-0"
+              title="Create an official ABSU Connect Page"
+            >
+              <Flag className="w-4 h-4" />
+              <span className="hidden sm:inline">Create a Page</span>
+            </button>
+          )}
+
+          {activeIdentity.type === 'personal' && onOpenAnonymous && (
             <button
               type="button"
               onClick={onOpenAnonymous}

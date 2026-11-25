@@ -9,6 +9,8 @@ import webpush from 'web-push';
 import { registerCommunityRoutes } from './serverCommunityRoutes.ts';
 import { registerEventRoutes } from './serverEventRoutes.ts';
 import { registerStoryRoutes } from './serverStoryRoutes.ts';
+import { computeAdminPagesStats } from './src/lib/pageUtils.ts';
+import { getPageCategoryFilterValues } from './src/types/pages.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -541,12 +543,13 @@ app.get('/api/pages/mr-anonymous/posts', async (req, res) => {
       .select(`
         *,
         author:profiles!posts_author_id_fkey(*),
-        page:pages(*),
+        page:pages!posts_page_id_fkey(*),
         post_media(*),
         post_reactions(*),
         comments(id)
       `)
-      .or(`page_id.eq.${MR_ANONYMOUS_PAGE_ID},author_id.eq.${MR_ANONYMOUS_DUMMY_ID}`)
+      .or(`page_id.eq.${MR_ANONYMOUS_PAGE_ID},author_page_id.eq.${MR_ANONYMOUS_PAGE_ID},author_id.eq.${MR_ANONYMOUS_DUMMY_ID}`)
+      .order('is_pinned', { ascending: false, nullsFirst: false })
       .order('created_at', { ascending: false })
       .limit(requestedLimit);
 
@@ -569,6 +572,212 @@ app.get('/api/pages/mr-anonymous/posts', async (req, res) => {
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : 'Failed to fetch page posts';
     res.status(500).json({ error: msg });
+  }
+});
+
+// 1b. Fetch active Pages directory (uses supabaseAdmin when configured to bypass restrictive table grants cleanly)
+app.get('/api/pages', async (req, res) => {
+  const sb = getAdminSupabase(req);
+  try {
+    const category = typeof req.query.category === 'string' ? req.query.category.trim() : '';
+    const search = typeof req.query.search === 'string' ? req.query.search.trim() : '';
+    const limit = Math.min(Math.max(Number(req.query.limit) || 40, 1), 100);
+
+    let q = sb
+      .from('pages')
+      .select('*')
+      .eq('status', 'active')
+      .eq('is_active', true)
+      .is('deleted_at', null);
+
+    if (category && category !== 'All') {
+      const catValues = getPageCategoryFilterValues(category);
+      if (catValues.length > 1) {
+        q = q.in('category', catValues);
+      } else {
+        q = q.eq('category', catValues[0]);
+      }
+    }
+    if (search) {
+      const clean = search.replace(/[,%()]/g, ' ').trim();
+      if (clean) {
+        q = q.or(`name.ilike.%${clean}%,slug.ilike.%${clean}%,category.ilike.%${clean}%,description.ilike.%${clean}%`);
+      }
+    }
+
+    const { data, error } = await q
+      .order('is_verified', { ascending: false })
+      .order('followers_count', { ascending: false })
+      .order('created_at', { ascending: false })
+      .limit(limit);
+
+    if (error) {
+      res.status(error.code === '42501' ? 403 : 500).json({ success: false, error: error.message, code: error.code });
+      return;
+    }
+
+    // Deduplicate rows strictly by id and slug
+    const seenIds = new Set<string>();
+    const seenSlugs = new Set<string>();
+    const uniquePages = (data || []).filter((row: any) => {
+      if (!row?.id || seenIds.has(row.id)) return false;
+      const slugKey = String(row.slug || '').trim().toLowerCase();
+      if (slugKey && seenSlugs.has(slugKey)) return false;
+      seenIds.add(row.id);
+      if (slugKey) seenSlugs.add(slugKey);
+      return true;
+    });
+
+    res.json({ success: true, pages: uniquePages });
+  } catch (err: unknown) {
+    res.status(500).json({ success: false, error: err instanceof Error ? err.message : 'Failed to load pages' });
+  }
+});
+
+// 1c. Fetch a single Page (including Mr Anonymous) with counts, follow status, and manager role
+app.get('/api/pages/:idOrSlug', async (req, res) => {
+  const idOrSlug = (req.params.idOrSlug || '').trim();
+  if (!idOrSlug) {
+    res.status(400).json({ success: false, error: 'Missing Page identifier.' });
+    return;
+  }
+
+  const sb = getAdminSupabase(req);
+  const authHeader = req.headers.authorization || '';
+  const token = authHeader.replace(/^Bearer\s+/i, '').trim();
+  let callerUserId: string | null = null;
+  let callerEmail: string | null = null;
+  if (token) {
+    try {
+      const { data: uData } = await supabaseClient.auth.getUser(token);
+      callerUserId = uData?.user?.id || null;
+      callerEmail = uData?.user?.email?.toLowerCase().trim() || null;
+    } catch {}
+  }
+
+  try {
+    const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(idOrSlug);
+    const { data: pageRow, error } = await sb
+      .from('pages')
+      .select('*')
+      .eq(isUuid ? 'id' : 'slug', idOrSlug)
+      .maybeSingle();
+
+    if (error) {
+      res.status(error.code === '42501' ? 403 : 500).json({ success: false, error: error.message, code: error.code });
+      return;
+    }
+    if (!pageRow) {
+      res.status(404).json({ success: false, reason: 'not_found', error: 'Page not found.' });
+      return;
+    }
+
+    const pid = pageRow.id;
+    const postFilter =
+      pid === MR_ANONYMOUS_PAGE_ID
+        ? `page_id.eq.${pid},author_page_id.eq.${pid},author_id.eq.${MR_ANONYMOUS_DUMMY_ID}`
+        : `page_id.eq.${pid},author_page_id.eq.${pid}`;
+
+    const [followersRes, postsRes, followRes, mgrRes, blockRes] = await Promise.all([
+      sb.from('page_followers').select('*', { count: 'exact', head: true }).eq('page_id', pid),
+      sb.from('posts').select('*', { count: 'exact', head: true }).or(postFilter),
+      callerUserId
+        ? sb.from('page_followers').select('page_id').eq('page_id', pid).eq('user_id', callerUserId).maybeSingle()
+        : Promise.resolve({ data: null }),
+      callerUserId
+        ? sb.from('page_managers').select('role').eq('page_id', pid).eq('user_id', callerUserId).maybeSingle()
+        : Promise.resolve({ data: null }),
+      callerUserId
+        ? sb.from('page_blocks').select('user_id').eq('page_id', pid).eq('user_id', callerUserId).maybeSingle()
+        : Promise.resolve({ data: null }),
+    ]);
+
+    let managerRole: 'owner' | 'admin' | 'editor' | 'moderator' | null = null;
+    const rawRole = String((mgrRes as any)?.data?.role || '').toLowerCase();
+    if (rawRole === 'owner') managerRole = 'owner';
+    else if (rawRole === 'editor') managerRole = 'editor';
+    else if (rawRole === 'moderator') managerRole = 'moderator';
+    else if (rawRole === 'admin' || rawRole === 'manager') managerRole = 'admin';
+    else if (callerUserId && pageRow.created_by === callerUserId) managerRole = 'owner';
+    else if (
+      pid === MR_ANONYMOUS_PAGE_ID &&
+      callerEmail &&
+      (MR_ANONYMOUS_MANAGER_EMAILS.includes(callerEmail) || isSuperAdminEmail(callerEmail))
+    ) {
+      managerRole = 'admin';
+    }
+
+    const isUnavailable = Boolean(pageRow.deleted_at) || pageRow.status !== 'active' || pageRow.is_active === false;
+    if (isUnavailable && !managerRole && !isSuperAdminEmail(callerEmail)) {
+      res.status(404).json({ success: false, reason: 'not_found', error: 'Page not found.' });
+      return;
+    }
+
+    res.json({
+      success: true,
+      page: pageRow,
+      followersCount: followersRes.count ?? pageRow.followers_count ?? 0,
+      postsCount: postsRes.count ?? pageRow.posts_count ?? 0,
+      isFollowing: Boolean((followRes as any)?.data),
+      isBlocked: Boolean((blockRes as any)?.data),
+      managerRole,
+    });
+  } catch (err: unknown) {
+    res.status(500).json({ success: false, error: err instanceof Error ? err.message : 'Failed to load page' });
+  }
+});
+
+// 1d. Fetch published posts for any Page (including existing pages & Mr Anonymous)
+app.get('/api/pages/:idOrSlug/posts', async (req, res) => {
+  const idOrSlug = (req.params.idOrSlug || '').trim();
+  const sb = getAdminSupabase(req);
+  try {
+    let pageId = idOrSlug;
+    const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(idOrSlug);
+    if (!isUuid) {
+      if (idOrSlug === 'mr-anonymous') {
+        pageId = MR_ANONYMOUS_PAGE_ID;
+      } else {
+        const { data: pg } = await sb.from('pages').select('id').eq('slug', idOrSlug).maybeSingle();
+        if (!pg?.id) {
+          res.status(404).json({ success: false, error: 'Page not found.' });
+          return;
+        }
+        pageId = pg.id;
+      }
+    }
+
+    const postFilter =
+      pageId === MR_ANONYMOUS_PAGE_ID
+        ? `page_id.eq.${pageId},author_page_id.eq.${pageId},author_id.eq.${MR_ANONYMOUS_DUMMY_ID}`
+        : `page_id.eq.${pageId},author_page_id.eq.${pageId}`;
+
+    const { rows, error } = await queryPostsResilient(sb, (q) =>
+      q
+        .or(postFilter)
+        .order('is_pinned', { ascending: false, nullsFirst: false })
+        .order('created_at', { ascending: false })
+        .limit(60)
+    );
+
+    if (error) {
+      res.status(500).json({ success: false, error });
+      return;
+    }
+
+    const store = readStore();
+    const moderated = store.moderatedPosts || {};
+    const posts = rows.filter((post: any) => {
+      const mod = moderated[post.id];
+      if (mod?.action === 'hide' || mod?.action === 'delete') return false;
+      if (String(post.visibility || '').toLowerCase() === 'hidden' || Boolean(post.is_hidden)) return false;
+      return true;
+    });
+
+    await resolveServerPostMediaSignedUrls(sb, posts);
+    res.json({ success: true, posts });
+  } catch (err: unknown) {
+    res.status(500).json({ success: false, error: err instanceof Error ? err.message : 'Failed to load page posts' });
   }
 });
 
@@ -1509,6 +1718,8 @@ app.post('/api/notifications/create', async (req, res) => {
       parentCommentId,
       senderName,
       url,
+      recipientPageId,
+      targetPageId,
     } = req.body;
 
     if (!recipientId || !actorId || recipientId === actorId) {
@@ -1571,6 +1782,8 @@ app.post('/api/notifications/create', async (req, res) => {
     let safePostId = isValidUuid(postId) ? postId : null;
     let safeCommentId = isValidUuid(commentId) ? commentId : null;
     let safeParentCommentId = isValidUuid(parentCommentId) ? parentCommentId : null;
+    const safeRecipientPageId = isValidUuid(recipientPageId) ? recipientPageId : null;
+    const safeTargetPageId = isValidUuid(targetPageId) ? targetPageId : null;
 
     if (
       (entityType === 'comment' || entityType === 'comment_reply' || entityType === 'comment_reaction') &&
@@ -1816,6 +2029,8 @@ app.post('/api/notifications/create', async (req, res) => {
       ...(safePostId ? { post_id: safePostId } : {}),
       ...(safeCommentId ? { comment_id: safeCommentId } : {}),
       ...(safeParentCommentId ? { parent_comment_id: safeParentCommentId } : {}),
+      ...(safeRecipientPageId ? { recipient_page_id: safeRecipientPageId } : {}),
+      ...(safeTargetPageId ? { target_page_id: safeTargetPageId } : {}),
     };
 
     let { data: insertedData, error: insErr } = await client
@@ -1925,7 +2140,7 @@ app.post('/api/notifications/create', async (req, res) => {
 // 5. Server-Authoritative Conversation-Level Message Notification
 app.post('/api/notifications/create-or-update-message', async (req, res) => {
   try {
-    const { recipientId, senderId, conversationId, senderName, messageId } = req.body;
+    const { recipientId, senderId, conversationId, senderName, messageId, recipientPageId, targetPageId, type: notifType } = req.body;
     if (!recipientId || !senderId || recipientId === senderId) {
       res.status(400).json({ success: false, error: 'Invalid recipientId or senderId' });
       return;
@@ -1940,6 +2155,9 @@ app.post('/api/notifications/create-or-update-message', async (req, res) => {
     const nowIso = new Date().toISOString();
     const safeConvId = isValidUuid(conversationId) ? conversationId : null;
     const safeMsgId = isValidUuid(messageId) ? messageId : null;
+    const safeRecipientPageId = isValidUuid(recipientPageId) ? recipientPageId : null;
+    const safeTargetPageId = isValidUuid(targetPageId) ? targetPageId : null;
+    const resolvedType = notifType === 'page_message' || safeRecipientPageId ? 'page_message' : 'message';
     const targetEntityId = safeMsgId || safeConvId;
 
     // Verify recipient profile exists
@@ -1965,19 +2183,30 @@ app.post('/api/notifications/create-or-update-message', async (req, res) => {
       if (!senderProfile) safeSenderId = null;
     }
 
-    // Check if an unread notification already exists for this conversation
-    const { data: existingList } = await client
+    // Check if an unread notification already exists for this conversation & recipient scope
+    let existingQuery = client
       .from('notifications')
       .select('id, entity_id')
       .eq('recipient_id', recipientId)
-      .eq('type', 'message')
-      .is('read_at', null)
+      .eq('type', resolvedType)
+      .is('read_at', null);
+
+    if (safeRecipientPageId) {
+      existingQuery = existingQuery.eq('recipient_page_id', safeRecipientPageId);
+    } else {
+      existingQuery = existingQuery.is('recipient_page_id', null);
+    }
+
+    const { data: existingList } = await existingQuery
       .or(safeConvId ? `entity_id.eq.${safeConvId},actor_id.eq.${senderId}` : `actor_id.eq.${senderId}`)
       .order('created_at', { ascending: false })
       .limit(5);
 
     const senderDisplayName = senderName || 'ABSU Student';
-    const notifTitle = `${senderDisplayName} sent you a message.`;
+    const notifTitle = safeRecipientPageId
+      ? `New Page message from ${senderDisplayName}`
+      : `${senderDisplayName} sent you a message.`;
+    const notifBody = safeRecipientPageId ? 'sent a message to your Page.' : 'sent you a message.';
 
     if (existingList && existingList.length > 0) {
       // Update primary existing unread notification timestamp & preserve/update entityId
@@ -1989,7 +2218,9 @@ app.post('/api/notifications/create-or-update-message', async (req, res) => {
           entity_type: safeMsgId ? 'message' : 'conversation',
           entity_id: targetEntityId || existingList[0].entity_id,
           title: notifTitle,
-          body: 'sent you a message.',
+          body: notifBody,
+          ...(safeRecipientPageId ? { recipient_page_id: safeRecipientPageId } : {}),
+          ...(safeTargetPageId ? { target_page_id: safeTargetPageId } : {}),
         })
         .eq('id', existingList[0].id);
 
@@ -2000,17 +2231,24 @@ app.post('/api/notifications/create-or-update-message', async (req, res) => {
       }
     } else {
       // Insert one fresh conversation notification
-      await client.from('notifications').insert({
+      const insertPayload: Record<string, any> = {
         recipient_id: recipientId,
         actor_id: safeSenderId,
-        type: 'message',
+        type: resolvedType,
         title: notifTitle,
-        body: 'sent you a message.',
+        body: notifBody,
         entity_type: safeMsgId ? 'message' : 'conversation',
         entity_id: targetEntityId,
         created_at: nowIso,
         read_at: null,
-      });
+        ...(safeRecipientPageId ? { recipient_page_id: safeRecipientPageId } : {}),
+        ...(safeTargetPageId ? { target_page_id: safeTargetPageId } : {}),
+      };
+      const { error: msgNotifErr } = await client.from('notifications').insert(insertPayload);
+      if (msgNotifErr && (msgNotifErr.message || '').toLowerCase().includes('recipient_page_id')) {
+        delete insertPayload.recipient_page_id;
+        await client.from('notifications').insert(insertPayload);
+      }
     }
 
     // Trigger privacy-safe push notification (never leak DM message text)
@@ -2038,13 +2276,25 @@ app.get('/api/notifications/user/:userId', async (req, res) => {
 
     const client = getAdminSupabase(req);
 
-    // Fetch notifications directly
-    const { data: rawNotifs, error: notifErr } = await client
+    // Fetch personal notifications strictly (exclude Page-scoped alerts where recipient_page_id is set)
+    let { data: rawNotifs, error: notifErr } = await client
       .from('notifications')
       .select('*')
       .eq('recipient_id', userId)
+      .is('recipient_page_id', null)
       .order('created_at', { ascending: false })
       .limit(100);
+
+    if (notifErr && (notifErr.message || '').toLowerCase().includes('recipient_page_id')) {
+      const retry = await client
+        .from('notifications')
+        .select('*')
+        .eq('recipient_id', userId)
+        .order('created_at', { ascending: false })
+        .limit(100);
+      rawNotifs = retry.data;
+      notifErr = retry.error;
+    }
 
     if (notifErr) {
       console.warn('[Notifications] Fetch error:', notifErr.message);
@@ -2344,11 +2594,20 @@ app.post('/api/notifications/mark-all-read', async (req, res) => {
     }
 
     const client = getAdminSupabase(req);
-    await client
+    const { error: markErr } = await client
       .from('notifications')
       .update({ read_at: new Date().toISOString() })
       .eq('recipient_id', userId)
+      .is('recipient_page_id', null)
       .is('read_at', null);
+
+    if (markErr && (markErr.message || '').toLowerCase().includes('recipient_page_id')) {
+      await client
+        .from('notifications')
+        .update({ read_at: new Date().toISOString() })
+        .eq('recipient_id', userId)
+        .is('read_at', null);
+    }
 
     res.json({ success: true, message: 'All notifications marked as read.' });
   } catch (err: unknown) {
@@ -2714,6 +2973,399 @@ app.get('/api/admin/verify', async (req, res) => {
     role: 'Super Admin',
     serviceRoleConfigured: Boolean(supabaseAdmin),
   });
+});
+
+// 1b. Super Admin Pages Console Endpoints (strictly requires Super Admin email/JWT)
+app.get('/api/admin/pages/stats', requireSuperAdmin, async (_req, res) => {
+  if (!supabaseAdmin) {
+    res.status(503).json({ success: false, fallbackToRpc: true, error: 'Service role not configured.' });
+    return;
+  }
+  try {
+    const [pagesRes, reportsRes] = await Promise.all([
+      supabaseAdmin.from('pages').select('id, status, is_active, is_verified, deleted_at'),
+      supabaseAdmin
+        .from('page_reports')
+        .select('id', { count: 'exact', head: true })
+        .eq('status', 'open'),
+    ]);
+
+    if (pagesRes.error) {
+      res.status(500).json({ success: false, error: pagesRes.error.message });
+      return;
+    }
+
+    const stats = computeAdminPagesStats(pagesRes.data || [], reportsRes.count ?? 0);
+    res.json({ success: true, stats });
+  } catch (err: unknown) {
+    res.status(500).json({
+      success: false,
+      error: err instanceof Error ? err.message : 'Failed to compute Pages stats.',
+    });
+  }
+});
+
+app.get('/api/admin/pages', requireSuperAdmin, async (req, res) => {
+  if (!supabaseAdmin) {
+    res.status(503).json({ success: false, fallbackToRpc: true, error: 'Service role not configured.' });
+    return;
+  }
+  try {
+    const search = typeof req.query.search === 'string' ? req.query.search.trim() : '';
+    const status = typeof req.query.status === 'string' ? req.query.status.trim() : 'all';
+    const verified = typeof req.query.verified === 'string' ? req.query.verified.trim() : 'all';
+
+    let q = supabaseAdmin.from('pages').select('*');
+    if (status === 'deleted') {
+      q = q.or('status.eq.deleted,deleted_at.not.is.null');
+    } else if (status === 'disabled') {
+      q = q.is('deleted_at', null).or('status.eq.disabled,is_active.eq.false');
+    } else if (status === 'active') {
+      q = q.is('deleted_at', null).eq('status', 'active').eq('is_active', true);
+    } else {
+      q = q.is('deleted_at', null);
+    }
+
+    if (verified === 'verified') q = q.eq('is_verified', true);
+    else if (verified === 'unverified') q = q.eq('is_verified', false);
+
+    if (search) {
+      const clean = search.replace(/[,%()]/g, ' ').trim();
+      if (clean) {
+        q = q.or(`name.ilike.%${clean}%,slug.ilike.%${clean}%,category.ilike.%${clean}%`);
+      }
+    }
+
+    const { data, error } = await q.order('created_at', { ascending: false }).limit(200);
+    if (error) {
+      res.status(500).json({ success: false, error: error.message });
+      return;
+    }
+
+    const seenIds = new Set<string>();
+    const pages = (data || []).filter((r: any) => {
+      if (!r?.id || seenIds.has(r.id)) return false;
+      seenIds.add(r.id);
+      return true;
+    });
+
+    res.json({ success: true, pages });
+  } catch (err: unknown) {
+    res.status(500).json({
+      success: false,
+      error: err instanceof Error ? err.message : 'Failed to list Pages.',
+    });
+  }
+});
+
+app.post('/api/admin/pages/:pageId/verify', requireSuperAdmin, async (req, res) => {
+  const pageId = String(req.params.pageId || '').trim();
+  const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(pageId);
+  if (!isUuid) {
+    res.status(400).json({ success: false, error: 'Invalid Page ID.' });
+    return;
+  }
+  if (typeof req.body?.verified !== 'boolean') {
+    res.status(400).json({ success: false, error: 'Missing boolean verified flag.' });
+    return;
+  }
+  if (!supabaseAdmin) {
+    res.status(503).json({ success: false, fallbackToRpc: true, error: 'Service role not configured.' });
+    return;
+  }
+
+  const verified = Boolean(req.body.verified);
+  const adminUser = (req as any).adminUser as { id: string; email: string };
+  try {
+    const { data, error } = await supabaseAdmin
+      .from('pages')
+      .update({
+        is_verified: verified,
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', pageId)
+      .select('*')
+      .maybeSingle();
+
+    if (error) {
+      res.status(500).json({ success: false, error: error.message });
+      return;
+    }
+    if (!data) {
+      res.status(404).json({ success: false, error: 'Page not found.' });
+      return;
+    }
+
+    appendAuditLog({
+      adminEmail: adminUser.email,
+      action: verified ? 'VERIFY_PAGE' : 'UNVERIFY_PAGE',
+      targetId: pageId,
+      targetType: 'page',
+      details: `Set is_verified=${verified} on "${data.name}" (@${data.slug})`,
+      outcome: 'success',
+      ip: req.ip,
+    });
+    void supabaseAdmin.from('page_audit_logs').insert({
+      page_id: pageId,
+      actor_id: adminUser.id,
+      action: verified ? 'page_verified' : 'page_unverified',
+      details: `${verified ? 'Verified' : 'Removed verification badge from'} Page by platform administrator`,
+    });
+    res.json({ success: true, page: data });
+  } catch (err: unknown) {
+    res.status(500).json({
+      success: false,
+      error: err instanceof Error ? err.message : 'Failed to update verification status.',
+    });
+  }
+});
+
+app.post('/api/admin/pages/:pageId/status', requireSuperAdmin, async (req, res) => {
+  const pageId = String(req.params.pageId || '').trim();
+  const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(pageId);
+  if (!isUuid) {
+    res.status(400).json({ success: false, error: 'Invalid Page ID.' });
+    return;
+  }
+  const nextStatus = String(req.body?.status || '').trim();
+  if (!['active', 'disabled', 'deleted'].includes(nextStatus)) {
+    res.status(400).json({ success: false, error: 'Invalid Page status.' });
+    return;
+  }
+  if (!supabaseAdmin) {
+    res.status(503).json({ success: false, fallbackToRpc: true, error: 'Service role not configured.' });
+    return;
+  }
+
+  const adminUser = (req as any).adminUser as { id: string; email: string };
+  const reason = typeof req.body?.reason === 'string' ? req.body.reason.trim() : '';
+  const explanation = typeof req.body?.explanation === 'string' ? req.body.explanation.trim() : '';
+  const nowIso = new Date().toISOString();
+
+  const updateFields: Record<string, any> =
+    nextStatus === 'active'
+      ? {
+          status: 'active',
+          is_active: true,
+          deleted_at: null,
+          disabled_reason: null,
+          disabled_explanation: null,
+          updated_at: nowIso,
+        }
+      : nextStatus === 'disabled'
+      ? {
+          status: 'disabled',
+          is_active: false,
+          disabled_reason: reason || 'Policy violation',
+          disabled_explanation: explanation || null,
+          updated_at: nowIso,
+        }
+      : {
+          status: 'deleted',
+          is_active: false,
+          deleted_at: nowIso,
+          updated_at: nowIso,
+        };
+
+  try {
+    const { data, error } = await supabaseAdmin
+      .from('pages')
+      .update(updateFields)
+      .eq('id', pageId)
+      .select('*')
+      .maybeSingle();
+
+    if (error) {
+      res.status(500).json({ success: false, error: error.message });
+      return;
+    }
+    if (!data) {
+      res.status(404).json({ success: false, error: 'Page not found.' });
+      return;
+    }
+
+    appendAuditLog({
+      adminEmail: adminUser.email,
+      action: `SET_PAGE_STATUS_${nextStatus.toUpperCase()}`,
+      targetId: pageId,
+      targetType: 'page',
+      details: `Set status=${nextStatus} on "${data.name}" (@${data.slug})${reason ? ` — ${reason}` : ''}`,
+      outcome: 'success',
+      ip: req.ip,
+    });
+    void supabaseAdmin.from('page_audit_logs').insert({
+      page_id: pageId,
+      actor_id: adminUser.id,
+      action: `admin_status_${nextStatus}`,
+      details: `Platform admin changed Page status to ${nextStatus}${reason ? `: ${reason}` : ''}`,
+    });
+    res.json({ success: true, page: data });
+  } catch (err: unknown) {
+    res.status(500).json({
+      success: false,
+      error: err instanceof Error ? err.message : 'Failed to update Page status.',
+    });
+  }
+});
+
+// 1g. Super Admin: List & Review Page Verification Requests
+app.get('/api/admin/pages/verification-requests', requireSuperAdmin, async (req, res) => {
+  const sb = getAdminSupabase(req);
+  try {
+    const { data: requests, error } = await sb
+      .from('page_verification_requests')
+      .select('*')
+      .order('created_at', { ascending: false })
+      .limit(150);
+
+    if (error) {
+      res.status(500).json({ success: false, error: error.message });
+      return;
+    }
+
+    const rows = requests || [];
+    const pageIds = Array.from(new Set(rows.map((r: any) => r.page_id).filter(Boolean)));
+    const userIds = Array.from(new Set(rows.map((r: any) => r.requested_by).filter(Boolean)));
+
+    const [pagesRes, profRes] = await Promise.all([
+      pageIds.length > 0
+        ? sb
+            .from('pages')
+            .select('id, name, slug, avatar_url, category, is_verified, status, followers_count, posts_count')
+            .in('id', pageIds)
+        : Promise.resolve({ data: [] as any[] }),
+      userIds.length > 0
+        ? sb.from('profiles').select('id, display_name, username, avatar_url').in('id', userIds)
+        : Promise.resolve({ data: [] as any[] }),
+    ]);
+
+    const pageMap = new Map<string, any>();
+    for (const p of pagesRes.data || []) pageMap.set(p.id, p);
+    const profMap = new Map<string, any>();
+    for (const u of profRes.data || []) profMap.set(u.id, u);
+
+    const enriched = rows.map((r: any) => ({
+      ...r,
+      page: pageMap.get(r.page_id) || undefined,
+      requester: profMap.get(r.requested_by) || undefined,
+    }));
+
+    res.json({ success: true, requests: enriched });
+  } catch (err: unknown) {
+    res.status(500).json({
+      success: false,
+      error: err instanceof Error ? err.message : 'Failed to load verification requests.',
+    });
+  }
+});
+
+app.post('/api/admin/pages/verification-requests/:requestId/review', requireSuperAdmin, async (req, res) => {
+  const requestId = (req.params.requestId || '').trim();
+  const decision = String(req.body?.decision || '').trim().toLowerCase();
+  const reviewNote = typeof req.body?.reviewNote === 'string' ? req.body.reviewNote.trim() : '';
+
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(requestId)) {
+    res.status(400).json({ success: false, error: 'Invalid verification request ID.' });
+    return;
+  }
+  if (decision !== 'approved' && decision !== 'rejected') {
+    res.status(400).json({ success: false, error: 'Decision must be approved or rejected.' });
+    return;
+  }
+  if (!supabaseAdmin) {
+    res.status(503).json({ success: false, fallbackToRpc: true, error: 'Service role not configured.' });
+    return;
+  }
+
+  const adminUser = (req as any).adminUser as { id: string; email: string };
+  const nowIso = new Date().toISOString();
+
+  try {
+    const { data: reqRow, error: fetchErr } = await supabaseAdmin
+      .from('page_verification_requests')
+      .select('*')
+      .eq('id', requestId)
+      .maybeSingle();
+
+    if (fetchErr || !reqRow) {
+      res.status(404).json({ success: false, error: 'Verification request not found.' });
+      return;
+    }
+
+    const { error: updErr } = await supabaseAdmin
+      .from('page_verification_requests')
+      .update({
+        status: decision,
+        review_note: reviewNote || null,
+        reviewed_by: adminUser.id,
+        reviewed_at: nowIso,
+        updated_at: nowIso,
+      })
+      .eq('id', requestId);
+
+    if (updErr) {
+      res.status(500).json({ success: false, error: updErr.message });
+      return;
+    }
+
+    if (decision === 'approved') {
+      await supabaseAdmin
+        .from('pages')
+        .update({ is_verified: true, updated_at: nowIso })
+        .eq('id', reqRow.page_id);
+    }
+
+    const { data: pageRow } = await supabaseAdmin
+      .from('pages')
+      .select('id, name, slug')
+      .eq('id', reqRow.page_id)
+      .maybeSingle();
+
+    appendAuditLog({
+      adminEmail: adminUser.email,
+      action: `PAGE_VERIFICATION_${decision.toUpperCase()}`,
+      targetId: reqRow.page_id,
+      targetType: 'page',
+      details: `${decision === 'approved' ? 'Approved' : 'Rejected'} verification for "${pageRow?.name || reqRow.official_name}"${reviewNote ? ` — ${reviewNote}` : ''}`,
+      outcome: 'success',
+      ip: req.ip,
+    });
+
+    void supabaseAdmin.from('page_audit_logs').insert({
+      page_id: reqRow.page_id,
+      actor_id: adminUser.id,
+      action: decision === 'approved' ? 'verification_approved' : 'verification_rejected',
+      details:
+        decision === 'approved'
+          ? 'Super Admin approved Page verification badge'
+          : reviewNote || 'Super Admin rejected Page verification request',
+      metadata: { request_id: requestId, decision },
+    });
+
+    void supabaseAdmin.from('notifications').insert({
+      recipient_id: reqRow.requested_by,
+      recipient_page_id: reqRow.page_id,
+      actor_id: adminUser.id,
+      type: decision === 'approved' ? 'page_verification_approved' : 'page_verification_rejected',
+      entity_type: 'page',
+      entity_id: reqRow.page_id,
+      title:
+        decision === 'approved'
+          ? `${pageRow?.name || 'Your Page'} is now Verified`
+          : `Verification update for ${pageRow?.name || 'your Page'}`,
+      body:
+        decision === 'approved'
+          ? `Your verification request for ${pageRow?.name || 'your Page'} was approved.`
+          : reviewNote || 'Your verification request was not approved at this time.',
+    });
+
+    res.json({ success: true, status: decision, pageId: reqRow.page_id });
+  } catch (err: unknown) {
+    res.status(500).json({
+      success: false,
+      error: err instanceof Error ? err.message : 'Failed to review verification request.',
+    });
+  }
 });
 
 // 2. Executive Dashboard Overview & Stats
@@ -4403,7 +5055,7 @@ async function getViewerSocialContext(sb: any, viewerId: string | null): Promise
 const POST_RICH_SELECT = `
   *,
   author:profiles!posts_author_id_fkey(*),
-  page:pages(*),
+  page:pages!posts_page_id_fkey(*),
   community:communities(*),
   post_media(*),
   post_reactions(*),
@@ -4434,7 +5086,7 @@ async function queryPostsResilient(
 
   const postIds = Array.from(new Set(rows.map((r: any) => r.id).filter(Boolean)));
   const authorIds = Array.from(new Set(rows.map((r: any) => r.author_id).filter(Boolean)));
-  const pageIds = Array.from(new Set(rows.map((r: any) => r.page_id).filter(Boolean)));
+  const pageIds = Array.from(new Set(rows.map((r: any) => r.page_id || r.author_page_id).filter(Boolean)));
   const communityIds = Array.from(new Set(rows.map((r: any) => r.community_id).filter(Boolean)));
 
   const [authorsRes, pagesRes, commsRes, mediaRes, reactionsRes, commentsRes] = await Promise.allSettled([
@@ -4507,8 +5159,13 @@ function isPostVisibleToViewer(
   if (mod?.action === 'hide' || mod?.action === 'delete') return false;
   if (String(post.visibility || '').toLowerCase() === 'hidden' || Boolean(post.is_hidden)) return false;
 
+  // Exclude posts from disabled or deleted Pages
+  if (post.page && post.page.status && post.page.status !== 'active') {
+    return false;
+  }
+
   // Enforce user blocks on regular student posts
-  if (!post.page_id && post.author_id && social.blockedIds.has(post.author_id)) {
+  if (!post.page_id && !post.author_page_id && post.author_id && social.blockedIds.has(post.author_id)) {
     return false;
   }
 
@@ -4892,7 +5549,7 @@ app.get('/api/posts/reels/search', async (req, res) => {
       const body = String(row.body || '').toLowerCase();
       const authorName = String(row.author?.display_name || row.page?.name || '').toLowerCase();
       const username = String(row.author?.username || row.page?.slug || '').toLowerCase();
-      const dept = String(row.author?.department || '').toLowerCase();
+      const dept = String(row.author?.department || row.page?.category || '').toLowerCase();
 
       return (
         body.includes(lowerQ) ||

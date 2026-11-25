@@ -15,6 +15,8 @@ import {
 } from '../../lib/cloudinaryService.ts';
 import { resolveSinglePostMediaSignedUrl } from '../../lib/storageService.ts';
 import { Avatar } from '../common/Avatar.tsx';
+import { VerifiedBadge } from '../common/VerifiedBadge.tsx';
+import { MR_ANONYMOUS_PAGE_ID } from '../../lib/pageService.ts';
 import { ReelsCommentsModal } from './ReelsCommentsModal.tsx';
 import { ReelsSearchModal } from './ReelsSearchModal.tsx';
 import { ReelsUploadModal } from './ReelsUploadModal.tsx';
@@ -300,20 +302,36 @@ const ReelSlide: React.FC<ReelSlideProps> = ({
         <div className="flex items-center gap-2.5 flex-wrap">
           <button
             type="button"
-            onClick={() =>
-              navigateTo(post.author.id === currentUser.id ? 'profile' : 'user-profile', {
-                userId: post.author.id,
-              })
-            }
+            onClick={() => {
+              if (post.isPagePost || post.pageId) {
+                const pid =
+                  post.pageId ||
+                  post.authorPageId ||
+                  (post.author.name.toLowerCase() === 'mr anonymous' ? MR_ANONYMOUS_PAGE_ID : null);
+                if (pid) {
+                  navigateTo('page-profile', { pageId: pid });
+                } else {
+                  navigateTo('user-profile', { userId: post.author.id });
+                }
+              } else {
+                navigateTo(post.author.id === currentUser.id ? 'profile' : 'user-profile', {
+                  userId: post.author.id,
+                });
+              }
+            }}
             className="flex items-center gap-2 min-w-0 group"
           >
             <Avatar src={post.author.avatar} name={post.author.name} size="sm" />
             <div className="text-left min-w-0">
-              <p className="text-sm font-extrabold text-white drop-shadow-sm truncate max-w-[180px] group-hover:underline">
-                {post.author.name}
-              </p>
+              <div className="flex items-center gap-1.5">
+                <p className="text-sm font-extrabold text-white drop-shadow-sm truncate max-w-[180px] group-hover:underline">
+                  {post.author.name}
+                </p>
+                {(post.pageIsVerified || post.author.isVerified) && <VerifiedBadge size={14} />}
+              </div>
               <p className="text-[11px] text-white/75 truncate">
-                {post.author.handle || '@student'} · {post.createdAt}
+                {post.isPagePost ? post.pageCategory || 'Page' : post.author.handle || '@student'} ·{' '}
+                {post.createdAt}
               </p>
             </div>
           </button>

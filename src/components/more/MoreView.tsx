@@ -3,6 +3,7 @@ import { useApp } from '../../context/AppContext.tsx';
 import { useAuth } from '../../context/AuthContext.tsx';
 import { Avatar } from '../common/Avatar.tsx';
 import { BrandLogo } from '../common/BrandLogo.tsx';
+import { MR_ANONYMOUS_PAGE_ID } from '../../lib/pageService.ts';
 import {
   ShoppingBag,
   Bookmark,
@@ -16,6 +17,7 @@ import {
   LogOut,
   ChevronRight,
   EyeOff,
+  Flag,
 } from 'lucide-react';
 
 export const MoreView: React.FC = () => {
@@ -37,6 +39,15 @@ export const MoreView: React.FC = () => {
 
   const shortcuts = [
     {
+      id: 'pages',
+      title: 'Pages',
+      description: 'Follow, manage & create campus Pages',
+      icon: Flag,
+      colorClass: 'text-[#1877F2] bg-[#1877F2]/10',
+      badge: 'New',
+      onClick: () => navigateTo('pages'),
+    },
+    {
       id: 'saved',
       title: 'Saved',
       description: 'Bookmarks & important announcements',
@@ -52,7 +63,7 @@ export const MoreView: React.FC = () => {
       icon: EyeOff,
       colorClass: 'text-purple-600 bg-purple-600/10',
       badge: 'Official',
-      onClick: () => navigateTo('mr-anonymous'),
+      onClick: () => navigateTo('page-profile', { pageId: MR_ANONYMOUS_PAGE_ID }),
     },
     {
       id: 'marketplace',

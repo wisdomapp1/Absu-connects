@@ -2,8 +2,10 @@ import React, { useState, useRef, useEffect } from 'react';
 import { useApp } from '../../context/AppContext.tsx';
 import type { Post, Comment, PostMediaItem } from '../../types/index.ts';
 import { Avatar } from '../common/Avatar.tsx';
+import { VerifiedBadge } from '../common/VerifiedBadge.tsx';
 import { LinkifiedText } from '../common/LinkifiedText.tsx';
 import { ReelsIcon } from '../common/ReelsIcon.tsx';
+import { MR_ANONYMOUS_PAGE_ID } from '../../lib/pageService.ts';
 import {
   fetchPostComments,
   countThreadedComments,
@@ -31,7 +33,7 @@ import {
   EyeOff,
   Flag,
   Play,
-  Building2,
+  Pin,
   CornerDownRight,
   Pencil,
   Check,
@@ -223,9 +225,13 @@ export const PostCard: React.FC<PostCardProps> = ({
 }) => {
   const {
     currentUser,
+    activeIdentity,
+    managedPages,
     toggleLike,
     toggleSave,
     addComment,
+    editPost,
+    pinPagePost,
     deletePost,
     hidePost,
     reportPost,
@@ -298,6 +304,15 @@ export const PostCard: React.FC<PostCardProps> = ({
   const [menuOpen, setMenuOpen] = useState(false);
   const [reportModalOpen, setReportModalOpen] = useState(false);
   const [reportReason, setReportReason] = useState('');
+  const [isEditingPost, setIsEditingPost] = useState(false);
+  const [postEditDraft, setPostEditDraft] = useState(post.content);
+  const [savingPostEdit, setSavingPostEdit] = useState(false);
+
+  useEffect(() => {
+    if (!isEditingPost) {
+      setPostEditDraft(post.content);
+    }
+  }, [post.content, isEditingPost]);
 
   const menuRef = useRef<HTMLDivElement>(null);
 
@@ -561,7 +576,14 @@ export const PostCard: React.FC<PostCardProps> = ({
     }
   };
 
-  const isOwnPost = post.author.id === currentUser.id;
+  const isOwnPost = !post.isPagePost && post.author.id === currentUser.id;
+  const isPageManagedByMe = Boolean(
+    post.isPagePost &&
+      post.pageId &&
+      managedPages.some((m) => m.page.id === post.pageId && m.page.status === 'active')
+  );
+  const canManagePost = isOwnPost || isPageManagedByMe;
+  const commentsLocked = post.allowComments === false && !isPageManagedByMe;
 
   const AudienceIcon =
     post.audience === 'Public'
@@ -570,11 +592,34 @@ export const PostCard: React.FC<PostCardProps> = ({
       ? GraduationCap
       : Users;
 
-  const navigateToAuthor = (authorId: string) => {
+  const navigateToAuthor = (
+    authorId: string,
+    asPage?: boolean,
+    authorPageId?: string | null,
+    authorName?: string
+  ) => {
+    if (asPage && (authorPageId || (authorName || '').toLowerCase() === 'mr anonymous')) {
+      navigateTo('page-profile', { pageId: authorPageId || MR_ANONYMOUS_PAGE_ID });
+      return;
+    }
     if (authorId === currentUser.id) {
       navigateTo('profile');
     } else {
       navigateTo('user-profile', { userId: authorId });
+    }
+  };
+
+  const handleSavePostEdit = async () => {
+    const trimmed = postEditDraft.trim();
+    if (!trimmed || savingPostEdit) return;
+    setSavingPostEdit(true);
+    try {
+      const ok = await editPost(post.id, trimmed);
+      if (ok) {
+        setIsEditingPost(false);
+      }
+    } finally {
+      setSavingPostEdit(false);
     }
   };
 
@@ -594,7 +639,14 @@ export const PostCard: React.FC<PostCardProps> = ({
         <div className="flex items-start gap-2.5 text-xs">
           <button
             type="button"
-            onClick={() => navigateToAuthor(comment.author.id)}
+            onClick={() =>
+              navigateToAuthor(
+                comment.author.id,
+                comment.authorAsPage,
+                comment.authorPageId,
+                comment.author.name
+              )
+            }
             className="shrink-0 focus:outline-none"
           >
             <Avatar src={comment.author.avatar} name={comment.author.name} size="xs" />
@@ -610,10 +662,18 @@ export const PostCard: React.FC<PostCardProps> = ({
             <div className="flex items-center justify-between gap-2">
               <button
                 type="button"
-                onClick={() => navigateToAuthor(comment.author.id)}
-                className="font-bold text-[var(--color-text-primary)] hover:text-[var(--color-primary)] truncate text-left"
+                onClick={() =>
+                  navigateToAuthor(
+                    comment.author.id,
+                    comment.authorAsPage,
+                    comment.authorPageId,
+                    comment.author.name
+                  )
+                }
+                className="font-bold text-[var(--color-text-primary)] hover:text-[var(--color-primary)] truncate text-left flex items-center gap-1"
               >
-                {comment.author.name}
+                <span className="truncate">{comment.author.name}</span>
+                {comment.author.isVerified && <VerifiedBadge size={12} />}
               </button>
               <span className="text-[10px] text-[var(--color-text-secondary)] shrink-0">
                 {comment.createdAt}
@@ -622,7 +682,9 @@ export const PostCard: React.FC<PostCardProps> = ({
             </div>
 
             <p className="text-[11px] text-[var(--color-text-secondary)] mb-1">
-              {comment.author.department} · {comment.author.level}
+              {comment.authorAsPage
+                ? 'Page'
+                : `${comment.author.department} · ${comment.author.level}`}
             </p>
 
             {isEditing ? (
@@ -781,12 +843,16 @@ export const PostCard: React.FC<PostCardProps> = ({
       <div className="flex items-start justify-between gap-2">
         <button
           onClick={() => {
-            const isAnonPage =
-              post.isPagePost ||
-              post.pageId === '0c3240e3-ae39-461d-bd7a-4963859b9bc7' ||
-              post.author.name.toLowerCase() === 'mr anonymous';
-            if (isAnonPage) {
-              navigateTo('mr-anonymous');
+            if (post.isPagePost || post.pageId) {
+              const targetPid =
+                post.pageId ||
+                post.authorPageId ||
+                (post.author.name.toLowerCase() === 'mr anonymous' ? MR_ANONYMOUS_PAGE_ID : null);
+              if (targetPid) {
+                navigateTo('page-profile', { pageId: targetPid });
+              } else {
+                navigateTo('user-profile', { userId: post.author.id });
+              }
             } else if (isOwnPost) {
               navigateTo('profile');
             } else {
@@ -802,16 +868,11 @@ export const PostCard: React.FC<PostCardProps> = ({
               <span className="font-bold text-sm sm:text-base text-[var(--color-text-primary)] group-hover:text-[var(--color-primary)] transition-colors truncate">
                 {post.author.name}
               </span>
-              {post.isPagePost && (
-                <span className="inline-flex items-center gap-1 text-[11px] font-semibold text-[var(--color-primary)]">
-                  <Building2 className="w-3 h-3" />
-                  <span>Official Page</span>
-                </span>
-              )}
+              {(post.pageIsVerified || post.author.isVerified) && <VerifiedBadge size={15} />}
             </div>
 
             <div className="flex items-center gap-1.5 text-xs text-[var(--color-text-secondary)] mt-0.5">
-              <span>{post.author.department}</span>
+              <span>{post.isPagePost ? post.pageCategory || 'Page' : post.author.department}</span>
               <span aria-hidden="true">·</span>
               <span>{post.createdAt}</span>
               <span title={post.audience} className="inline-flex items-center">
@@ -845,6 +906,35 @@ export const PostCard: React.FC<PostCardProps> = ({
                 <span>{localIsSaved ? 'Saved' : 'Save Post'}</span>
               </button>
 
+              {isPageManagedByMe && post.pageId && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setMenuOpen(false);
+                    void pinPagePost(post.pageId!, post.isPinned ? null : post.id);
+                  }}
+                  className="w-full flex items-center gap-2.5 px-3 py-2 text-xs font-medium text-[var(--color-text-primary)] hover:bg-[var(--color-primary-subtle)] rounded-xl transition-colors min-h-[36px]"
+                >
+                  <Pin className="w-4 h-4 text-[var(--color-primary)]" />
+                  <span>{post.isPinned ? 'Unpin Post' : 'Pin to Page Top'}</span>
+                </button>
+              )}
+
+              {canManagePost && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setMenuOpen(false);
+                    setPostEditDraft(post.content);
+                    setIsEditingPost(true);
+                  }}
+                  className="w-full flex items-center gap-2.5 px-3 py-2 text-xs font-medium text-[var(--color-text-primary)] hover:bg-[var(--color-primary-subtle)] rounded-xl transition-colors min-h-[36px]"
+                >
+                  <Pencil className="w-4 h-4" />
+                  <span>Edit Post</span>
+                </button>
+              )}
+
               <button
                 onClick={() => {
                   hidePost(post.id);
@@ -867,7 +957,7 @@ export const PostCard: React.FC<PostCardProps> = ({
                 <span>Report Content</span>
               </button>
 
-              {isOwnPost && (
+              {canManagePost && (
                 <>
                   <div className="h-px bg-[var(--color-border)] my-1" />
                   <button
@@ -898,20 +988,53 @@ export const PostCard: React.FC<PostCardProps> = ({
         </div>
       ) : null}
 
-      {/* Content text */}
-      <div
-        onClick={(e) => {
-          if (!onOpenPost) return;
-          const target = e.target as HTMLElement;
-          if (target.closest('a, button')) return;
-          onOpenPost(post);
-        }}
-        className={`mt-3 text-[14px] sm:text-[15px] leading-relaxed text-[var(--color-text-primary)] whitespace-pre-line break-words ${
-          onOpenPost ? 'cursor-pointer hover:opacity-90' : ''
-        }`}
-      >
-        <LinkifiedText text={post.content} />
-      </div>
+      {/* Content text or inline edit composer */}
+      {isEditingPost ? (
+        <div className="mt-3 space-y-2">
+          <textarea
+            value={postEditDraft}
+            onChange={(e) => setPostEditDraft(e.target.value)}
+            maxLength={2000}
+            rows={4}
+            className="w-full rounded-xl bg-[var(--color-bg-main)] border border-[var(--color-primary)]/50 px-3 py-2.5 text-sm text-[var(--color-text-primary)] focus:outline-none focus:ring-2 focus:ring-[var(--color-primary)] resize-y"
+          />
+          <div className="flex items-center justify-end gap-2">
+            <button
+              type="button"
+              disabled={savingPostEdit}
+              onClick={() => {
+                setIsEditingPost(false);
+                setPostEditDraft(post.content);
+              }}
+              className="min-h-[36px] px-3 rounded-xl border border-[var(--color-border)] text-xs font-semibold text-[var(--color-text-secondary)]"
+            >
+              Cancel
+            </button>
+            <button
+              type="button"
+              disabled={savingPostEdit || !postEditDraft.trim()}
+              onClick={handleSavePostEdit}
+              className="min-h-[36px] px-4 rounded-xl bg-[var(--color-primary)] text-white text-xs font-bold disabled:opacity-50"
+            >
+              {savingPostEdit ? 'Saving...' : 'Save Changes'}
+            </button>
+          </div>
+        </div>
+      ) : (
+        <div
+          onClick={(e) => {
+            if (!onOpenPost) return;
+            const target = e.target as HTMLElement;
+            if (target.closest('a, button')) return;
+            onOpenPost(post);
+          }}
+          className={`mt-3 text-[14px] sm:text-[15px] leading-relaxed text-[var(--color-text-primary)] whitespace-pre-line break-words ${
+            onOpenPost ? 'cursor-pointer hover:opacity-90' : ''
+          }`}
+        >
+          <LinkifiedText text={post.content} />
+        </div>
+      )}
 
       {/* Media Image or Video Preview */}
       {post.mediaItems && post.mediaItems.length > 1 ? (
@@ -1159,31 +1282,45 @@ export const PostCard: React.FC<PostCardProps> = ({
       {/* Expandable Comments Section */}
       {commentsExpanded && (
         <div className="mt-3 pt-3 border-t border-[var(--color-border)] flex flex-col gap-3">
-          {/* Comment composer */}
-          <form onSubmit={handleCommentSubmit} className="flex items-center gap-2">
-            <Avatar src={currentUser.avatar} name={currentUser.name} size="sm" />
-            <div className="flex-1 relative">
-              <input
-                type="text"
-                value={commentText}
-                onChange={(e) => setCommentText(e.target.value)}
-                placeholder="Write a comment..."
-                autoCorrect="on"
-                autoCapitalize="sentences"
-                spellCheck={true}
-                enterKeyHint="send"
-                className="w-full min-h-[40px] bg-[var(--color-bg-main)] border border-[var(--color-border)] rounded-xl px-4 py-2 text-xs sm:text-sm text-[var(--color-text-primary)] placeholder:text-[var(--color-text-secondary)] focus:outline-none focus:ring-1 focus:ring-[var(--color-primary)]"
+          {/* Comment composer (disabled when Page comments are turned off for non-managers) */}
+          {commentsLocked ? (
+            <p className="text-xs text-[var(--color-text-secondary)] bg-[var(--color-bg-main)] border border-[var(--color-border)] rounded-xl px-3.5 py-2.5 text-center">
+              Comments are turned off for this Page post.
+            </p>
+          ) : (
+            <form onSubmit={handleCommentSubmit} className="flex items-center gap-2">
+              <Avatar
+                src={activeIdentity.type === 'page' ? activeIdentity.page.avatarUrl : currentUser.avatar}
+                name={activeIdentity.type === 'page' ? activeIdentity.page.name : currentUser.name}
+                size="sm"
               />
-            </div>
-            <button
-              type="submit"
-              disabled={!commentText.trim()}
-              className="p-2 rounded-xl bg-[var(--color-primary)] text-white hover:bg-[var(--color-primary-hover)] disabled:opacity-40 transition-opacity min-w-[40px] min-h-[40px] flex items-center justify-center"
-              aria-label="Submit comment"
-            >
-              <Send className="w-4 h-4" />
-            </button>
-          </form>
+              <div className="flex-1 relative">
+                <input
+                  type="text"
+                  value={commentText}
+                  onChange={(e) => setCommentText(e.target.value)}
+                  placeholder={
+                    activeIdentity.type === 'page'
+                      ? `Write a comment as ${activeIdentity.page.name}...`
+                      : 'Write a comment...'
+                  }
+                  autoCorrect="on"
+                  autoCapitalize="sentences"
+                  spellCheck={true}
+                  enterKeyHint="send"
+                  className="w-full min-h-[40px] bg-[var(--color-bg-main)] border border-[var(--color-border)] rounded-xl px-4 py-2 text-xs sm:text-sm text-[var(--color-text-primary)] placeholder:text-[var(--color-text-secondary)] focus:outline-none focus:ring-1 focus:ring-[var(--color-primary)]"
+                />
+              </div>
+              <button
+                type="submit"
+                disabled={!commentText.trim()}
+                className="p-2 rounded-xl bg-[var(--color-primary)] text-white hover:bg-[var(--color-primary-hover)] disabled:opacity-40 transition-opacity min-w-[40px] min-h-[40px] flex items-center justify-center"
+                aria-label="Submit comment"
+              >
+                <Send className="w-4 h-4" />
+              </button>
+            </form>
+          )}
 
           {/* Missing highlighted comment notice */}
           {!loadingComments && missingHighlightNotice && (
