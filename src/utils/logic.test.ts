@@ -1019,8 +1019,164 @@ test('resolvePageNotificationRoute routes Page alerts to Page views inside Page 
     'p1'
   );
   assert.equal(statusRoute.view, 'page-settings');
+  assert.equal(statusRoute.pageTab, 'verification');
+
+  const accessRoute = resolvePageNotificationRoute(
+    { type: 'page_role_updated', entityType: 'page_manager', recipientPageId: 'p1' },
+    'p1'
+  );
+  assert.equal(accessRoute.view, 'page-settings');
+  assert.equal(accessRoute.pageTab, 'access');
+
+  const dangerRoute = resolvePageNotificationRoute(
+    { type: 'page_status', entityType: 'page', recipientPageId: 'p1' },
+    'p1'
+  );
+  assert.equal(dangerRoute.view, 'page-settings');
+  assert.equal(dangerRoute.pageTab, 'danger');
 });
 
+test('4-role Page RBAC normalizes legacy manager role and enforces role capabilities', async () => {
+  const { normalizePageRole, formatPageRoleLabel, getPageRoleCapabilities } = await import(
+    '../lib/pageUtils.ts'
+  );
 
+  assert.equal(normalizePageRole('owner'), 'owner');
+  assert.equal(normalizePageRole('admin'), 'admin');
+  assert.equal(normalizePageRole('editor'), 'editor');
+  assert.equal(normalizePageRole('moderator'), 'moderator');
+  assert.equal(normalizePageRole('manager'), 'admin');
+  assert.equal(normalizePageRole(null), 'admin');
+
+  assert.equal(formatPageRoleLabel('owner'), 'Owner');
+  assert.equal(formatPageRoleLabel('editor'), 'Editor');
+  assert.equal(formatPageRoleLabel('moderator'), 'Moderator');
+  assert.equal(formatPageRoleLabel('manager'), 'Admin');
+
+  const ownerCaps = getPageRoleCapabilities('owner');
+  assert.equal(ownerCaps.canTransferOwnership, true);
+  assert.equal(ownerCaps.canEditHandle, true);
+  assert.equal(ownerCaps.canDisableOrDelete, true);
+  assert.equal(ownerCaps.canPublishPosts, true);
+
+  const adminCaps = getPageRoleCapabilities('admin');
+  assert.equal(adminCaps.canTransferOwnership, false);
+  assert.equal(adminCaps.canEditHandle, false);
+  assert.equal(adminCaps.canDisableOrDelete, false);
+  assert.equal(adminCaps.canManageRoles, true);
+  assert.equal(adminCaps.canRequestVerification, true);
+  assert.equal(adminCaps.canPublishPosts, true);
+
+  const editorCaps = getPageRoleCapabilities('editor');
+  assert.equal(editorCaps.canPublishPosts, true);
+  assert.equal(editorCaps.canEditInfo, true);
+  assert.equal(editorCaps.canModeratePosts, true);
+  assert.equal(editorCaps.canManageFollowers, false);
+  assert.equal(editorCaps.canManageRoles, false);
+  assert.equal(editorCaps.canEditPrivacy, false);
+
+  const modCaps = getPageRoleCapabilities('moderator');
+  assert.equal(modCaps.canPublishPosts, false);
+  assert.equal(modCaps.canEditInfo, false);
+  assert.equal(modCaps.canModeratePosts, true);
+  assert.equal(modCaps.canModerateComments, true);
+  assert.equal(modCaps.canManageFollowers, true);
+  assert.equal(modCaps.canUseInbox, true);
+});
+
+test('containsHiddenKeyword detects blocked keywords case-insensitively and ignores blanks', async () => {
+  const { containsHiddenKeyword } = await import('../lib/pageUtils.ts');
+
+  assert.equal(containsHiddenKeyword('Buy cheap CRYPTO now', ['  ', 'crypto', 'scam']), 'crypto');
+  assert.equal(containsHiddenKeyword('Normal campus announcement', ['crypto', 'scam']), null);
+  assert.equal(containsHiddenKeyword('', ['crypto']), null);
+  assert.equal(containsHiddenKeyword('Hello world', null), null);
+});
+
+test('buildPermittedPageUpdatePayload validates extended settings fields and strips privileged columns', async () => {
+  const { buildPermittedPageUpdatePayload } = await import('../lib/pageUtils.ts');
+
+  const res = buildPermittedPageUpdatePayload({
+    publishing_permission: 'admins_editors',
+    comment_permission: 'followers',
+    messaging_permission: 'disabled',
+    hidden_words: [' Spam ', 'spam', 'SCAM', ''],
+    inbox_access_roles: ['editor', 'moderator'],
+    welcome_message: '  Welcome to ABSU Memes!  ',
+    away_mode_enabled: true,
+    away_message: 'We will reply by 9am.',
+  });
+
+  assert.ok(res.payload);
+  assert.equal(res.payload?.publishing_permission, 'admins_editors');
+  assert.equal(res.payload?.comment_permission, 'followers');
+  assert.equal(res.payload?.allow_comments, true);
+  assert.equal(res.payload?.messaging_permission, 'disabled');
+  assert.equal(res.payload?.allow_messages, false);
+  assert.deepEqual(res.payload?.hidden_words, ['spam', 'scam']);
+  assert.deepEqual(res.payload?.inbox_access_roles, ['owner', 'editor', 'moderator']);
+  assert.equal(res.payload?.welcome_message, 'Welcome to ABSU Memes!');
+  assert.equal(res.payload?.away_mode_enabled, true);
+  assert.equal(res.payload?.away_message, 'We will reply by 9am.');
+  assert.equal('is_verified' in (res.payload || {}), false);
+  assert.equal('deletion_requested_at' in (res.payload || {}), false);
+  assert.equal('created_by' in (res.payload || {}), false);
+
+  const invalidComment = buildPermittedPageUpdatePayload({ comment_permission: 'vip_only' });
+  assert.ok(invalidComment.error);
+});
+
+test('classifyAdminVerificationError maps session, non-admin, missing page, and strips private schema names', async () => {
+  const { classifyAdminVerificationError } = await import('../lib/pageUtils.ts');
+
+  assert.equal(
+    classifyAdminVerificationError({ code: 'PGRST301', message: 'JWT expired' }),
+    'Session expired. Please sign in again.'
+  );
+  assert.equal(
+    classifyAdminVerificationError('Not authenticated'),
+    'Session expired. Please sign in again.'
+  );
+  assert.equal(
+    classifyAdminVerificationError({ code: '42501', message: 'Super administrator permission required' }),
+    'User is not a super administrator.'
+  );
+  assert.equal(
+    classifyAdminVerificationError('User is not authorized for this operation'),
+    'User is not a super administrator.'
+  );
+  assert.equal(
+    classifyAdminVerificationError({ code: 'P0002', message: 'Page not found' }),
+    'Page not found.'
+  );
+  assert.equal(
+    classifyAdminVerificationError({ code: '22P02', message: 'invalid input syntax for type uuid' }),
+    'Page not found.'
+  );
+  const permDenied = classifyAdminVerificationError('permission denied for schema private');
+  assert.ok(permDenied.startsWith('Database operation failed:'));
+  assert.equal(/private\./i.test(permDenied), false);
+
+  const sanitizedLeak = classifyAdminVerificationError('relation private.app_admins does not exist');
+  assert.equal(/private\./i.test(sanitizedLeak), false);
+  assert.ok(sanitizedLeak.includes('Database operation failed:'));
+});
+
+test('adminSetPageVerified rejects non-UUID page IDs cleanly without throwing', async () => {
+  const { adminSetPageVerified } = await import('../lib/pageService.ts');
+  const res = await adminSetPageVerified('not-a-valid-uuid', true);
+  assert.equal(res.success, false);
+  assert.equal(res.error, 'Page not found.');
+});
+
+test('isSuperAdminEmail recognizes configured super admins and rejects ordinary student accounts', async () => {
+  const { isSuperAdminEmail } = await import('../lib/adminService.ts');
+  assert.equal(isSuperAdminEmail('wisdomchinonso82@gmail.com'), true);
+  assert.equal(isSuperAdminEmail('  WisdomChinonso82@Gmail.com '), true);
+  assert.equal(isSuperAdminEmail('natashaojiugo112@gmail.com'), true);
+  assert.equal(isSuperAdminEmail('student@absu.edu.ng'), false);
+  assert.equal(isSuperAdminEmail(''), false);
+  assert.equal(isSuperAdminEmail(null), false);
+});
 
 

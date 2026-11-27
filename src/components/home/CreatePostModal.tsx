@@ -7,6 +7,7 @@ import {
   validatePostSubmission,
   validatePagePostAttachments,
 } from '../../utils/logic.ts';
+import { getPageRoleCapabilities } from '../../lib/pageUtils.ts';
 import {
   safeReadAndPrepareImage,
   safeReadAndPrepareVideo,
@@ -134,6 +135,8 @@ export const CreatePostModal: React.FC = () => {
 
   const activePageIdentity = activeIdentity.type === 'page' ? activeIdentity.page : null;
   const isPostingAsPage = Boolean(activePageIdentity);
+  const canPublishInActiveIdentity =
+    activeIdentity.type !== 'page' || getPageRoleCapabilities(activeIdentity.role).canPublishPosts;
   const maxAllowedAttachments = isPostingAsPage ? 5 : MAX_POST_ATTACHMENTS;
 
   useEffect(() => {
@@ -677,8 +680,17 @@ export const CreatePostModal: React.FC = () => {
 
               {isPostingAsPage ? (
                 <div className="px-3 py-1.5 rounded-xl bg-[var(--color-bg-main)] border border-[var(--color-border)] text-xs font-semibold text-[var(--color-text-secondary)] flex items-center gap-1.5 shrink-0">
-                  <Globe className="w-3.5 h-3.5 text-[var(--color-primary)]" />
-                  <span>Public</span>
+                  {activePageIdentity?.default_post_visibility === 'followers' ? (
+                    <>
+                      <Users className="w-3.5 h-3.5 text-[var(--color-primary)]" />
+                      <span>Followers</span>
+                    </>
+                  ) : (
+                    <>
+                      <Globe className="w-3.5 h-3.5 text-[var(--color-primary)]" />
+                      <span>Public</span>
+                    </>
+                  )}
                 </div>
               ) : (
                 <div className="flex items-center gap-1.5 bg-[var(--color-bg-main)] p-1 rounded-xl border border-[var(--color-border)]">
@@ -1182,10 +1194,14 @@ export const CreatePostModal: React.FC = () => {
               <button
                 type="button"
                 onClick={handleSubmit}
-                disabled={isSubmitting || !content.trim()}
+                disabled={isSubmitting || !content.trim() || !canPublishInActiveIdentity}
                 className="min-h-[44px] px-4 sm:px-5 py-2 rounded-xl bg-[var(--color-primary)] hover:bg-[var(--color-primary-hover)] text-white text-xs font-bold shadow-sm transition-all active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1.5 whitespace-nowrap"
               >
-                {isSubmitting ? 'Publishing...' : 'Publish Post'}
+                {!canPublishInActiveIdentity
+                  ? 'Moderators Cannot Publish'
+                  : isSubmitting
+                  ? 'Publishing...'
+                  : 'Publish Post'}
               </button>
             </div>
           </div>

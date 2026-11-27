@@ -4,6 +4,7 @@ import { useApp } from '../../context/AppContext.tsx';
 import { VerifiedBadge } from '../common/VerifiedBadge.tsx';
 import { Avatar } from '../common/Avatar.tsx';
 import { formatPageCategoryLabel } from '../../types/pages.ts';
+import { formatPageRoleLabel } from '../../lib/pageUtils.ts';
 
 interface IdentitySwitcherProps {
   isOpen: boolean;
@@ -211,7 +212,7 @@ export const IdentitySwitcher: React.FC<IdentitySwitcherProps> = ({ isOpen, onCl
                           {page.isVerified && <VerifiedBadge size={14} />}
                         </div>
                         <p className="text-[11px] text-[var(--color-text-secondary)] truncate">
-                          {role === 'owner' ? 'Owner' : 'Admin'} · {formatPageCategoryLabel(page.category)}
+                          {formatPageRoleLabel(role)} · {formatPageCategoryLabel(page.category)}
                         </p>
                       </div>
                     </div>

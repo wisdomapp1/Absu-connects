@@ -111,7 +111,9 @@ export interface Post {
   pageSlug?: string;
   pageCategory?: string;
   pageStatus?: 'active' | 'disabled' | 'deleted';
+  visibility?: string;
   allowComments?: boolean;
+  pageCommentPermission?: 'everyone' | 'followers' | 'disabled';
   allowMessages?: boolean;
   communityId?: string;
   communityName?: string;
@@ -205,9 +207,14 @@ export type NotificationType =
   | 'page_like'
   | 'page_comment'
   | 'page_admin_invite'
+  | 'page_admin_accepted'
+  | 'page_role_updated'
+  | 'page_ownership_transferred'
   | 'page_follow_invite'
   | 'page_message'
   | 'page_verified'
+  | 'page_verification_approved'
+  | 'page_verification_rejected'
   | 'page_status';
 
 export interface NotificationItem {

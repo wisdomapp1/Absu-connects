@@ -12,31 +12,44 @@ import {
   ShieldAlert,
   RotateCcw,
 } from 'lucide-react';
-import type { Page, PageFollower, PageBlock } from '../../types/pages.ts';
+import type {
+  Page,
+  PageFollower,
+  PageBlock,
+  PageRestrictedUser,
+  PageManagerRole,
+  CanonicalPageRole,
+} from '../../types/pages.ts';
 import {
   fetchPageFollowers,
   fetchPageBlocks,
+  fetchPageRestrictedUsers,
   removePageFollower,
   blockUserFromPage,
   unblockUserFromPage,
+  restrictUserFromPage,
+  unrestrictUserFromPage,
   inviteFriendToPage,
 } from '../../lib/pageService.ts';
+import { getPageRoleCapabilities } from '../../lib/pageUtils.ts';
 import { useApp } from '../../context/AppContext.tsx';
 import { Avatar } from '../common/Avatar.tsx';
 
 interface PageFollowersViewProps {
   page: Page;
-  role: 'owner' | 'admin';
+  role: PageManagerRole | CanonicalPageRole;
 }
 
-export const PageFollowersView: React.FC<PageFollowersViewProps> = ({ page }) => {
+export const PageFollowersView: React.FC<PageFollowersViewProps> = ({ page, role }) => {
   const { friends, navigateTo, goBack, addToast, refreshManagedPages } = useApp();
+  const caps = useMemo(() => getPageRoleCapabilities(role), [role]);
 
   const [followers, setFollowers] = useState<PageFollower[]>([]);
   const [blocks, setBlocks] = useState<PageBlock[]>([]);
+  const [restrictedUsers, setRestrictedUsers] = useState<PageRestrictedUser[]>([]);
   const [loading, setLoading] = useState(true);
   const [searchQuery, setSearchQuery] = useState('');
-  const [tab, setTab] = useState<'followers' | 'blocked'>('followers');
+  const [tab, setTab] = useState<'followers' | 'restricted' | 'blocked'>('followers');
   const [inviteModalOpen, setInviteModalOpen] = useState(false);
   const [invitedFriendIds, setInvitedFriendIds] = useState<Set<string>>(new Set());
   const [busyUserId, setBusyUserId] = useState<string | null>(null);
@@ -44,12 +57,14 @@ export const PageFollowersView: React.FC<PageFollowersViewProps> = ({ page }) =>
   const loadData = useCallback(async () => {
     setLoading(true);
     try {
-      const [fols, blks] = await Promise.all([
+      const [fols, blks, rests] = await Promise.all([
         fetchPageFollowers(page.id, 120),
         fetchPageBlocks(page.id),
+        fetchPageRestrictedUsers(page.id),
       ]);
       setFollowers(fols);
       setBlocks(blks);
+      setRestrictedUsers(rests);
     } finally {
       setLoading(false);
     }
@@ -70,6 +85,17 @@ export const PageFollowersView: React.FC<PageFollowersViewProps> = ({ page }) =>
     });
   }, [followers, searchQuery]);
 
+  const filteredRestricted = useMemo(() => {
+    const q = searchQuery.trim().toLowerCase();
+    if (!q) return restrictedUsers;
+    return restrictedUsers.filter((r) => {
+      const name = (r.user?.display_name || '').toLowerCase();
+      const username = (r.user?.username || '').toLowerCase();
+      const dept = (r.user?.department || '').toLowerCase();
+      return name.includes(q) || username.includes(q) || dept.includes(q);
+    });
+  }, [restrictedUsers, searchQuery]);
+
   const filteredBlocks = useMemo(() => {
     const q = searchQuery.trim().toLowerCase();
     if (!q) return blocks;
@@ -80,8 +106,13 @@ export const PageFollowersView: React.FC<PageFollowersViewProps> = ({ page }) =>
     });
   }, [blocks, searchQuery]);
 
+  const restrictedIdSet = useMemo(
+    () => new Set(restrictedUsers.map((r) => r.user_id)),
+    [restrictedUsers]
+  );
+
   const handleRemoveFollower = async (userId: string) => {
-    if (busyUserId) return;
+    if (busyUserId || !caps.canManageFollowers) return;
     setBusyUserId(userId);
     try {
       const res = await removePageFollower(page.id, userId);
@@ -97,8 +128,40 @@ export const PageFollowersView: React.FC<PageFollowersViewProps> = ({ page }) =>
     }
   };
 
+  const handleRestrictUser = async (userId: string) => {
+    if (busyUserId || !caps.canManageFollowers) return;
+    setBusyUserId(userId);
+    try {
+      const res = await restrictUserFromPage(page.id, userId, 'Restricted by Page moderator');
+      if (res.success) {
+        addToast('User restricted from commenting and messaging this Page.', 'info');
+        await loadData();
+      } else {
+        addToast(res.error || 'Could not restrict user.', 'warning');
+      }
+    } finally {
+      setBusyUserId(null);
+    }
+  };
+
+  const handleUnrestrictUser = async (userId: string) => {
+    if (busyUserId || !caps.canManageFollowers) return;
+    setBusyUserId(userId);
+    try {
+      const res = await unrestrictUserFromPage(page.id, userId);
+      if (res.success) {
+        setRestrictedUsers((prev) => prev.filter((r) => r.user_id !== userId));
+        addToast('User restriction lifted.', 'info');
+      } else {
+        addToast(res.error || 'Could not unrestrict user.', 'warning');
+      }
+    } finally {
+      setBusyUserId(null);
+    }
+  };
+
   const handleBlockUser = async (userId: string) => {
-    if (busyUserId) return;
+    if (busyUserId || !caps.canManageFollowers) return;
     setBusyUserId(userId);
     try {
       const res = await blockUserFromPage(page.id, userId, 'Blocked by Page manager');
@@ -115,7 +178,7 @@ export const PageFollowersView: React.FC<PageFollowersViewProps> = ({ page }) =>
   };
 
   const handleUnblockUser = async (userId: string) => {
-    if (busyUserId) return;
+    if (busyUserId || !caps.canManageFollowers) return;
     setBusyUserId(userId);
     try {
       const res = await unblockUserFromPage(page.id, userId);
@@ -155,7 +218,7 @@ export const PageFollowersView: React.FC<PageFollowersViewProps> = ({ page }) =>
           </button>
           <div className="min-w-0">
             <h1 className="text-lg font-extrabold text-[var(--color-text-primary)] truncate">
-              Page Followers
+              Page Audience
             </h1>
             <p className="text-xs text-[var(--color-text-secondary)] truncate">
               {page.name} ·{' '}
@@ -177,13 +240,19 @@ export const PageFollowersView: React.FC<PageFollowersViewProps> = ({ page }) =>
         </button>
       </div>
 
+      {!caps.canManageFollowers && (
+        <div className="bg-[var(--color-bg-card)] border border-[var(--color-border)] rounded-2xl px-4 py-3 text-xs text-[var(--color-text-secondary)]">
+          Viewing audience in read-only mode. Owners, Admins, and Moderators can remove, restrict, or block followers.
+        </div>
+      )}
+
       {/* Tabs & Search */}
       <div className="bg-[var(--color-bg-card)] border border-[var(--color-border)] rounded-2xl p-3.5 space-y-3">
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-2 overflow-x-auto pb-0.5">
           <button
             type="button"
             onClick={() => setTab('followers')}
-            className={`min-h-[40px] px-4 rounded-xl text-xs font-bold transition-colors whitespace-nowrap ${
+            className={`min-h-[40px] px-4 rounded-xl text-xs font-bold transition-colors whitespace-nowrap tabular-nums ${
               tab === 'followers'
                 ? 'bg-[var(--color-primary)] text-white'
                 : 'bg-[var(--color-bg-main)] border border-[var(--color-border)] text-[var(--color-text-secondary)]'
@@ -193,8 +262,19 @@ export const PageFollowersView: React.FC<PageFollowersViewProps> = ({ page }) =>
           </button>
           <button
             type="button"
+            onClick={() => setTab('restricted')}
+            className={`min-h-[40px] px-4 rounded-xl text-xs font-bold transition-colors whitespace-nowrap tabular-nums ${
+              tab === 'restricted'
+                ? 'bg-[var(--color-primary)] text-white'
+                : 'bg-[var(--color-bg-main)] border border-[var(--color-border)] text-[var(--color-text-secondary)]'
+            }`}
+          >
+            Restricted ({restrictedUsers.length})
+          </button>
+          <button
+            type="button"
             onClick={() => setTab('blocked')}
-            className={`min-h-[40px] px-4 rounded-xl text-xs font-bold transition-colors whitespace-nowrap ${
+            className={`min-h-[40px] px-4 rounded-xl text-xs font-bold transition-colors whitespace-nowrap tabular-nums ${
               tab === 'blocked'
                 ? 'bg-[var(--color-primary)] text-white'
                 : 'bg-[var(--color-bg-main)] border border-[var(--color-border)] text-[var(--color-text-secondary)]'
@@ -213,6 +293,8 @@ export const PageFollowersView: React.FC<PageFollowersViewProps> = ({ page }) =>
             placeholder={
               tab === 'followers'
                 ? 'Search followers by name, username, or department...'
+                : tab === 'restricted'
+                ? 'Search restricted accounts...'
                 : 'Search blocked users...'
             }
             className="w-full min-h-[42px] pl-10 pr-4 rounded-xl bg-[var(--color-bg-main)] border border-[var(--color-border)] text-xs sm:text-sm text-[var(--color-text-primary)] placeholder:text-[var(--color-text-secondary)] focus:outline-none focus:ring-2 focus:ring-[var(--color-primary)]"
@@ -243,6 +325,7 @@ export const PageFollowersView: React.FC<PageFollowersViewProps> = ({ page }) =>
               {filteredFollowers.map((f) => {
                 const name = f.user?.display_name || f.user?.username || 'ABSU Student';
                 const busy = busyUserId === f.user_id;
+                const isRestricted = restrictedIdSet.has(f.user_id);
                 return (
                   <div
                     key={f.user_id}
@@ -261,32 +344,101 @@ export const PageFollowersView: React.FC<PageFollowersViewProps> = ({ page }) =>
                         <p className="text-xs text-[var(--color-text-secondary)] truncate">
                           {f.user?.username ? `@${f.user.username}` : 'Student'}
                           {f.user?.department ? ` · ${f.user.department}` : ''}
+                          {isRestricted ? ' · Restricted' : ''}
                         </p>
                       </div>
                     </button>
 
-                    <div className="flex items-center gap-1.5 shrink-0">
-                      <button
-                        type="button"
-                        disabled={busy}
-                        onClick={() => handleRemoveFollower(f.user_id)}
-                        className="min-h-[40px] px-3 rounded-xl bg-[var(--color-bg-main)] border border-[var(--color-border)] text-xs font-semibold text-[var(--color-text-secondary)] hover:text-[var(--color-text-primary)] flex items-center gap-1 whitespace-nowrap disabled:opacity-50"
-                        title="Remove follower"
-                      >
-                        <UserX className="w-3.5 h-3.5" />
-                        <span className="hidden sm:inline">Remove</span>
-                      </button>
-                      <button
-                        type="button"
-                        disabled={busy}
-                        onClick={() => handleBlockUser(f.user_id)}
-                        className="min-h-[40px] px-3 rounded-xl bg-rose-500/10 text-rose-500 hover:bg-rose-500/20 text-xs font-bold flex items-center gap-1 whitespace-nowrap disabled:opacity-50"
-                        title="Block from Page"
-                      >
-                        <Ban className="w-3.5 h-3.5" />
-                        <span className="hidden sm:inline">Block</span>
-                      </button>
+                    {caps.canManageFollowers && (
+                      <div className="flex items-center gap-1.5 shrink-0">
+                        <button
+                          type="button"
+                          disabled={busy}
+                          onClick={() =>
+                            isRestricted
+                              ? handleUnrestrictUser(f.user_id)
+                              : handleRestrictUser(f.user_id)
+                          }
+                          className="min-h-[40px] px-3 rounded-xl bg-[var(--color-bg-main)] border border-[var(--color-border)] text-xs font-semibold text-amber-500 hover:bg-amber-500/10 flex items-center gap-1 whitespace-nowrap disabled:opacity-50"
+                          title={isRestricted ? 'Unrestrict user' : 'Restrict commenting/messaging'}
+                        >
+                          <ShieldAlert className="w-3.5 h-3.5" />
+                          <span className="hidden sm:inline">
+                            {isRestricted ? 'Unrestrict' : 'Restrict'}
+                          </span>
+                        </button>
+                        <button
+                          type="button"
+                          disabled={busy}
+                          onClick={() => handleRemoveFollower(f.user_id)}
+                          className="min-h-[40px] px-3 rounded-xl bg-[var(--color-bg-main)] border border-[var(--color-border)] text-xs font-semibold text-[var(--color-text-secondary)] hover:text-[var(--color-text-primary)] flex items-center gap-1 whitespace-nowrap disabled:opacity-50"
+                          title="Remove follower"
+                        >
+                          <UserX className="w-3.5 h-3.5" />
+                          <span className="hidden sm:inline">Remove</span>
+                        </button>
+                        <button
+                          type="button"
+                          disabled={busy}
+                          onClick={() => handleBlockUser(f.user_id)}
+                          className="min-h-[40px] px-3 rounded-xl bg-rose-500/10 text-rose-500 hover:bg-rose-500/20 text-xs font-bold flex items-center gap-1 whitespace-nowrap disabled:opacity-50"
+                          title="Block from Page"
+                        >
+                          <Ban className="w-3.5 h-3.5" />
+                          <span className="hidden sm:inline">Block</span>
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+      ) : tab === 'restricted' ? (
+        <div className="bg-[var(--color-bg-card)] border border-[var(--color-border)] rounded-2xl overflow-hidden">
+          {filteredRestricted.length === 0 ? (
+            <div className="p-8 text-center space-y-2">
+              <ShieldAlert className="w-8 h-8 text-[var(--color-text-secondary)] mx-auto opacity-60" />
+              <p className="text-sm font-bold text-[var(--color-text-primary)]">
+                No restricted accounts
+              </p>
+              <p className="text-xs text-[var(--color-text-secondary)]">
+                Restricted users can still follow {page.name} but cannot comment or send inbox messages.
+              </p>
+            </div>
+          ) : (
+            <div className="divide-y divide-[var(--color-border)]">
+              {filteredRestricted.map((r) => {
+                const name = r.user?.display_name || r.user?.username || 'Restricted user';
+                const busy = busyUserId === r.user_id;
+                return (
+                  <div
+                    key={r.user_id}
+                    className="p-3.5 flex items-center justify-between gap-3"
+                  >
+                    <div className="flex items-center gap-3 min-w-0">
+                      <Avatar src={r.user?.avatar_url} name={name} size="md" className="shrink-0" />
+                      <div className="min-w-0">
+                        <p className="text-sm font-bold text-[var(--color-text-primary)] truncate">
+                          {name}
+                        </p>
+                        <p className="text-xs text-[var(--color-text-secondary)] truncate">
+                          {r.reason || 'Restricted from commenting and messaging'}
+                        </p>
+                      </div>
                     </div>
+                    {caps.canManageFollowers && (
+                      <button
+                        type="button"
+                        disabled={busy}
+                        onClick={() => handleUnrestrictUser(r.user_id)}
+                        className="min-h-[40px] px-3.5 rounded-xl bg-[var(--color-bg-main)] border border-[var(--color-border)] text-xs font-bold text-[var(--color-text-primary)] flex items-center gap-1.5 whitespace-nowrap disabled:opacity-50"
+                      >
+                        <RotateCcw className="w-3.5 h-3.5" />
+                        <span>Unrestrict</span>
+                      </button>
+                    )}
                   </div>
                 );
               })}
@@ -326,15 +478,17 @@ export const PageFollowersView: React.FC<PageFollowersViewProps> = ({ page }) =>
                         </p>
                       </div>
                     </div>
-                    <button
-                      type="button"
-                      disabled={busy}
-                      onClick={() => handleUnblockUser(b.user_id)}
-                      className="min-h-[40px] px-3.5 rounded-xl bg-[var(--color-bg-main)] border border-[var(--color-border)] text-xs font-bold text-[var(--color-text-primary)] flex items-center gap-1.5 whitespace-nowrap disabled:opacity-50"
-                    >
-                      <RotateCcw className="w-3.5 h-3.5" />
-                      <span>Unblock</span>
-                    </button>
+                    {caps.canManageFollowers && (
+                      <button
+                        type="button"
+                        disabled={busy}
+                        onClick={() => handleUnblockUser(b.user_id)}
+                        className="min-h-[40px] px-3.5 rounded-xl bg-[var(--color-bg-main)] border border-[var(--color-border)] text-xs font-bold text-[var(--color-text-primary)] flex items-center gap-1.5 whitespace-nowrap disabled:opacity-50"
+                      >
+                        <RotateCcw className="w-3.5 h-3.5" />
+                        <span>Unblock</span>
+                      </button>
+                    )}
                   </div>
                 );
               })}

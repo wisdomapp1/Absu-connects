@@ -1,6 +1,6 @@
 import React from 'react';
 import { useApp } from '../../context/AppContext.tsx';
-import { Home, Users, MessageCircle, Settings } from 'lucide-react';
+import { Home, Compass, MessageCircle, Settings } from 'lucide-react';
 import { ReelsIcon } from '../common/ReelsIcon.tsx';
 
 export const PageBottomNav: React.FC = () => {
@@ -19,7 +19,7 @@ export const PageBottomNav: React.FC = () => {
   const isReelsMode = activeView === 'reels';
 
   const items: Array<{
-    id: 'home' | 'page-followers' | 'page-inbox' | 'reels' | 'page-settings';
+    id: 'home' | 'pages' | 'page-inbox' | 'reels' | 'page-settings';
     label: string;
     icon: React.ComponentType<{ className?: string }>;
     badgeCount?: number;
@@ -32,17 +32,17 @@ export const PageBottomNav: React.FC = () => {
       onPress: () => setActiveTab('home'),
     },
     {
-      id: 'page-followers',
-      label: 'Followers',
-      icon: Users,
+      id: 'pages',
+      label: 'Discovery',
+      icon: Compass,
       onPress: () => {
-        if (activeView === 'page-followers') {
+        if (activeView === 'pages') {
           window.dispatchEvent(
-            new CustomEvent('absu:scroll-top', { detail: { view: 'page-followers' } })
+            new CustomEvent('absu:scroll-top', { detail: { view: 'pages' } })
           );
           void refreshCurrentScreen();
         } else {
-          navigateTo('page-followers', { pageId });
+          navigateTo('pages');
         }
       },
     },

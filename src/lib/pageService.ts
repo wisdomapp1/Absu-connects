@@ -36,6 +36,7 @@ import { mapProfileRowToUser, SupabaseProfileRow } from './profileService.ts';
 import { mapDbEnumToAppType, getPrivacySafeNotificationText, isValidUuid } from './notificationService.ts';
 import {
   buildPermittedPageUpdatePayload,
+  classifyAdminVerificationError,
   computeAdminPagesStats,
   dedupeManagedPageEntries,
   dedupePages,
@@ -43,6 +44,7 @@ import {
   resolvePageAvatarUrl,
   resolvePageCoverUrl,
 } from './pageUtils.ts';
+import { ensureAuthenticatedSession } from './adminService.ts';
 
 // Hardcoded canonical ID for Mr Anonymous from DB inspection
 export const MR_ANONYMOUS_SLUG = 'mr-anonymous';
@@ -1991,8 +1993,63 @@ export async function markAllPageNotificationsRead(
 /**
  * Super Admin — Manage Pages Console RPCs & Express Admin API
  */
+export { classifyAdminVerificationError };
+
+export async function verifyCurrentUserIsSuperAdmin(): Promise<{ ok: boolean; error?: string }> {
+  const sessionState = await ensureAuthenticatedSession();
+  if (sessionState.sessionExpired || !sessionState.session) {
+    return { ok: false, error: 'Session expired. Please sign in again.' };
+  }
+
+  let { data: isAdmin, error } = await supabase.rpc('current_user_is_admin');
+  if (error) {
+    const classified = classifyAdminVerificationError(error);
+    if (classified.startsWith('Session expired')) {
+      const { data: refreshed } = await supabase.auth
+        .refreshSession()
+        .catch(() => ({ data: { session: null } }));
+      if (!refreshed?.session?.access_token) {
+        return { ok: false, error: 'Session expired. Please sign in again.' };
+      }
+      const retry = await supabase.rpc('current_user_is_admin');
+      isAdmin = retry.data;
+      error = retry.error;
+    }
+  }
+
+  if (error) {
+    return { ok: false, error: classifyAdminVerificationError(error) };
+  }
+  if (isAdmin !== true) {
+    return { ok: false, error: 'User is not a super administrator.' };
+  }
+  return { ok: true };
+}
+
 export async function fetchAdminPagesStats(): Promise<AdminPagesStats> {
   return withInFlightDedup('admin-pages-stats', async () => {
+    const sessionState = await ensureAuthenticatedSession();
+    if (!sessionState.sessionExpired && sessionState.session) {
+      try {
+        const { data, error } = await supabase.rpc('admin_pages_stats');
+        if (!error && data && typeof data === 'object') {
+          const d = Array.isArray(data) ? data[0] : data;
+          if (d) {
+            return {
+              totalPages: Number(d.total_pages ?? d.totalPages ?? 0),
+              activePages: Number(d.active_pages ?? d.activePages ?? 0),
+              verifiedPages: Number(d.verified_pages ?? d.verifiedPages ?? 0),
+              disabledPages: Number(d.disabled_pages ?? d.disabledPages ?? 0),
+              deletedPages: Number(d.deleted_pages ?? d.deletedPages ?? 0),
+              openReports: Number(d.open_reports ?? d.openReports ?? 0),
+            };
+          }
+        }
+      } catch {
+        // Fall through cleanly
+      }
+    }
+
     try {
       const token = await getAuthToken();
       if (token) {
@@ -2016,25 +2073,6 @@ export async function fetchAdminPagesStats(): Promise<AdminPagesStats> {
 
       if (!pagesErr && Array.isArray(pages)) {
         return computeAdminPagesStats(pages, openReports || 0);
-      }
-    } catch {
-      // Fall through to RPC
-    }
-
-    try {
-      const { data, error } = await supabase.rpc('admin_pages_stats');
-      if (!error && data && typeof data === 'object') {
-        const d = Array.isArray(data) ? data[0] : data;
-        if (d) {
-          return {
-            totalPages: Number(d.total_pages ?? d.totalPages ?? 0),
-            activePages: Number(d.active_pages ?? d.activePages ?? 0),
-            verifiedPages: Number(d.verified_pages ?? d.verifiedPages ?? 0),
-            disabledPages: Number(d.disabled_pages ?? d.disabledPages ?? 0),
-            deletedPages: Number(d.deleted_pages ?? d.deletedPages ?? 0),
-            openReports: Number(d.open_reports ?? d.openReports ?? 0),
-          };
-        }
       }
     } catch {
       // Ignore
@@ -2061,6 +2099,25 @@ export async function adminListPages(params?: {
   }`;
 
   return withInFlightDedup(key, async () => {
+    const sessionState = await ensureAuthenticatedSession();
+    if (!sessionState.sessionExpired && sessionState.session) {
+      try {
+        const { data, error } = await supabase.rpc('admin_list_pages', {
+          p_search: params?.search?.trim() || null,
+          p_status: params?.status && params.status !== 'all' ? params.status : null,
+          p_verified:
+            params?.verified === 'verified' ? true : params?.verified === 'unverified' ? false : null,
+        });
+        if (!error && Array.isArray(data)) {
+          return dedupePages(
+            data.map((row: any) => mapSupabasePageRowToPage(row, { includePrivateMeta: true }))
+          );
+        }
+      } catch {
+        // Fallback below
+      }
+    }
+
     try {
       const token = await getAuthToken();
       if (token) {
@@ -2080,22 +2137,6 @@ export async function adminListPages(params?: {
       }
     } catch {
       // Fall through cleanly
-    }
-
-    try {
-      const { data, error } = await supabase.rpc('admin_list_pages', {
-        p_search: params?.search?.trim() || null,
-        p_status: params?.status && params.status !== 'all' ? params.status : null,
-        p_verified:
-          params?.verified === 'verified' ? true : params?.verified === 'unverified' ? false : null,
-      });
-      if (!error && Array.isArray(data)) {
-        return dedupePages(
-          data.map((row: any) => mapSupabasePageRowToPage(row, { includePrivateMeta: true }))
-        );
-      }
-    } catch {
-      // Fallback below
     }
 
     try {
@@ -2125,44 +2166,31 @@ export async function adminSetPageVerified(
   pageId: string,
   verified: boolean
 ): Promise<{ success: boolean; error?: string }> {
+  const cleanPageId = String(pageId || '').trim();
+  if (!isValidUuid(cleanPageId)) {
+    return { success: false, error: 'Page not found.' };
+  }
+
   try {
-    const token = await getAuthToken();
-    if (token) {
-      const res = await fetch(`/api/admin/pages/${encodeURIComponent(pageId)}/verify`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${token}`,
-        },
-        body: JSON.stringify({ verified }),
-      }).catch(() => null);
-      const json = await parseApiJson(res);
-      if (res && json) {
-        if (res.ok && json.success) return { success: true };
-        if (res.status !== 404 && !json.fallbackToRpc && json.error) {
-          return { success: false, error: json.error };
-        }
-      }
+    const adminCheck = await verifyCurrentUserIsSuperAdmin();
+    if (!adminCheck.ok) {
+      return { success: false, error: adminCheck.error || 'User is not a super administrator.' };
     }
 
-    const { error } = await supabase.rpc('admin_set_page_verified', {
-      p_page_id: pageId,
-      p_verified: verified,
+    const { data, error } = await supabase.rpc('admin_set_page_verified', {
+      p_page_id: cleanPageId,
+      p_verified: Boolean(verified),
     });
+
     if (error) {
-      const msg = error.message || 'Failed to update verification.';
-      if (/super administrator permission required/i.test(msg)) {
-        return {
-          success: false,
-          error:
-            'Super administrator permission required in Supabase (private.app_admins). Run the 20261125 SQL migration in Supabase SQL Editor.',
-        };
-      }
-      return { success: false, error: msg };
+      return { success: false, error: classifyAdminVerificationError(error) };
+    }
+    if (data === false) {
+      return { success: false, error: 'Page not found.' };
     }
     return { success: true };
   } catch (err: unknown) {
-    return { success: false, error: err instanceof Error ? err.message : 'Failed to update verification.' };
+    return { success: false, error: classifyAdminVerificationError(err) };
   }
 }
 
@@ -3173,35 +3201,33 @@ export async function adminReviewVerificationRequest(
   decision: 'approved' | 'rejected',
   reviewNote?: string
 ): Promise<{ success: boolean; error?: string }> {
+  const cleanReqId = String(requestId || '').trim();
+  if (!isValidUuid(cleanReqId)) {
+    return { success: false, error: 'Page not found.' };
+  }
+
   try {
-    const token = await getAuthToken();
-    if (token) {
-      const res = await fetch(`/api/admin/pages/verification-requests/${encodeURIComponent(requestId)}/review`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${token}`,
-        },
-        body: JSON.stringify({ decision, reviewNote }),
-      }).catch(() => null);
-      const json = await parseApiJson(res);
-      if (res?.ok && json?.success) return { success: true };
-      if (res && res.status !== 503 && res.status !== 404 && json?.error) {
-        return { success: false, error: json.error };
-      }
+    const adminCheck = await verifyCurrentUserIsSuperAdmin();
+    if (!adminCheck.ok) {
+      return { success: false, error: adminCheck.error || 'User is not a super administrator.' };
     }
 
-    const { error } = await supabase.rpc('admin_review_verification_request', {
-      p_request_id: requestId,
+    const { data, error } = await supabase.rpc('admin_review_verification_request', {
+      p_request_id: cleanReqId,
       p_decision: decision,
       ...(reviewNote ? { p_review_note: reviewNote.trim() } : {}),
     });
-    if (error) return { success: false, error: error.message };
+    if (error) {
+      return { success: false, error: classifyAdminVerificationError(error) };
+    }
+    if (data === false) {
+      return { success: false, error: 'Page not found.' };
+    }
     return { success: true };
   } catch (err: unknown) {
     return {
       success: false,
-      error: err instanceof Error ? err.message : 'Failed to review verification request.',
+      error: classifyAdminVerificationError(err),
     };
   }
 }
@@ -3235,7 +3261,7 @@ export async function fetchPageMediaInventory(page: Page): Promise<PageMediaInve
   try {
     const posts = await fetchPagePostsForManager(page.id);
     for (const post of posts) {
-      const mediaItems: PostMediaItem[] = Array.isArray(post.media) ? post.media : [];
+      const mediaItems: PostMediaItem[] = Array.isArray(post.mediaItems) ? post.mediaItems : [];
       for (const m of mediaItems) {
         if (!m?.secure_url) continue;
         items.push({
@@ -3310,9 +3336,9 @@ export async function buildPageDataExportBundle(page: Page, userId?: string): Pr
       visibility: p.visibility,
       isPinned: Boolean(p.isPinned),
       createdAt: p.createdAt,
-      likesCount: p.likes,
+      likesCount: p.likesCount,
       commentsCount: p.commentsCount ?? p.comments.length,
-      mediaUrls: (p.media || []).map((m) => m.secure_url),
+      mediaUrls: (p.mediaItems || []).map((m) => m.secure_url),
     })),
     mediaInventory,
     auditLogs: auditLogs.map((l) => ({

@@ -17,6 +17,7 @@ import {
   Compass,
   User as UserIcon,
 } from 'lucide-react';
+import { formatPageRoleLabel, getPageRoleCapabilities } from '../../lib/pageUtils.ts';
 
 export const PageHeader: React.FC = () => {
   const {
@@ -51,6 +52,7 @@ export const PageHeader: React.FC = () => {
   if (activeIdentity.type !== 'page') return null;
 
   const { page, role } = activeIdentity;
+  const roleCaps = getPageRoleCapabilities(role);
 
   const handleSignOut = async () => {
     setMenuOpen(false);
@@ -78,7 +80,7 @@ export const PageHeader: React.FC = () => {
                 {page.isVerified && <VerifiedBadge size={14} />}
               </div>
               <p className="text-[10px] font-semibold text-[var(--color-primary)] tracking-wide uppercase truncate">
-                Page Mode · {role === 'owner' ? 'Owner' : 'Admin'}
+                Page Mode · {formatPageRoleLabel(role)}
               </p>
             </div>
           </button>
@@ -95,16 +97,18 @@ export const PageHeader: React.FC = () => {
               <Search className="w-5 h-5" />
             </button>
 
-            <button
-              type="button"
-              onClick={() => setCreatePostModalOpen(true)}
-              className="h-10 px-3 sm:px-3.5 rounded-full bg-[var(--color-primary-subtle)] text-[var(--color-primary)] hover:bg-[var(--color-primary)] hover:text-white transition-all flex items-center gap-1.5 font-medium text-xs sm:text-sm active:scale-95 shadow-sm"
-              aria-label={`Post as ${page.name}`}
-              title={`Post as ${page.name}`}
-            >
-              <Plus className="w-4 h-4 stroke-[2.5]" />
-              <span className="hidden sm:inline font-semibold">Post</span>
-            </button>
+            {roleCaps.canPublishPosts && (
+              <button
+                type="button"
+                onClick={() => setCreatePostModalOpen(true)}
+                className="h-10 px-3 sm:px-3.5 rounded-full bg-[var(--color-primary-subtle)] text-[var(--color-primary)] hover:bg-[var(--color-primary)] hover:text-white transition-all flex items-center gap-1.5 font-medium text-xs sm:text-sm active:scale-95 shadow-sm"
+                aria-label={`Post as ${page.name}`}
+                title={`Post as ${page.name}`}
+              >
+                <Plus className="w-4 h-4 stroke-[2.5]" />
+                <span className="hidden sm:inline font-semibold">Post</span>
+              </button>
+            )}
 
             {/* Page Notifications Bell */}
             <button
@@ -166,7 +170,7 @@ export const PageHeader: React.FC = () => {
                       {page.isVerified && <VerifiedBadge size={14} />}
                     </div>
                     <p className="text-[11px] text-[var(--color-text-secondary)] truncate">
-                      {role === 'owner' ? 'Owner' : 'Admin'} · Page Mode
+                      {formatPageRoleLabel(role)} · Page Mode
                     </p>
                   </div>
 

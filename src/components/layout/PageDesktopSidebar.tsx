@@ -14,6 +14,7 @@ import { Avatar } from '../common/Avatar.tsx';
 import { ReelsIcon } from '../common/ReelsIcon.tsx';
 import { VerifiedBadge } from '../common/VerifiedBadge.tsx';
 import { IdentitySwitcher } from '../pages/IdentitySwitcher.tsx';
+import { formatPageRoleLabel, getPageRoleCapabilities } from '../../lib/pageUtils.ts';
 
 export const PageDesktopSidebar: React.FC = () => {
   const {
@@ -34,6 +35,7 @@ export const PageDesktopSidebar: React.FC = () => {
   if (activeIdentity.type !== 'page') return null;
 
   const { page, role } = activeIdentity;
+  const roleCaps = getPageRoleCapabilities(role);
   const activeManagedCount = managedPages.filter((e) => e.page.status === 'active').length;
 
   const navItems: Array<{
@@ -61,12 +63,16 @@ export const PageDesktopSidebar: React.FC = () => {
       icon: Compass,
       onClick: () => navigateTo('pages'),
     },
-    {
-      id: 'page-followers',
-      label: 'Page Followers',
-      icon: Users,
-      onClick: () => navigateTo('page-followers', { pageId: page.id }),
-    },
+    ...(roleCaps.canManageFollowers
+      ? [
+          {
+            id: 'page-followers',
+            label: 'Page Followers',
+            icon: Users,
+            onClick: () => navigateTo('page-followers', { pageId: page.id }),
+          },
+        ]
+      : []),
     {
       id: 'page-inbox',
       label: 'Page Inbox',
@@ -107,7 +113,7 @@ export const PageDesktopSidebar: React.FC = () => {
               {page.isVerified && <VerifiedBadge size={14} />}
             </div>
             <p className="text-xs text-[var(--color-text-secondary)] truncate">
-              Page Mode · {role === 'owner' ? 'Owner' : 'Admin'}
+              Page Mode · {formatPageRoleLabel(role)}
             </p>
           </div>
         </button>
@@ -146,15 +152,17 @@ export const PageDesktopSidebar: React.FC = () => {
 
         <div className="h-px bg-[var(--color-border)] my-2" />
 
-        {/* Create Post as Page */}
-        <button
-          type="button"
-          onClick={() => setCreatePostModalOpen(true)}
-          className="w-full py-3 px-4 rounded-xl bg-[var(--color-primary)] hover:bg-[var(--color-primary-hover)] text-white font-semibold text-sm flex items-center justify-center gap-2 shadow-md transition-all active:scale-[0.98]"
-        >
-          <Plus className="w-4 h-4 stroke-[2.5]" />
-          <span>Post as Page</span>
-        </button>
+        {/* Create Post in Active Page Mode */}
+        {roleCaps.canPublishPosts && (
+          <button
+            type="button"
+            onClick={() => setCreatePostModalOpen(true)}
+            className="w-full py-3 px-4 rounded-xl bg-[var(--color-primary)] hover:bg-[var(--color-primary-hover)] text-white font-semibold text-sm flex items-center justify-center gap-2 shadow-md transition-all active:scale-[0.98]"
+          >
+            <Plus className="w-4 h-4 stroke-[2.5]" />
+            <span>Create Post</span>
+          </button>
+        )}
 
         {/* Identity Switching Actions */}
         <div className="mt-2.5 space-y-1.5">

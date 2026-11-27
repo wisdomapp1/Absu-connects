@@ -6,6 +6,7 @@ import { Avatar } from '../common/Avatar.tsx';
 import { ReelsIcon } from '../common/ReelsIcon.tsx';
 import { VerifiedBadge } from '../common/VerifiedBadge.tsx';
 import { MR_ANONYMOUS_PAGE_ID } from '../../lib/pageService.ts';
+import { formatPageRoleLabel } from '../../lib/pageUtils.ts';
 
 export const DesktopSidebar: React.FC = () => {
   const {
@@ -63,7 +64,7 @@ export const DesktopSidebar: React.FC = () => {
           </div>
           <p className="text-xs text-[var(--color-text-secondary)] truncate">
             {activeIdentity.type === 'page'
-              ? `Managing Page (${activeIdentity.role === 'owner' ? 'Owner' : 'Admin'})`
+              ? `Managing Page (${formatPageRoleLabel(activeIdentity.role)})`
               : currentUser.department}
           </p>
         </div>

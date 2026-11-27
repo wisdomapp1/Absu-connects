@@ -101,7 +101,7 @@ import {
   compressImageForUpload,
   validatePostVideoFile,
 } from '../lib/mediaCompression.ts';
-import { adminService, isSuperAdminEmail } from '../lib/adminService.ts';
+import { adminService } from '../lib/adminService.ts';
 import {
   sendPrivacySafePush,
   playNotificationChime,
@@ -112,6 +112,7 @@ import { initAllPushChannels, isNativeAndroidApp } from '../lib/nativePushServic
 export interface AppContextType {
   // Super Admin & Platform Control
   isSuperAdmin: boolean;
+  adminDbSynced: boolean;
   adminViewOpen: boolean;
   openAdminDashboard: () => void;
   closeAdminDashboard: () => void;
@@ -432,6 +433,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
   // Super Admin state & live verification
   const [isSuperAdmin, setIsSuperAdmin] = useState<boolean>(false);
+  const [adminDbSynced, setAdminDbSynced] = useState<boolean>(true);
   const [adminViewOpen, setAdminViewOpen] = useState<boolean>(false);
   const [platformBanner, setPlatformBanner] = useState<string | null>(null);
   const [userRestriction, setUserRestriction] = useState<{
@@ -444,18 +446,16 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     let isCancelled = false;
 
     const verifyAdmin = async () => {
-      const token = auth.session?.access_token;
-      const email = auth.user?.email;
-
-      if (!token || !email) {
-        setIsSuperAdmin(false);
-        setAdminViewOpen(false);
+      if (auth.loading) {
         return;
       }
 
-      // Check against configured authorized administration emails
-      if (!isSuperAdminEmail(email)) {
+      const token = auth.session?.access_token;
+      const userId = auth.user?.id;
+
+      if (!token || !userId) {
         setIsSuperAdmin(false);
+        setAdminDbSynced(true);
         setAdminViewOpen(false);
         return;
       }
@@ -463,12 +463,18 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       try {
         const res = await adminService.verifySuperAdmin(token);
         if (!isCancelled) {
-          setIsSuperAdmin(Boolean(res.isSuperAdmin));
+          const authorized = Boolean(res.isSuperAdmin);
+          setIsSuperAdmin(authorized);
+          setAdminDbSynced(res.dbAdminSynced !== false);
+          if (!authorized) {
+            setAdminViewOpen(false);
+          }
         }
       } catch {
         if (!isCancelled) {
-          // If server verification threw a transient network error but user holds a valid authorized session, keep check consistent
-          setIsSuperAdmin(isSuperAdminEmail(email));
+          setIsSuperAdmin(false);
+          setAdminDbSynced(true);
+          setAdminViewOpen(false);
         }
       }
     };
@@ -478,7 +484,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     return () => {
       isCancelled = true;
     };
-  }, [auth.session?.access_token, auth.user?.email]);
+  }, [auth.loading, auth.session?.access_token, auth.user?.id]);
 
   useEffect(() => {
     // Fetch public platform broadcast banner if active
@@ -3751,6 +3757,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         refreshCurrentScreen,
         // Super Admin & Platform Control
         isSuperAdmin,
+        adminDbSynced,
         adminViewOpen,
         openAdminDashboard,
         closeAdminDashboard,

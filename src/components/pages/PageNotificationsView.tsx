@@ -67,7 +67,10 @@ export const PageNotificationsView: React.FC<PageNotificationsViewProps> = ({ pa
       route.view === 'page-settings' ||
       route.view === 'page-profile'
     ) {
-      navigateTo(route.view, { pageId: route.pageId });
+      navigateTo(route.view, {
+        pageId: route.pageId,
+        ...(route.pageTab ? { pageTab: route.pageTab } : {}),
+      });
       return;
     }
 

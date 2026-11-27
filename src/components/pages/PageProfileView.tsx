@@ -19,11 +19,17 @@ import {
   CheckCircle2,
   Settings,
   Users,
+  Pencil,
 } from 'lucide-react';
 import {
   Page,
   formatPageCategoryLabel,
 } from '../../types/pages.ts';
+import {
+  normalizePageRole,
+  formatPageRoleLabel,
+  getPageRoleCapabilities,
+} from '../../lib/pageUtils.ts';
 import { Post } from '../../types/index.ts';
 import {
   MR_ANONYMOUS_PAGE_ID,
@@ -66,7 +72,6 @@ export const PageProfileView: React.FC<PageProfileViewProps> = ({ forcedPageId }
     refreshPosts,
     navigateTo,
     goBack,
-    setCreatePostModalOpen,
     setImageLightboxUrl,
     addToast,
   } = useApp();
@@ -207,12 +212,8 @@ export const PageProfileView: React.FC<PageProfileViewProps> = ({ forcedPageId }
   );
   const rawManagerRole =
     page?.managerRole ?? (isAnonymousPage && isSuperAdmin ? 'admin' : null);
-  const effectiveManagerRole: 'owner' | 'admin' | null =
-    rawManagerRole === 'owner'
-      ? 'owner'
-      : rawManagerRole === 'admin' || rawManagerRole === 'manager'
-      ? 'admin'
-      : null;
+  const effectiveManagerRole = rawManagerRole ? normalizePageRole(rawManagerRole) : null;
+  const managerCaps = effectiveManagerRole ? getPageRoleCapabilities(effectiveManagerRole) : null;
   const isManager = Boolean(effectiveManagerRole);
   const isOwner = effectiveManagerRole === 'owner';
 
@@ -266,10 +267,17 @@ export const PageProfileView: React.FC<PageProfileViewProps> = ({ forcedPageId }
     }
   };
 
+  const messagingPerm =
+    page?.messaging_permission || (page?.allowMessages === false ? 'disabled' : 'everyone');
+
   const handleMessagePage = async () => {
     if (!page || messagingBusy) return;
-    if (!page.allowMessages) {
+    if (messagingPerm === 'disabled' || !page.allowMessages) {
       addToast('This Page is not accepting direct messages right now.', 'info');
+      return;
+    }
+    if (messagingPerm === 'followers' && !page.isFollowing && !isManager) {
+      addToast(`Follow ${page.name} first to send a direct message.`, 'info');
       return;
     }
     setMessagingBusy(true);
@@ -306,14 +314,6 @@ export const PageProfileView: React.FC<PageProfileViewProps> = ({ forcedPageId }
     } catch {
       addToast(shareUrl, 'info');
     }
-  };
-
-  const handlePostAsPage = async () => {
-    if (!page) return;
-    if (activeIdentity.type !== 'page' || activeIdentity.pageId !== page.id) {
-      await switchIdentity(page.id, { targetView: 'page-profile' });
-    }
-    setCreatePostModalOpen(true);
   };
 
   const handleReportPage = async (e: React.FormEvent) => {
@@ -511,11 +511,11 @@ export const PageProfileView: React.FC<PageProfileViewProps> = ({ forcedPageId }
               </p>
             )}
 
-            {isManager && (
+            {isManager && effectiveManagerRole && (
               <p className="text-xs font-semibold text-[var(--color-primary)] pt-1 flex items-center gap-1.5">
                 <Shield className="w-3.5 h-3.5 shrink-0" />
                 <span>
-                  You are managing this Page as {effectiveManagerRole === 'owner' ? 'Owner' : 'Admin'}.
+                  You are managing this Page as {formatPageRoleLabel(effectiveManagerRole)}.
                 </span>
               </p>
             )}
@@ -526,14 +526,51 @@ export const PageProfileView: React.FC<PageProfileViewProps> = ({ forcedPageId }
             {isManager ? (
               isSwitchedAsThisPage ? (
                 <>
+                  {managerCaps?.canEditInfo && (
+                    <button
+                      type="button"
+                      onClick={() =>
+                        navigateTo('page-settings', { pageId: page.id, pageTab: 'info' })
+                      }
+                      className="min-h-[44px] px-4 rounded-xl bg-[var(--color-primary)] hover:bg-[var(--color-primary-hover)] text-white text-xs font-bold flex items-center gap-1.5 whitespace-nowrap"
+                    >
+                      <Pencil className="w-3.5 h-3.5" />
+                      <span>Edit Page</span>
+                    </button>
+                  )}
+
                   <button
                     type="button"
-                    onClick={handlePostAsPage}
-                    className="min-h-[44px] px-4 rounded-xl bg-[var(--color-primary)] hover:bg-[var(--color-primary-hover)] text-white text-xs font-bold flex items-center gap-1.5 whitespace-nowrap"
+                    onClick={() => navigateTo('page-settings', { pageId: page.id })}
+                    className="min-h-[44px] px-4 rounded-xl bg-[var(--color-bg-main)] border border-[var(--color-border)] text-xs font-bold text-[var(--color-text-primary)] flex items-center gap-1.5 whitespace-nowrap"
                   >
-                    <Plus className="w-4 h-4" />
-                    <span>Post as Page</span>
+                    <Settings className="w-3.5 h-3.5 text-[var(--color-primary)]" />
+                    <span>Page Settings</span>
                   </button>
+
+                  {managerCaps?.canManageFollowers && (
+                    <button
+                      type="button"
+                      onClick={() => navigateTo('page-followers', { pageId: page.id })}
+                      className="min-h-[44px] px-4 rounded-xl bg-[var(--color-bg-main)] border border-[var(--color-border)] text-xs font-bold text-[var(--color-text-primary)] flex items-center gap-1.5 whitespace-nowrap"
+                    >
+                      <Users className="w-3.5 h-3.5 text-[var(--color-primary)]" />
+                      <span>Manage Followers</span>
+                    </button>
+                  )}
+
+                  {managerCaps?.canManageRoles && (
+                    <button
+                      type="button"
+                      onClick={() =>
+                        navigateTo('page-settings', { pageId: page.id, pageTab: 'access' })
+                      }
+                      className="min-h-[44px] px-4 rounded-xl bg-[var(--color-bg-main)] border border-[var(--color-border)] text-xs font-bold text-[var(--color-text-primary)] flex items-center gap-1.5 whitespace-nowrap"
+                    >
+                      <Shield className="w-3.5 h-3.5 text-[var(--color-primary)]" />
+                      <span>Manage Administrators</span>
+                    </button>
+                  )}
 
                   {isAnonymousPage && (
                     <button
@@ -548,20 +585,11 @@ export const PageProfileView: React.FC<PageProfileViewProps> = ({ forcedPageId }
 
                   <button
                     type="button"
-                    onClick={() => navigateTo('page-followers', { pageId: page.id })}
-                    className="min-h-[44px] px-4 rounded-xl bg-[var(--color-bg-main)] border border-[var(--color-border)] text-xs font-bold text-[var(--color-text-primary)] flex items-center gap-1.5 whitespace-nowrap"
+                    onClick={() => void switchIdentity('personal')}
+                    className="min-h-[44px] px-4 rounded-xl bg-[var(--color-primary-subtle)] text-[var(--color-primary)] hover:bg-[var(--color-primary)] hover:text-white text-xs font-bold flex items-center gap-1.5 whitespace-nowrap transition-colors"
                   >
-                    <Users className="w-3.5 h-3.5 text-[var(--color-primary)]" />
-                    <span>Followers</span>
-                  </button>
-
-                  <button
-                    type="button"
-                    onClick={() => navigateTo('page-settings', { pageId: page.id })}
-                    className="min-h-[44px] px-4 rounded-xl bg-[var(--color-bg-main)] border border-[var(--color-border)] text-xs font-bold text-[var(--color-text-primary)] flex items-center gap-1.5 whitespace-nowrap"
-                  >
-                    <Settings className="w-3.5 h-3.5 text-[var(--color-primary)]" />
-                    <span>Page Settings</span>
+                    <ArrowRightLeft className="w-3.5 h-3.5" />
+                    <span>Switch to Personal Profile</span>
                   </button>
                 </>
               ) : (
@@ -616,12 +644,23 @@ export const PageProfileView: React.FC<PageProfileViewProps> = ({ forcedPageId }
 
                 <button
                   type="button"
-                  disabled={messagingBusy || !page.allowMessages || page.isBlocked}
+                  disabled={
+                    messagingBusy ||
+                    messagingPerm === 'disabled' ||
+                    !page.allowMessages ||
+                    page.isBlocked
+                  }
                   onClick={handleMessagePage}
                   className="min-h-[44px] px-4 rounded-xl bg-[var(--color-bg-main)] border border-[var(--color-border)] text-xs font-bold text-[var(--color-text-primary)] flex items-center gap-1.5 whitespace-nowrap disabled:opacity-50"
                 >
                   <MessageCircle className="w-4 h-4" />
-                  <span>{page.allowMessages ? 'Message Page' : 'Messages Off'}</span>
+                  <span>
+                    {messagingPerm === 'disabled' || !page.allowMessages
+                      ? 'Messages Off'
+                      : messagingPerm === 'followers' && !page.isFollowing
+                      ? 'Followers Only'
+                      : 'Message Page'}
+                  </span>
                 </button>
 
                 <button
@@ -674,19 +713,9 @@ export const PageProfileView: React.FC<PageProfileViewProps> = ({ forcedPageId }
               <p className="text-sm font-bold text-[var(--color-text-primary)]">No posts yet.</p>
               <p className="text-xs text-[var(--color-text-secondary)]">
                 {isManager
-                  ? 'Share an announcement, photo gallery, or short campus video as your Page.'
+                  ? 'Use the composer on Home Feed while operating as this Page to share updates with followers.'
                   : `No posts yet. Follow to see updates from ${page.name}.`}
               </p>
-              {isManager && (
-                <button
-                  type="button"
-                  onClick={handlePostAsPage}
-                  className="mt-2 min-h-[44px] px-4 rounded-xl bg-[var(--color-primary)] text-white text-xs font-bold inline-flex items-center gap-1.5"
-                >
-                  <Plus className="w-4 h-4" />
-                  <span>Create First Page Post</span>
-                </button>
-              )}
             </div>
           ) : (
             pagePosts.map((post) => (

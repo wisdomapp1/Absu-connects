@@ -41,6 +41,7 @@ import {
 import { ReelsIcon } from '../common/ReelsIcon.tsx';
 import { VerifiedBadge } from '../common/VerifiedBadge.tsx';
 import { formatPageCategoryLabel } from '../../types/pages.ts';
+import { formatPageRoleLabel } from '../../lib/pageUtils.ts';
 
 interface ProfileViewProps {
   isAnotherUser?: boolean;
@@ -331,7 +332,7 @@ export const ProfileView: React.FC<ProfileViewProps> = ({ isAnotherUser = false 
             </div>
 
             {/* Header Action Buttons */}
-            <div className="flex items-center gap-2 pt-2">
+            <div className="flex flex-wrap items-center gap-2 pt-2">
               {isMe ? (
                 <>
                   {activeManagedPages.length > 0 && (
@@ -376,6 +377,18 @@ export const ProfileView: React.FC<ProfileViewProps> = ({ isAnotherUser = false 
 
                     {menuOpen && (
                       <div className="absolute right-0 top-11 w-52 bg-[var(--color-bg-card)] border border-[var(--color-border)] rounded-2xl shadow-xl py-1.5 z-40 animate-in fade-in zoom-in-95 duration-100">
+                        {isSuperAdmin && (
+                          <button
+                            onClick={() => {
+                              setMenuOpen(false);
+                              openAdminDashboard();
+                            }}
+                            className="w-full px-3.5 py-2.5 text-left text-xs font-bold text-emerald-600 dark:text-emerald-400 hover:bg-emerald-500/10 flex items-center gap-2.5 transition-colors"
+                          >
+                            <ShieldAlert className="w-4 h-4" />
+                            <span>Super Admin Dashboard</span>
+                          </button>
+                        )}
                         <button
                           onClick={() => {
                             setMenuOpen(false);
@@ -803,7 +816,7 @@ export const ProfileView: React.FC<ProfileViewProps> = ({ isAnotherUser = false 
                           {page.isVerified && <VerifiedBadge size={14} />}
                         </div>
                         <p className="text-[11px] text-[var(--color-text-secondary)] truncate">
-                          {role === 'owner' ? 'Owner' : 'Admin'} · {formatPageCategoryLabel(page.category)}
+                          {formatPageRoleLabel(role)} · {formatPageCategoryLabel(page.category)}
                         </p>
                       </div>
                     </div>

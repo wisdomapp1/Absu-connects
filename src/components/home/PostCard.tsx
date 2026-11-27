@@ -5,7 +5,8 @@ import { Avatar } from '../common/Avatar.tsx';
 import { VerifiedBadge } from '../common/VerifiedBadge.tsx';
 import { LinkifiedText } from '../common/LinkifiedText.tsx';
 import { ReelsIcon } from '../common/ReelsIcon.tsx';
-import { MR_ANONYMOUS_PAGE_ID } from '../../lib/pageService.ts';
+import { MR_ANONYMOUS_PAGE_ID, toggleHidePagePost } from '../../lib/pageService.ts';
+import { getPageRoleCapabilities } from '../../lib/pageUtils.ts';
 import {
   fetchPostComments,
   countThreadedComments,
@@ -307,6 +308,14 @@ export const PostCard: React.FC<PostCardProps> = ({
   const [isEditingPost, setIsEditingPost] = useState(false);
   const [postEditDraft, setPostEditDraft] = useState(post.content);
   const [savingPostEdit, setSavingPostEdit] = useState(false);
+  const [localPagePostHidden, setLocalPagePostHidden] = useState<boolean>(
+    String(post.visibility || '').toLowerCase() === 'hidden'
+  );
+  const [togglingPageVisibility, setTogglingPageVisibility] = useState(false);
+
+  useEffect(() => {
+    setLocalPagePostHidden(String(post.visibility || '').toLowerCase() === 'hidden');
+  }, [post.id, post.visibility]);
 
   useEffect(() => {
     if (!isEditingPost) {
@@ -577,13 +586,25 @@ export const PostCard: React.FC<PostCardProps> = ({
   };
 
   const isOwnPost = !post.isPagePost && post.author.id === currentUser.id;
-  const isPageManagedByMe = Boolean(
-    post.isPagePost &&
-      post.pageId &&
-      managedPages.some((m) => m.page.id === post.pageId && m.page.status === 'active')
-  );
-  const canManagePost = isOwnPost || isPageManagedByMe;
-  const commentsLocked = post.allowComments === false && !isPageManagedByMe;
+  const managedPageEntry =
+    post.isPagePost && post.pageId
+      ? managedPages.find((m) => m.page.id === post.pageId && m.page.status === 'active')
+      : undefined;
+  const isPageManagedByMe = Boolean(managedPageEntry);
+  const pageCaps = managedPageEntry ? getPageRoleCapabilities(managedPageEntry.role) : null;
+  const canEditPost = isOwnPost || Boolean(pageCaps?.canPublishPosts);
+  const canDeletePost = isOwnPost || Boolean(pageCaps?.canModeratePosts);
+  const canPinPagePost = Boolean(pageCaps?.canModeratePosts && post.pageId);
+  const canHideFromPageFeed = Boolean(pageCaps?.canModeratePosts && post.pageId);
+
+  const effectivePageCommentPerm =
+    post.pageCommentPermission ||
+    managedPageEntry?.page.comment_permission ||
+    (post.allowComments === false ? 'disabled' : 'everyone');
+  const commentsLocked =
+    (post.allowComments === false || effectivePageCommentPerm === 'disabled') && !isPageManagedByMe;
+  const followersOnlyComments =
+    !commentsLocked && post.isPagePost && effectivePageCommentPerm === 'followers' && !isPageManagedByMe;
 
   const AudienceIcon =
     post.audience === 'Public'
@@ -906,7 +927,7 @@ export const PostCard: React.FC<PostCardProps> = ({
                 <span>{localIsSaved ? 'Saved' : 'Save Post'}</span>
               </button>
 
-              {isPageManagedByMe && post.pageId && (
+              {canPinPagePost && post.pageId && (
                 <button
                   type="button"
                   onClick={() => {
@@ -920,7 +941,40 @@ export const PostCard: React.FC<PostCardProps> = ({
                 </button>
               )}
 
-              {canManagePost && (
+              {canHideFromPageFeed && post.pageId && (
+                <button
+                  type="button"
+                  disabled={togglingPageVisibility}
+                  onClick={async () => {
+                    if (!post.pageId || togglingPageVisibility) return;
+                    setMenuOpen(false);
+                    setTogglingPageVisibility(true);
+                    try {
+                      const nextHidden = !localPagePostHidden;
+                      const res = await toggleHidePagePost(post.pageId, post.id, nextHidden);
+                      if (res.success) {
+                        setLocalPagePostHidden(nextHidden);
+                        addToast(
+                          nextHidden
+                            ? 'Post hidden from public campus feed.'
+                            : 'Post restored to public campus feed.',
+                          'info'
+                        );
+                      } else {
+                        addToast(res.error || 'Could not update Page post visibility.', 'warning');
+                      }
+                    } finally {
+                      setTogglingPageVisibility(false);
+                    }
+                  }}
+                  className="w-full flex items-center gap-2.5 px-3 py-2 text-xs font-medium text-[var(--color-text-primary)] hover:bg-[var(--color-primary-subtle)] rounded-xl transition-colors min-h-[36px] disabled:opacity-50"
+                >
+                  <EyeOff className="w-4 h-4 text-amber-500" />
+                  <span>{localPagePostHidden ? 'Restore to Public Feed' : 'Hide from Public Feed'}</span>
+                </button>
+              )}
+
+              {canEditPost && (
                 <button
                   type="button"
                   onClick={() => {
@@ -957,7 +1011,7 @@ export const PostCard: React.FC<PostCardProps> = ({
                 <span>Report Content</span>
               </button>
 
-              {canManagePost && (
+              {canDeletePost && (
                 <>
                   <div className="h-px bg-[var(--color-border)] my-1" />
                   <button
@@ -1283,6 +1337,11 @@ export const PostCard: React.FC<PostCardProps> = ({
       {commentsExpanded && (
         <div className="mt-3 pt-3 border-t border-[var(--color-border)] flex flex-col gap-3">
           {/* Comment composer (disabled when Page comments are turned off for non-managers) */}
+          {followersOnlyComments && (
+            <p className="text-[11px] text-[var(--color-text-secondary)]">
+              Comments are limited to followers of this Page.
+            </p>
+          )}
           {commentsLocked ? (
             <p className="text-xs text-[var(--color-text-secondary)] bg-[var(--color-bg-main)] border border-[var(--color-border)] rounded-xl px-3.5 py-2.5 text-center">
               Comments are turned off for this Page post.

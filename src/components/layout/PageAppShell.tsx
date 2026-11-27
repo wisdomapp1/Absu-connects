@@ -27,6 +27,7 @@ import {
   Settings,
   ArrowRightLeft,
 } from 'lucide-react';
+import { formatPageRoleLabel } from '../../lib/pageUtils.ts';
 
 export const PageAppShell: React.FC = () => {
   const {
@@ -213,7 +214,7 @@ export const PageAppShell: React.FC = () => {
                     </div>
                     <p className="text-[11px] text-[var(--color-text-secondary)] truncate">
                       {page.followersCount.toLocaleString()} followers ·{' '}
-                      {role === 'owner' ? 'Owner' : 'Admin'}
+                      {formatPageRoleLabel(role)}
                     </p>
                   </div>
                 </div>

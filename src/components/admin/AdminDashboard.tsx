@@ -56,7 +56,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   adminEmail,
   onBackToApp,
 }) => {
-  const { addToast } = useApp();
+  const { addToast, adminDbSynced } = useApp();
   const [activeTab, setActiveTab] = useState<AdminTab>('overview');
 
   // Overview metrics state
@@ -197,6 +197,18 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
 
       {/* Main Content Area */}
       <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-6">
+        {!adminDbSynced && (
+          <div
+            role="status"
+            className="mb-4 p-3.5 rounded-2xl bg-amber-500/10 border border-amber-500/30 text-xs text-amber-700 dark:text-amber-300 flex items-start gap-2.5"
+          >
+            <ShieldAlert className="w-4 h-4 shrink-0 mt-0.5" />
+            <div>
+              <span className="font-bold">Database admin sync pending for {adminEmail}.</span>{' '}
+              Your Super Admin account is active, but database-level actions (such as Page verification) require running the latest Super Admin sync SQL migration in Supabase.
+            </div>
+          </div>
+        )}
         {activeTab === 'overview' && (
           <AdminOverviewTab
             stats={stats}

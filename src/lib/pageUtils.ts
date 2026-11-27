@@ -549,4 +549,60 @@ export function buildPermittedPageUpdatePayload(updates: {
   return { payload };
 }
 
+export function classifyAdminVerificationError(errOrMessage: unknown): string {
+  const raw =
+    typeof errOrMessage === 'string'
+      ? errOrMessage
+      : errOrMessage && typeof errOrMessage === 'object' && 'message' in errOrMessage
+      ? String((errOrMessage as any).message || '')
+      : '';
+  const code =
+    errOrMessage && typeof errOrMessage === 'object' && 'code' in errOrMessage
+      ? String((errOrMessage as any).code || '')
+      : '';
+  const combined = `${code} ${raw}`.toLowerCase();
+
+  if (
+    combined.includes('jwt') ||
+    combined.includes('expired') ||
+    combined.includes('not authenticated') ||
+    combined.includes('invalid token') ||
+    combined.includes('pgrst301') ||
+    (combined.includes('session') && !combined.includes('permission'))
+  ) {
+    return 'Session expired. Please sign in again.';
+  }
+
+  if (
+    combined.includes('super administrator') ||
+    combined.includes('super admin') ||
+    combined.includes('not authorized') ||
+    combined.includes('insufficient_privilege') ||
+    combined.includes('42501')
+  ) {
+    return 'User is not a super administrator.';
+  }
+
+  if (
+    combined.includes('page not found') ||
+    combined.includes('verification request not found') ||
+    combined.includes('p0002') ||
+    combined.includes('22p02')
+  ) {
+    return 'Page not found.';
+  }
+
+  if (combined.includes('permission denied')) {
+    return 'Database operation failed: Administrative permission check could not be completed.';
+  }
+
+  const sanitized = raw
+    .replace(/private\.[a-z0-9_]+/gi, 'restricted admin permissions')
+    .replace(/schema\s+private/gi, 'restricted schema')
+    .trim();
+  return sanitized
+    ? `Database operation failed: ${sanitized}`
+    : 'Database operation failed. Please try again.';
+}
+
 export { formatPageCategoryLabel, toCanonicalPageCategory };

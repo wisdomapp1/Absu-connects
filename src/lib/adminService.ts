@@ -234,113 +234,185 @@ async function parseApiJson(res: Response | null): Promise<any | null> {
   return await res.json().catch(() => null);
 }
 
-async function verifyLocalSuperAdminSession(providedToken?: string): Promise<{
-  isSuperAdmin: boolean;
-  email?: string;
-  userId?: string;
-  role?: string;
-  staticHostMode?: boolean;
-  reason?: string;
-}> {
-  const { data: sessionData } = await supabase.auth.getSession();
-  const session = sessionData?.session || null;
-  const token = providedToken || session?.access_token;
+function isSessionExpiredError(err: unknown): boolean {
+  if (!err || typeof err !== 'object') return false;
+  const msg = String((err as any).message || '').toLowerCase();
+  const code = String((err as any).code || '').toLowerCase();
+  return (
+    code === 'pgrst301' ||
+    msg.includes('jwt') ||
+    msg.includes('expired') ||
+    msg.includes('not authenticated') ||
+    msg.includes('invalid token') ||
+    msg.includes('session')
+  );
+}
 
-  if (!token) {
-    return { isSuperAdmin: false, reason: 'Not signed in' };
-  }
-
-  let verifiedUser = null as { id: string; email?: string | null } | null;
-  try {
-    const { data: userData } = await supabase.auth.getUser(token);
-    if (userData?.user) {
-      verifiedUser = userData.user;
-    }
-  } catch {
-    // Network issue; fall back to un-expired active session user below
-  }
-
-  if (!verifiedUser && session?.user) {
-    const expiresAtMs = (session.expires_at ?? 0) * 1000;
-    if (expiresAtMs === 0 || expiresAtMs > Date.now()) {
-      verifiedUser = session.user;
-    }
-  }
-
-  if (!verifiedUser) {
-    return { isSuperAdmin: false, reason: 'Could not verify authenticated session.' };
-  }
-
-  const email = verifiedUser.email?.toLowerCase().trim() || '';
-  if (!isSuperAdminEmail(email)) {
-    return {
-      isSuperAdmin: false,
-      email,
-      userId: verifiedUser.id,
-      reason: `Account "${email}" is not an authorized Super Admin.`,
-    };
-  }
-
-  return {
-    isSuperAdmin: true,
-    email,
-    userId: verifiedUser.id,
-    role: 'Super Admin',
-    staticHostMode: true,
-  };
+function sanitizeAdminError(msg?: string | null): string {
+  const cleaned = String(msg || '')
+    .replace(/private\.[a-z0-9_]+/gi, 'restricted admin permissions')
+    .replace(/schema\s+private/gi, 'restricted schema')
+    .trim();
+  return cleaned || 'Database operation failed.';
 }
 
 /**
- * 1. Verify Super Admin access on Express backend when available, or directly via
- *    verified Supabase Auth session on static deployments (e.g. Vercel / Android APK).
+ * Ensures the Supabase Auth session is fully loaded and valid before administrator checks.
+ */
+export async function ensureAuthenticatedSession(): Promise<{
+  session: { access_token: string; expires_at?: number; user: { id: string; email?: string | null } } | null;
+  sessionExpired: boolean;
+  error?: string;
+}> {
+  try {
+    const { data, error } = await supabase.auth.getSession();
+    if (error) {
+      return {
+        session: null,
+        sessionExpired: true,
+        error: 'Session expired. Please sign in again.',
+      };
+    }
+
+    let currentSession = data?.session || null;
+    if (!currentSession?.access_token || !currentSession?.user?.id) {
+      return {
+        session: null,
+        sessionExpired: true,
+        error: 'Session expired. Please sign in again.',
+      };
+    }
+
+    const expiresAtMs = (currentSession.expires_at ?? 0) * 1000;
+    if (expiresAtMs > 0 && expiresAtMs <= Date.now() + 30_000) {
+      const { data: refreshed, error: refreshErr } = await supabase.auth
+        .refreshSession()
+        .catch(() => ({ data: { session: null }, error: new Error('Session expired') }));
+      if (refreshErr || !refreshed?.session?.access_token) {
+        return {
+          session: null,
+          sessionExpired: true,
+          error: 'Session expired. Please sign in again.',
+        };
+      }
+      currentSession = refreshed.session;
+    }
+
+    return { session: currentSession, sessionExpired: false };
+  } catch {
+    return {
+      session: null,
+      sessionExpired: true,
+      error: 'Session expired. Please sign in again.',
+    };
+  }
+}
+
+/**
+ * 1. Verify Super Admin access via loaded Supabase Auth session and public.current_user_is_admin() RPC.
  */
 export async function checkIsSuperAdmin(providedToken?: string): Promise<{
   isSuperAdmin: boolean;
   email?: string;
   userId?: string;
   role?: string;
-  staticHostMode?: boolean;
+  dbAdminSynced?: boolean;
+  sessionExpired?: boolean;
   reason?: string;
 }> {
   try {
-    const headers = providedToken
-      ? { Authorization: `Bearer ${providedToken}` }
-      : await getAuthHeader();
-
-    if (!headers.Authorization) {
-      return { isSuperAdmin: false, reason: 'Not signed in' };
+    const sessionState = await ensureAuthenticatedSession();
+    if (sessionState.sessionExpired || !sessionState.session) {
+      if (!providedToken) {
+        return {
+          isSuperAdmin: false,
+          sessionExpired: true,
+          reason: sessionState.error || 'Session expired. Please sign in again.',
+        };
+      }
+      return {
+        isSuperAdmin: false,
+        sessionExpired: true,
+        reason: 'Session expired. Please sign in again.',
+      };
     }
 
-    const res = await fetch('/api/admin/verify', { headers }).catch(() => null);
-    const json = await parseApiJson(res);
+    const activeUser = sessionState.session.user;
+    const activeEmail = (activeUser.email || '').toLowerCase().trim();
+    const isConfiguredAdminEmail = isSuperAdminEmail(activeEmail);
 
-    // Authoritative Express backend response
-    if (res && json && typeof json.isSuperAdmin === 'boolean') {
-      if (json.isSuperAdmin) {
-        return json;
+    let { data: isAdminRpc, error: rpcErr } = await supabase.rpc('current_user_is_admin');
+
+    if (rpcErr && isSessionExpiredError(rpcErr)) {
+      const { data: refreshed } = await supabase.auth
+        .refreshSession()
+        .catch(() => ({ data: { session: null } }));
+      if (!refreshed?.session?.access_token) {
+        return {
+          isSuperAdmin: false,
+          sessionExpired: true,
+          reason: 'Session expired. Please sign in again.',
+        };
       }
-      // If server returned ok:false strictly due to expired/invalid token when client already refreshed,
-      // double-check against live Supabase auth before rejecting an authorized admin
-      const fallbackCheck = await verifyLocalSuperAdminSession(providedToken);
-      if (fallbackCheck.isSuperAdmin && !res.ok) {
-        return fallbackCheck;
-      }
-      if (!res.ok) {
-        return { isSuperAdmin: false, reason: json.reason || json.error || `Status ${res.status}` };
-      }
-      return json;
+      const retry = await supabase.rpc('current_user_is_admin');
+      isAdminRpc = retry.data;
+      rpcErr = retry.error;
     }
 
-    // Static deployment (404 / non-JSON from /api/admin/verify): verify directly against Supabase Auth
-    return await verifyLocalSuperAdminSession(providedToken);
-  } catch (err: unknown) {
-    const fallback = await verifyLocalSuperAdminSession(providedToken).catch(() => null);
-    if (fallback?.isSuperAdmin) {
-      return fallback;
+    if (isAdminRpc === true && !rpcErr) {
+      return {
+        isSuperAdmin: true,
+        email: activeEmail,
+        userId: activeUser.id,
+        role: 'Super Admin',
+        dbAdminSynced: true,
+      };
     }
+
+    if (rpcErr && isSessionExpiredError(rpcErr)) {
+      return {
+        isSuperAdmin: false,
+        sessionExpired: true,
+        reason: 'Session expired. Please sign in again.',
+      };
+    }
+
+    // Preserve dashboard visibility for verified configured Super Admin accounts
+    // (such as wisdomchinonso82@gmail.com) even if their DB admin row is not yet synced.
+    if (isConfiguredAdminEmail) {
+      return {
+        isSuperAdmin: true,
+        email: activeEmail,
+        userId: activeUser.id,
+        role: 'Super Admin',
+        dbAdminSynced: false,
+        reason: rpcErr
+          ? `Database operation failed: ${sanitizeAdminError(rpcErr.message)}`
+          : 'Database admin permissions are pending sync for this account.',
+      };
+    }
+
+    if (rpcErr) {
+      return {
+        isSuperAdmin: false,
+        reason: `Database operation failed: ${sanitizeAdminError(rpcErr.message)}`,
+      };
+    }
+
     return {
       isSuperAdmin: false,
-      reason: err instanceof Error ? err.message : 'Network error',
+      email: activeEmail,
+      userId: activeUser.id,
+      dbAdminSynced: false,
+      reason: 'User is not a super administrator.',
+    };
+  } catch (err: unknown) {
+    return {
+      isSuperAdmin: false,
+      reason:
+        err instanceof Error
+          ? `Database operation failed: ${sanitizeAdminError(err.message)}`
+          : 'Database operation failed.',
     };
   }
 }

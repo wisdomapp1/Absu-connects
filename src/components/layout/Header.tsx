@@ -17,6 +17,7 @@ import {
   ArrowRightLeft,
   ChevronDown,
 } from 'lucide-react';
+import { formatPageRoleLabel } from '../../lib/pageUtils.ts';
 
 export const Header: React.FC = () => {
   const {
@@ -160,7 +161,7 @@ export const Header: React.FC = () => {
                     </div>
                     <p className="text-xs text-[var(--color-text-secondary)] truncate">
                       {activeIdentity.type === 'page'
-                        ? `Managing Page (${activeIdentity.role === 'owner' ? 'Owner' : 'Admin'})`
+                        ? `Managing Page (${formatPageRoleLabel(activeIdentity.role)})`
                         : `${currentUser.department} · ${currentUser.level}`}
                     </p>
                   </div>

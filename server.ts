@@ -44,23 +44,28 @@ const supabaseAdmin = SUPABASE_SERVICE_ROLE_KEY
   ? createClient(SUPABASE_PROJECT_URL, SUPABASE_SERVICE_ROLE_KEY)
   : null;
 
+// Returns a user-scoped Supabase client carrying the caller's verified Bearer JWT
+function createUserSupabaseClient(token: string) {
+  return createClient(SUPABASE_PROJECT_URL, SUPABASE_PUBLISHABLE_KEY, {
+    global: {
+      headers: {
+        Authorization: `Bearer ${token}`,
+      },
+    },
+    auth: {
+      persistSession: false,
+      autoRefreshToken: false,
+    },
+  });
+}
+
 // Returns privileged admin client when available, or user-scoped client carrying their Bearer token
 export function getAdminSupabase(req: Request): any {
   if (supabaseAdmin) return supabaseAdmin;
   const authHeader = req.headers.authorization || '';
   const token = authHeader.replace(/^Bearer\s+/i, '').trim();
   if (token) {
-    return createClient(SUPABASE_PROJECT_URL, SUPABASE_PUBLISHABLE_KEY, {
-      global: {
-        headers: {
-          Authorization: `Bearer ${token}`,
-        },
-      },
-      auth: {
-        persistSession: false,
-        autoRefreshToken: false,
-      },
-    });
+    return createUserSupabaseClient(token);
   }
   return supabaseClient;
 }
@@ -222,42 +227,65 @@ function appendAuditLog(entry: {
   writeStore(store);
 }
 
-// Security: Verify user identity & super admin authorization from Supabase session token
+// Security: Verify user identity & super admin authorization from Supabase session token + current_user_is_admin RPC
 async function verifyAdminAuth(req: Request): Promise<{
   authorized: boolean;
   user?: { id: string; email: string };
+  token?: string;
   reason?: string;
 }> {
   const authHeader = req.headers.authorization || '';
   const token = authHeader.replace(/^Bearer\s+/i, '').trim();
 
   if (!token) {
-    return { authorized: false, reason: 'Missing authorization bearer token.' };
+    return { authorized: false, reason: 'Session expired. Missing authorization bearer token.' };
   }
 
   try {
     const { data, error } = await supabaseClient.auth.getUser(token);
     if (error || !data?.user) {
-      return { authorized: false, reason: 'Invalid or expired user session.' };
+      return { authorized: false, reason: 'Session expired. Invalid or expired user session.' };
     }
 
     const email = data.user.email?.toLowerCase().trim() || '';
-    if (!isSuperAdminEmail(email)) {
+    const userSb = createUserSupabaseClient(token);
+    const { data: isAdminRpc, error: rpcError } = await userSb.rpc('current_user_is_admin');
+
+    if (isAdminRpc === true && !rpcError) {
+      return {
+        authorized: true,
+        token,
+        user: {
+          id: data.user.id,
+          email,
+        },
+      };
+    }
+
+    if (isSuperAdminEmail(email)) {
+      return {
+        authorized: true,
+        token,
+        user: {
+          id: data.user.id,
+          email,
+        },
+      };
+    }
+
+    if (rpcError) {
       return {
         authorized: false,
-        reason: `Account "${email}" is not authorized. Super Admin privileges are restricted to configured administrators (${SUPER_ADMIN_EMAIL}).`,
+        reason: 'Database operation failed while verifying super administrator access.',
       };
     }
 
     return {
-      authorized: true,
-      user: {
-        id: data.user.id,
-        email,
-      },
+      authorized: false,
+      reason: 'User is not a super administrator.',
     };
-  } catch (err) {
-    return { authorized: false, reason: 'Server error validating session token.' };
+  } catch {
+    return { authorized: false, reason: 'Database operation failed validating session token.' };
   }
 }
 
@@ -274,6 +302,7 @@ async function requireSuperAdmin(req: Request, res: Response, next: NextFunction
     return;
   }
   (req as any).adminUser = check.user;
+  (req as any).adminToken = check.token;
   next();
 }
 
@@ -3062,60 +3091,60 @@ app.post('/api/admin/pages/:pageId/verify', requireSuperAdmin, async (req, res) 
   const pageId = String(req.params.pageId || '').trim();
   const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(pageId);
   if (!isUuid) {
-    res.status(400).json({ success: false, error: 'Invalid Page ID.' });
+    res.status(404).json({ success: false, error: 'Page not found.' });
     return;
   }
   if (typeof req.body?.verified !== 'boolean') {
     res.status(400).json({ success: false, error: 'Missing boolean verified flag.' });
     return;
   }
-  if (!supabaseAdmin) {
-    res.status(503).json({ success: false, fallbackToRpc: true, error: 'Service role not configured.' });
-    return;
-  }
 
   const verified = Boolean(req.body.verified);
   const adminUser = (req as any).adminUser as { id: string; email: string };
+  const adminToken = String((req as any).adminToken || '');
+  const userSb = createUserSupabaseClient(adminToken);
+
   try {
-    const { data, error } = await supabaseAdmin
-      .from('pages')
-      .update({
-        is_verified: verified,
-        updated_at: new Date().toISOString(),
-      })
-      .eq('id', pageId)
-      .select('*')
-      .maybeSingle();
+    const { data: updated, error } = await userSb.rpc('admin_set_page_verified', {
+      p_page_id: pageId,
+      p_verified: verified,
+    });
 
     if (error) {
-      res.status(500).json({ success: false, error: error.message });
+      const msg = String(error.message || '').toLowerCase();
+      if (msg.includes('super administrator') || error.code === '42501') {
+        res.status(403).json({ success: false, error: 'User is not a super administrator.' });
+        return;
+      }
+      res.status(500).json({ success: false, error: `Database operation failed: ${error.message}` });
       return;
     }
-    if (!data) {
+
+    if (updated === false) {
       res.status(404).json({ success: false, error: 'Page not found.' });
       return;
     }
+
+    const { data: pageRow } = await userSb
+      .from('pages')
+      .select('*')
+      .eq('id', pageId)
+      .maybeSingle();
 
     appendAuditLog({
       adminEmail: adminUser.email,
       action: verified ? 'VERIFY_PAGE' : 'UNVERIFY_PAGE',
       targetId: pageId,
       targetType: 'page',
-      details: `Set is_verified=${verified} on "${data.name}" (@${data.slug})`,
+      details: `Set is_verified=${verified} on "${pageRow?.name || pageId}"`,
       outcome: 'success',
       ip: req.ip,
     });
-    void supabaseAdmin.from('page_audit_logs').insert({
-      page_id: pageId,
-      actor_id: adminUser.id,
-      action: verified ? 'page_verified' : 'page_unverified',
-      details: `${verified ? 'Verified' : 'Removed verification badge from'} Page by platform administrator`,
-    });
-    res.json({ success: true, page: data });
+    res.json({ success: true, page: pageRow || { id: pageId, is_verified: verified } });
   } catch (err: unknown) {
     res.status(500).json({
       success: false,
-      error: err instanceof Error ? err.message : 'Failed to update verification status.',
+      error: err instanceof Error ? `Database operation failed: ${err.message}` : 'Database operation failed.',
     });
   }
 });
@@ -3265,105 +3294,55 @@ app.post('/api/admin/pages/verification-requests/:requestId/review', requireSupe
   const reviewNote = typeof req.body?.reviewNote === 'string' ? req.body.reviewNote.trim() : '';
 
   if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(requestId)) {
-    res.status(400).json({ success: false, error: 'Invalid verification request ID.' });
+    res.status(404).json({ success: false, error: 'Page not found.' });
     return;
   }
   if (decision !== 'approved' && decision !== 'rejected') {
     res.status(400).json({ success: false, error: 'Decision must be approved or rejected.' });
     return;
   }
-  if (!supabaseAdmin) {
-    res.status(503).json({ success: false, fallbackToRpc: true, error: 'Service role not configured.' });
-    return;
-  }
 
   const adminUser = (req as any).adminUser as { id: string; email: string };
-  const nowIso = new Date().toISOString();
+  const adminToken = String((req as any).adminToken || '');
+  const userSb = createUserSupabaseClient(adminToken);
 
   try {
-    const { data: reqRow, error: fetchErr } = await supabaseAdmin
-      .from('page_verification_requests')
-      .select('*')
-      .eq('id', requestId)
-      .maybeSingle();
+    const { data: reviewed, error } = await userSb.rpc('admin_review_verification_request', {
+      p_request_id: requestId,
+      p_decision: decision,
+      p_review_note: reviewNote || null,
+    });
 
-    if (fetchErr || !reqRow) {
-      res.status(404).json({ success: false, error: 'Verification request not found.' });
+    if (error) {
+      const msg = String(error.message || '').toLowerCase();
+      if (msg.includes('super admin') || error.code === '42501') {
+        res.status(403).json({ success: false, error: 'User is not a super administrator.' });
+        return;
+      }
+      res.status(500).json({ success: false, error: `Database operation failed: ${error.message}` });
       return;
     }
 
-    const { error: updErr } = await supabaseAdmin
-      .from('page_verification_requests')
-      .update({
-        status: decision,
-        review_note: reviewNote || null,
-        reviewed_by: adminUser.id,
-        reviewed_at: nowIso,
-        updated_at: nowIso,
-      })
-      .eq('id', requestId);
-
-    if (updErr) {
-      res.status(500).json({ success: false, error: updErr.message });
+    if (reviewed === false) {
+      res.status(404).json({ success: false, error: 'Page not found.' });
       return;
     }
-
-    if (decision === 'approved') {
-      await supabaseAdmin
-        .from('pages')
-        .update({ is_verified: true, updated_at: nowIso })
-        .eq('id', reqRow.page_id);
-    }
-
-    const { data: pageRow } = await supabaseAdmin
-      .from('pages')
-      .select('id, name, slug')
-      .eq('id', reqRow.page_id)
-      .maybeSingle();
 
     appendAuditLog({
       adminEmail: adminUser.email,
       action: `PAGE_VERIFICATION_${decision.toUpperCase()}`,
-      targetId: reqRow.page_id,
-      targetType: 'page',
-      details: `${decision === 'approved' ? 'Approved' : 'Rejected'} verification for "${pageRow?.name || reqRow.official_name}"${reviewNote ? ` — ${reviewNote}` : ''}`,
+      targetId: requestId,
+      targetType: 'page_verification_request',
+      details: `${decision === 'approved' ? 'Approved' : 'Rejected'} verification request ${requestId}${reviewNote ? ` — ${reviewNote}` : ''}`,
       outcome: 'success',
       ip: req.ip,
     });
 
-    void supabaseAdmin.from('page_audit_logs').insert({
-      page_id: reqRow.page_id,
-      actor_id: adminUser.id,
-      action: decision === 'approved' ? 'verification_approved' : 'verification_rejected',
-      details:
-        decision === 'approved'
-          ? 'Super Admin approved Page verification badge'
-          : reviewNote || 'Super Admin rejected Page verification request',
-      metadata: { request_id: requestId, decision },
-    });
-
-    void supabaseAdmin.from('notifications').insert({
-      recipient_id: reqRow.requested_by,
-      recipient_page_id: reqRow.page_id,
-      actor_id: adminUser.id,
-      type: decision === 'approved' ? 'page_verification_approved' : 'page_verification_rejected',
-      entity_type: 'page',
-      entity_id: reqRow.page_id,
-      title:
-        decision === 'approved'
-          ? `${pageRow?.name || 'Your Page'} is now Verified`
-          : `Verification update for ${pageRow?.name || 'your Page'}`,
-      body:
-        decision === 'approved'
-          ? `Your verification request for ${pageRow?.name || 'your Page'} was approved.`
-          : reviewNote || 'Your verification request was not approved at this time.',
-    });
-
-    res.json({ success: true, status: decision, pageId: reqRow.page_id });
+    res.json({ success: true, status: decision });
   } catch (err: unknown) {
     res.status(500).json({
       success: false,
-      error: err instanceof Error ? err.message : 'Failed to review verification request.',
+      error: err instanceof Error ? `Database operation failed: ${err.message}` : 'Database operation failed.',
     });
   }
 });

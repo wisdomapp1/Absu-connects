@@ -2,12 +2,13 @@ import React, { useRef, useState } from 'react';
 import { useApp } from '../../context/AppContext.tsx';
 import { Avatar } from '../common/Avatar.tsx';
 import { MediaRecoveryBanner } from '../common/MediaRecoveryBanner.tsx';
-import { Image, Video, Sparkles, EyeOff, Flag } from 'lucide-react';
+import { Image, Video, Sparkles, EyeOff, Flag, Shield } from 'lucide-react';
 import {
   safeReadAndPrepareImage,
   safeReadAndPrepareVideo,
   type MediaRecoveryState,
 } from '../../lib/mediaRecovery.ts';
+import { formatPageRoleLabel, getPageRoleCapabilities } from '../../lib/pageUtils.ts';
 import type { AttachedMediaItem } from '../../types/index.ts';
 
 interface PostComposerProps {
@@ -30,6 +31,8 @@ export const PostComposer: React.FC<PostComposerProps> = ({ onOpenAnonymous }) =
   const [mediaRecovery, setMediaRecovery] = useState<MediaRecoveryState | null>(null);
   const [lastPickerKind, setLastPickerKind] = useState<'photo' | 'video'>('photo');
   const maxAttachments = activeIdentity.type === 'page' ? 5 : MAX_POST_ATTACHMENTS;
+  const pageCaps = activeIdentity.type === 'page' ? getPageRoleCapabilities(activeIdentity.role) : null;
+  const canPublishAsPage = activeIdentity.type !== 'page' || Boolean(pageCaps?.canPublishPosts);
 
   const handleMediaSelect = async (
     e: React.ChangeEvent<HTMLInputElement>,
@@ -115,6 +118,25 @@ export const PostComposer: React.FC<PostComposerProps> = ({ onOpenAnonymous }) =
       setMediaRecovery(lastRecovery);
     }
   };
+
+  if (!canPublishAsPage && activeIdentity.type === 'page') {
+    return (
+      <div className="bg-[var(--color-bg-card)] border border-[var(--color-border)] rounded-2xl p-3.5 sm:p-4 shadow-sm flex items-center gap-3">
+        <Avatar src={activeIdentity.page.avatarUrl} name={activeIdentity.page.name} size="md" />
+        <div className="min-w-0 flex-1">
+          <p className="text-xs font-bold text-[var(--color-text-primary)] flex items-center gap-1.5">
+            <Shield className="w-3.5 h-3.5 text-[var(--color-primary)] shrink-0" />
+            <span>
+              Operating {activeIdentity.page.name} as {formatPageRoleLabel(activeIdentity.role)}
+            </span>
+          </p>
+          <p className="text-[11px] text-[var(--color-text-secondary)] mt-0.5">
+            Moderators can reply in Page Inbox and moderate comments, while Owners, Admins, and Editors publish posts.
+          </p>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="bg-[var(--color-bg-card)] border border-[var(--color-border)] rounded-2xl p-3.5 sm:p-4 shadow-sm transition-colors">

@@ -35,6 +35,7 @@ export interface SupabasePostRow {
     is_verified?: boolean;
     status?: 'active' | 'disabled' | 'deleted';
     allow_comments?: boolean;
+    comment_permission?: 'everyone' | 'followers' | 'disabled';
     allow_messages?: boolean;
   } | null;
   body: string;
@@ -297,7 +298,9 @@ export function mapSupabasePostToFrontend(
     pageSlug: row.page?.slug,
     pageCategory: row.page?.category ? formatPageCategoryLabel(row.page.category) : undefined,
     pageStatus: row.page?.status,
-    allowComments: row.page?.allow_comments !== false,
+    visibility: row.visibility,
+    allowComments: row.page?.allow_comments !== false && row.page?.comment_permission !== 'disabled',
+    pageCommentPermission: row.page?.comment_permission,
     allowMessages: row.page?.allow_messages !== false,
     communityId,
     communityName,
@@ -1157,7 +1160,7 @@ async function cleanupUploadedPostMedia(mediaList: PostMediaAttachment[]): Promi
 export async function createRealPost(params: {
   authorId: string;
   body: string;
-  visibility?: 'public' | 'friends' | 'campus';
+  visibility?: 'public' | 'friends' | 'campus' | 'followers';
   media?: PostMediaAttachment | PostMediaAttachment[];
   communityId?: string;
   categoryHashtag?: '#Event' | '#CampusUpdates' | '#GeneralPost';
@@ -1180,7 +1183,7 @@ export async function createRealPost(params: {
           author_as_page: true,
           author_page_id: params.pageId,
           body: params.body.trim(),
-          visibility: 'public',
+          visibility: params.visibility === 'followers' ? 'followers' : 'public',
           created_at: nowIso,
           updated_at: nowIso,
         }
